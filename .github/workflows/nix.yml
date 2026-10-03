@@ -20,7 +20,7 @@ on:
       - "scripts/**"
       - "docs/**"
   pull_request:
-    branches: [main]
+    branches: [main, fleet/notification-runtime]
     paths:
       - ".github/workflows/nix.yml"
       - ".cargo/**"
