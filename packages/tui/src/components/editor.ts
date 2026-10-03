@@ -869,6 +869,11 @@ export class Editor implements Component, Focusable {
 		return this.#autocompleteState !== null;
 	}
 
+	/** A partial bracketed paste is a draft even before it reaches the editor text. */
+	isPasteActive(): boolean {
+		return this.#pasteHandler.active;
+	}
+
 	/**
 	 * Get the available width for top border content given a total terminal width.
 	 * Accounts for the border characters and horizontal padding when visible.

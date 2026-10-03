@@ -128,6 +128,7 @@ import {
 	type ResolvedRoleModel,
 	SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 } from "../session/agent-session";
+import type { NotificationAPI, NotificationRequest, NotificationResult } from "../session/agent-session-types";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import { HistoryStorage } from "../session/history-storage";
@@ -1437,6 +1438,10 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
+	readonly notification: NotificationAPI = {
+		target: () => this.session.getNotificationTarget(),
+		submit: request => this.#submitNotification(request),
+	};
 	optimisticUserMessageSignature: string | undefined = undefined;
 	locallySubmittedUserSignatures: Set<string> = new Set();
 	#pendingSubmittedInput: SubmittedUserInput | undefined;
@@ -2792,6 +2797,58 @@ export class InteractiveMode implements InteractiveModeContext {
 
 		using _ = new EventLoopKeepalive();
 		return await promise;
+	}
+
+	#submitNotification(request: NotificationRequest): NotificationResult {
+		if (this.shutdownRequested || this.isShuttingDown) {
+			return { status: "deferred", reason: "unavailable" };
+		}
+		if (
+			!this.onInputCallback ||
+			this.hasPendingSubmission() ||
+			this.#inputController.hasPendingEditorInput ||
+			this.#liveCommandController.active ||
+			this.focusedAgentId ||
+			this.#goalContinuationTimer ||
+			this.#loopAutoSubmitTimer
+		) {
+			return { status: "deferred", reason: "busy" };
+		}
+		if (
+			this.editorContainer.children.length !== 1 ||
+			this.editorContainer.children[0] !== this.editor ||
+			this.ui.getFocused() !== this.editor ||
+			this.ui.hasOverlay() ||
+			this.#extensionUiController.hasPendingDialogs ||
+			this.editor.isAutocompleteActive()
+		) {
+			return { status: "deferred", reason: "modal" };
+		}
+		const pendingInput = this.ui.terminal.hasPendingInput?.();
+		if (pendingInput === undefined) return { status: "deferred", reason: "unavailable" };
+		if (
+			pendingInput ||
+			this.#sttController?.isActive ||
+			this.editor.getText() !== "" ||
+			this.editor.pendingImages.length > 0 ||
+			this.editor.pendingImageLinks.length > 0 ||
+			this.editor.pendingTexts.length > 0 ||
+			this.editor.isPasteActive()
+		) {
+			return { status: "deferred", reason: "draft" };
+		}
+		// No await between the UI check and runtime reservation.
+		const admission = this.session.tryAcceptNotification(request);
+		if (admission.status === "deferred") return admission;
+		void admission.completion.then(
+			dispatched => {
+				if (!dispatched)
+					this.showError("An accepted notification did not start a turn; it was not returned to the composer.");
+			},
+			error =>
+				this.showError(`Accepted notification failed: ${error instanceof Error ? error.message : String(error)}`),
+		);
+		return { status: "accepted" };
 	}
 
 	#scheduleLoopAutoSubmit(): void {

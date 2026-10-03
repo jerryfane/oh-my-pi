@@ -447,6 +447,33 @@ export interface SendUserMessageOptions {
 	attribution?: MessageAttribution;
 }
 
+/** Pins a notification to one runtime instance and one session generation. */
+export interface NotificationTarget {
+	readonly runtimeId: string;
+	readonly sessionId: string;
+	readonly generation: number;
+}
+
+export interface NotificationRequest {
+	target: NotificationTarget;
+	content: string;
+}
+
+export type NotificationDeferReason = "stale_session" | "busy" | "draft" | "modal" | "unavailable" | "invalid_message";
+
+/** Acceptance is runtime admission, not persistence, reading or turn completion. */
+export type NotificationResult = { status: "accepted" } | { status: "deferred"; reason: NotificationDeferReason };
+
+export type NotificationAdmission =
+	| { status: "accepted"; completion: Promise<boolean> }
+	| { status: "deferred"; reason: NotificationDeferReason };
+
+/** Only interactive hosts with authoritative composer state provide this API. */
+export interface NotificationAPI {
+	target(): NotificationTarget;
+	submit(request: NotificationRequest): NotificationResult;
+}
+
 /** Result from a handoff operation. */
 export interface HandoffResult {
 	document: string;

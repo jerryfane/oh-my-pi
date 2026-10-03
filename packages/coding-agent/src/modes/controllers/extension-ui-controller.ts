@@ -104,6 +104,10 @@ export class ExtensionUiController {
 	#toolUIContext: ExtensionUIContext | undefined;
 	constructor(private ctx: InteractiveModeContext) {}
 
+	get hasPendingDialogs(): boolean {
+		return this.#dialogActive || this.#dialogQueue.length > 0;
+	}
+
 	#syncExtensionComposerShapes(): void {
 		this.disposeComposerShapes();
 		for (const definition of this.ctx.session.extensionRunner?.getComposerShapes() ?? []) {
@@ -232,6 +236,7 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			notification: this.ctx.notification,
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),
@@ -464,6 +469,7 @@ export class ExtensionUiController {
 			compact: instructionsOrOptions => this.#compactSession(instructionsOrOptions),
 			getSystemPrompt: () => this.ctx.session.systemPrompt,
 			runEphemeralTurn: args => this.ctx.session.runEphemeralTurn(args),
+			notification: this.ctx.notification,
 		};
 		const commandActions: ExtensionCommandContextActions = {
 			getContextUsage: () => this.ctx.session.getContextUsage(),

@@ -284,6 +284,7 @@ Handlers and tool `execute` receive `ctx` with:
 - `getAsyncJobSnapshot()` returns the current session's read-only async-job snapshot, or `null` when no session owns the context
 - `compact(instructionsOrOptions?)`: accepts summary focus text or `CompactOptions`, including one-off `mode: "soft" | "remote" | "snapcompact"`, `onComplete`, `onError`, and `suppressContinuation`
 - `isIdle()`, `hasPendingMessages()`, `abort()`
+- `notification` (optional): atomic notification admission on interactive hosts with observable input state
 - `shutdown()`
 - `getSystemPrompt()`
 - `isProjectTrusted()` — always `true`; OMP does not ask for per-directory trust before loading project inputs
@@ -291,6 +292,42 @@ Handlers and tool `execute` receive `ctx` with:
 - `runEphemeralTurn(...)` (optional; see below)
 - `memory` (optional structured memory runtime — status/search/save across the configured backend)
 - `setInterval(fn, ms, ...args)` / `setTimeout(fn, ms, ...args)` / `clearTimer(timer)` — managed timers (see below)
+
+### Atomic notifications (`ctx.notification`)
+
+Interactive extensions can submit a notification without typing into the terminal
+or changing the operator's editor. Non-interactive hosts do not expose this
+capability. Custom terminals must implement `Terminal.hasPendingInput()`; missing
+input evidence causes deferral, not an assumption that the editor is safe.
+
+```ts
+const notification = ctx.notification;
+if (notification) {
+  const target = notification.target();
+  const result = notification.submit({ target, content: "Inbox message 123 is ready." });
+  // result.status is "accepted" or "deferred"; deferred includes a reason.
+}
+```
+
+Retain the target with the request. It contains a runtime nonce, session ID and
+session generation; restarting, switching or reloading a session invalidates old
+targets. Do not replace a stale target silently while forwarding an existing
+request.
+
+Submission checks the target, active work and queued input synchronously with
+runtime reservation. Enter preprocessing, dictation, live voice sessions, draft
+text, attachments, unfinished pastes, clipboard reads, paste-file writes, buffered
+terminal input, dialogs, overlays and unavailable input state defer the request
+without changing the composer. Notifications persist as custom messages, not slash
+commands, and reach the model as quoted, untrusted user-role data attributed to an
+agent—not developer instructions. Aborted notifications are never restored as
+operator drafts.
+
+`accepted` means the runtime admitted the notification. It does not mean persisted,
+read, acted upon or completed. A transport that loses this receipt must retain an
+unknown outcome rather than blindly resubmit. Only an explicit `deferred` result
+proves that admission did not happen. This API does not grant task or directive
+authority.
 
 ### Ephemeral side turns (`ctx.runEphemeralTurn`)
 

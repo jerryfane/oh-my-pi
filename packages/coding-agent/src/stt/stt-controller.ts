@@ -101,6 +101,11 @@ export class STTController {
 		return this.#state;
 	}
 
+	/** Dictation owns its target while preparing, recording or transcribing. */
+	get isActive(): boolean {
+		return this.#toggling || this.#state !== "idle";
+	}
+
 	#setState(state: SttState, options: SttCallbacks): void {
 		this.#state = state;
 		options.onStateChange(state);

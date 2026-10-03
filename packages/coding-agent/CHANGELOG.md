@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `ctx.notification` for atomic, session-bound interactive notifications that defer around active work, dialogs, drafts and buffered input without writing into the composer.
+
+### Fixed
+
+- Kept notification admission behind operator Ctrl+Enter preprocessing, retry preparation, and queued submissions, including while the editor is temporarily empty.
+
 ## [18.4.9] - 2026-10-01
 
 ### Added

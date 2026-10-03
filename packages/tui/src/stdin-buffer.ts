@@ -442,6 +442,13 @@ export class StdinBuffer extends EventEmitter<StdinBufferEventMap> {
 		this.#pasteByteLimit = options.pasteByteLimit ?? PASTE_MAX_BYTES;
 	}
 
+	/** Input not yet delivered to the editor, including a partial paste or escape sequence. */
+	get hasPendingInput(): boolean {
+		return (
+			this.#pasteMode || this.#buffer.length > 0 || this.#rawPasteCandidate.length > 0 || this.#stringDiscardActive
+		);
+	}
+
 	process(data: string | Buffer): void {
 		// Handle high-byte conversion (for compatibility with parseKeypress)
 		// If buffer has single byte > 127, convert to ESC + (byte - 128)
