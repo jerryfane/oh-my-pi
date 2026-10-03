@@ -548,6 +548,9 @@ export interface Terminal {
 	 */
 	enableInput?(): void;
 
+	/** Positive buffered-input evidence for atomic admission; absent means unobservable. */
+	hasPendingInput?(): boolean;
+
 	// Stop the terminal and restore state
 	stop(): void;
 
@@ -791,6 +794,10 @@ export class ProcessTerminal implements Terminal {
 	// win32-input-mode sequences and are decoded before reaching the handler.
 	#win32InputDecoder?: Win32InputModeDecoder;
 	#stdinBuffer?: StdinBuffer;
+
+	hasPendingInput(): boolean {
+		return this.#inputDeferred || process.stdin.readableLength > 0 || (this.#stdinBuffer?.hasPendingInput ?? true);
+	}
 	#stdinDataHandler?: (data: string) => void;
 	#disconnectHandler?: () => void;
 	#stdinEndHandler = () => {

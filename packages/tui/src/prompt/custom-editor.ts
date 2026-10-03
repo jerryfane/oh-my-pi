@@ -1286,7 +1286,7 @@ export class CustomEditor extends Editor {
 	/** Called when a bracketed paste contains one or more image or video file paths. */
 	onPasteImagePath?: (path: string) => void | Promise<void>;
 	/** Called when the configured raw text-paste shortcut is pressed. */
-	onPasteTextRaw?: () => void;
+	onPasteTextRaw?: () => void | Promise<void>;
 	/** Called when the configured dequeue shortcut is pressed. */
 	onDequeue?: () => void;
 	/** Called when the configured retry shortcut is pressed. */
@@ -1322,6 +1322,12 @@ export class CustomEditor extends Editor {
 	/** Input chunks deferred behind an in-flight paste, drained in FIFO order once the paste
 	 *  count returns to zero. */
 	#pendingInput: string[] = [];
+
+	override isPasteActive(): boolean {
+		return (
+			super.isPasteActive() || this.#pasteHandler.active || this.#pasteInFlight > 0 || this.#pendingInput.length > 0
+		);
+	}
 	#actionKeys = new Map<ConfigurableEditorAction, KeyId[]>(
 		Object.entries(DEFAULT_ACTION_KEYS).map(([action, keys]) => [action as ConfigurableEditorAction, [...keys]]),
 	);
@@ -1397,14 +1403,19 @@ export class CustomEditor extends Editor {
 		for (const chunk of drained) this.handleInput(chunk);
 	};
 
-	/** Track `promise` as an in-flight paste so subsequent `handleInput` calls queue behind it,
+	/** Track clipboard work as an in-flight paste so subsequent input queues behind it,
 	 *  then drain the queue once it settles. Codex PR #3602 review: without this, a trailing
 	 *  keystroke (Enter most painfully) in the same stdin read processes synchronously while the
 	 *  clipboard read is still pending — submit fires with the text but `pendingImages` is still
 	 *  empty and the image lands on the *next* draft instead. */
-	#trackAsyncPaste(promise: Promise<unknown>): void {
+	#trackAsyncPaste(paste: () => unknown): void {
 		this.#pasteInFlight++;
-		void promise.then(this.#onPasteSettled, this.#onPasteSettled);
+		try {
+			void Promise.resolve(paste()).then(this.#onPasteSettled, this.#onPasteSettled);
+		} catch (error) {
+			this.#onPasteSettled();
+			throw error;
+		}
 	}
 
 	override handleInput(data: string): void {
@@ -1446,16 +1457,14 @@ export class CustomEditor extends Editor {
 			// completes — fixes the race where submit runs against an empty `pendingImages`.
 			if (remaining.length > 0) this.#pendingInput.push(remaining);
 			if (content.length === 0 && this.onPasteImage) {
-				this.#trackAsyncPaste(Promise.resolve(this.onPasteImage()));
+				this.#trackAsyncPaste(this.onPasteImage);
 				return;
 			}
 			const attachmentPaths = extractImagePastePathsFromText(content);
 			if (attachmentPaths && this.onPasteImagePath) {
-				this.#trackAsyncPaste(
-					(async () => {
-						for (const p of attachmentPaths) await this.onPasteImagePath?.(p);
-					})(),
-				);
+				this.#trackAsyncPaste(async () => {
+					for (const p of attachmentPaths) await this.onPasteImagePath?.(p);
+				});
 				return;
 			}
 			// A submit key that shared the read (see `StdinBuffer`'s paste event) is
@@ -1497,15 +1506,15 @@ export class CustomEditor extends Editor {
 			canonical !== undefined &&
 			(this.#actionMatchKeyUnion.has(canonical) || this.#customMatchKeys.has(canonical))
 		) {
-			// Intercept configured image paste (async - fires and handles result)
+			// Keyboard clipboard reads own the draft until their promise settles.
 			if (this.#matchesAction(canonical, "app.clipboard.pasteImage") && this.onPasteImage) {
-				void this.onPasteImage();
+				this.#trackAsyncPaste(this.onPasteImage);
 				return;
 			}
 
-			// Intercept configured raw text paste (fires and handles result)
+			// Raw text paste has the same asynchronous clipboard boundary.
 			if (this.#matchesAction(canonical, "app.clipboard.pasteTextRaw") && this.onPasteTextRaw) {
-				this.onPasteTextRaw();
+				this.#trackAsyncPaste(this.onPasteTextRaw);
 				return;
 			}
 

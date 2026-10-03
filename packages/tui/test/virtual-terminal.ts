@@ -246,6 +246,11 @@ export class VirtualTerminal implements Terminal {
 		this.#inputHandler?.(data);
 	}
 
+	hasPendingInput(): boolean {
+		// Virtual input is delivered synchronously by sendInput; it has no upstream buffer.
+		return false;
+	}
+
 	/**
 	 * Simulate the user scrolling through native terminal scrollback.
 	 * Negative values scroll up; positive values scroll down.

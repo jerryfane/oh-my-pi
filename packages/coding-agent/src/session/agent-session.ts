@@ -13,6 +13,7 @@
  * Modes use this class and add their own I/O layer on top.
  */
 
+import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -272,6 +273,9 @@ import type {
 	FreshSessionResult,
 	HandoffResult,
 	ModelCycleResult,
+	NotificationAdmission,
+	NotificationRequest,
+	NotificationTarget,
 	Prewalk,
 	PromptOptions,
 	ResetSessionContextResult,
@@ -989,6 +993,7 @@ export class AgentSession implements SettingsScope {
 	 *  enqueue and fold/resume normally across an in-session interrupt, only a session identity
 	 *  change should drop them. */
 	#sessionGeneration = 0;
+	readonly #notificationRuntimeId = randomUUID();
 	/** Settles when switchSession commits or restores its previous generation on rollback.
 	 *  newSession never rolls its generation back, so it does not delay stale aside/SDK calls. */
 	#sessionGenerationSettled: Promise<void> | undefined;
@@ -6940,6 +6945,60 @@ export class AgentSession implements SettingsScope {
 	 */
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
 		return this.#admitSubmission(() => this.#prompt(text, options));
+	}
+
+	getNotificationTarget(): NotificationTarget {
+		return {
+			runtimeId: this.#notificationRuntimeId,
+			sessionId: this.sessionId,
+			generation: this.#sessionGeneration,
+		};
+	}
+
+	/**
+	 * The host must check its composer synchronously before calling this method.
+	 * Admission reserves the runtime before yielding; notifications never use the
+	 * user-prompt drop path, which could restore their text into the editor.
+	 */
+	tryAcceptNotification(request: NotificationRequest): NotificationAdmission {
+		const { target, content } = request;
+		if (
+			target.runtimeId !== this.#notificationRuntimeId ||
+			target.sessionId !== this.sessionId ||
+			target.generation !== this.#sessionGeneration
+		) {
+			return { status: "deferred", reason: "stale_session" };
+		}
+		if (!content) return { status: "deferred", reason: "invalid_message" };
+		if (this.isDisposed || !this.model) return { status: "deferred", reason: "unavailable" };
+		if (
+			this.isSessionTransitioning ||
+			this.isStreaming ||
+			this.hasAdmittedSubmission ||
+			this.isAborting ||
+			this.isCompacting ||
+			this.hasPostPromptWork ||
+			this.isRetrying ||
+			this.isGeneratingHandoff ||
+			this.isBashRunning ||
+			this.isEvalRunning ||
+			this.hasPendingBashMessages ||
+			this.queuedMessageCount > 0 ||
+			this.agent.hasQueuedMessages() ||
+			this.#irc.hasPending() ||
+			this.hasPendingAsyncWork()
+		) {
+			return { status: "deferred", reason: "busy" };
+		}
+		const message: CustomMessage = {
+			role: "custom",
+			customType: "notification",
+			content,
+			display: true,
+			timestamp: Date.now(),
+		};
+		const completion = this.#admitSubmission(() => this.#promptWithMessage(message, content));
+		return { status: "accepted", completion };
 	}
 
 	async #prompt(text: string, options?: PromptOptions): Promise<boolean> {

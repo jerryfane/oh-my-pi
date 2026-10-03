@@ -75,6 +75,10 @@ export class BracketedPasteHandler {
 		this.#byteLimit = options.byteLimit ?? DEFAULT_BYTE_LIMIT;
 	}
 
+	get active(): boolean {
+		return this.#active;
+	}
+
 	/**
 	 * Process incoming terminal data for bracketed paste sequences.
 	 *

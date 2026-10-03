@@ -23,6 +23,7 @@ import type { Skill } from "../extensibility/skills";
 import type { MCPManager } from "../mcp";
 import type { PlanApprovalDetails } from "../plan-mode/approved-plan";
 import type { AgentSession } from "../session/agent-session";
+import type { NotificationAPI } from "../session/agent-session-types";
 import type { CompactMode } from "../session/compact-modes";
 import type { ForeignSessionSource } from "../session/foreign-session-store";
 import type { HistoryStorage } from "../session/history-storage";
@@ -243,6 +244,7 @@ export interface InteractiveModeContext {
 	retryLoader: Loader | undefined;
 	unsubscribe?: () => void;
 	onInputCallback?: (input: SubmittedUserInput) => void;
+	readonly notification: NotificationAPI;
 	optimisticUserMessageSignature: string | undefined;
 	locallySubmittedUserSignatures: Set<string>;
 	lastSigintTime: number;
