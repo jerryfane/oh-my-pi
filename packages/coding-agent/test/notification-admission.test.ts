@@ -30,12 +30,14 @@ describe("interactive notification admission", () => {
 	let term: VirtualTerminal;
 	let modelCalls: number;
 	let modelRoles: string[];
+	let modelRequest: ReturnType<typeof Promise.withResolvers<void>>;
 	let inputGate: { entered: () => void; release: Promise<void> } | undefined;
 
 	beforeAll(() => initTheme());
 	beforeEach(async () => {
 		resetSettingsForTest();
 		modelRoles = [];
+		modelRequest = Promise.withResolvers<void>();
 		inputGate = undefined;
 		tempDir = TempDir.createSync("@pi-notification-");
 		await Settings.init({ inMemory: true, cwd: tempDir.path() });
@@ -50,6 +52,7 @@ describe("interactive notification admission", () => {
 				context => {
 					modelCalls++;
 					modelRoles = context.messages.map(message => message.role);
+					modelRequest.resolve();
 					return { content: ["Notification observed."] };
 				},
 			],
@@ -214,13 +217,16 @@ describe("interactive notification admission", () => {
 		expect(modelRoles).toEqual(["user"]);
 	});
 
-	it("does not overtake Enter preprocessing", async () => {
+	it.each([
+		["Enter", "\r"],
+		["follow-up", "\x1b[13;5u"],
+	])("does not overtake %s preprocessing", async (kind, key) => {
 		const entered = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
 		inputGate = { entered: () => entered.resolve(), release: release.promise };
-		const input = mode.getUserInput();
+		const input = kind === "Enter" ? mode.getUserInput() : undefined;
 		term.sendInput("operator request");
-		term.sendInput("\r");
+		term.sendInput(key);
 		try {
 			await withTimeout(entered.promise, 3_000, "Input hook did not start");
 			expect(mode.editor.getText()).toBe("");
@@ -234,7 +240,15 @@ describe("interactive notification admission", () => {
 		} finally {
 			release.resolve();
 		}
-		expect((await withTimeout(input, 3_000, "Operator input did not finish")).text).toBe("operator request");
+		if (input) {
+			expect((await withTimeout(input, 3_000, "Operator input did not finish")).text).toBe("operator request");
+		} else {
+			await withTimeout(modelRequest.promise, 3_000, "Operator follow-up did not reach the model");
+			await withTimeout(session.waitForAdmittedSubmissions(), 3_000, "Operator follow-up did not finish");
+			expect(modelCalls).toBe(1);
+			const submitted = session.messages.find(message => message.role === "user");
+			expect(submitted?.content).toEqual([{ type: "text", text: "operator request" }]);
+		}
 	});
 
 	it.each(["image", "raw text"] as const)("preserves pending keyboard clipboard %s", async kind => {

@@ -1717,11 +1717,16 @@ export class InputController {
 			this.ctx.showStatus("/retry is host-only during a collab session");
 			return;
 		}
-		const didRetry = await this.ctx.viewSession.retry();
-		if (didRetry) {
-			this.ctx.editor.clearDraft();
-		} else {
-			this.ctx.showStatus("Nothing to retry");
+		this.#editorInputOperations++;
+		try {
+			const didRetry = await this.ctx.viewSession.retry();
+			if (didRetry) {
+				this.ctx.editor.clearDraft();
+			} else {
+				this.ctx.showStatus("Nothing to retry");
+			}
+		} finally {
+			this.#editorInputOperations--;
 		}
 	}
 
@@ -1741,7 +1746,12 @@ export class InputController {
 		};
 		const images = source.images?.length ? [...source.images] : undefined;
 		const imageLinks = images && source.imageLinks?.length ? [...source.imageLinks] : undefined;
-		await this.#queueForYield(text, { images, imageLinks, detachedText: detached?.text });
+		this.#editorInputOperations++;
+		try {
+			await this.#queueForYield(text, { images, imageLinks, detachedText: detached?.text });
+		} finally {
+			this.#editorInputOperations--;
+		}
 	}
 
 	async #queueForYield(
@@ -1865,105 +1875,114 @@ export class InputController {
 
 	/** Send editor text as a follow-up message (queued behind current stream). */
 	async handleFollowUp(): Promise<void> {
-		let text = this.#compactDraftImages(this.ctx.editor.getExpandedText().trim());
-		let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
-		let imageLinks =
-			images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
-		if (!text && !images) return;
+		this.#editorInputOperations++;
+		try {
+			let text = this.#compactDraftImages(this.ctx.editor.getExpandedText().trim());
+			let images = this.ctx.editor.pendingImages.length > 0 ? [...this.ctx.editor.pendingImages] : undefined;
+			let imageLinks =
+				images && this.ctx.editor.pendingImageLinks.length > 0 ? [...this.ctx.editor.pendingImageLinks] : undefined;
+			if (!text && !images) return;
 
-		// Focused subagent session: follow-ups go to it; non-chat input is gated.
-		if (this.ctx.focusedAgentId) {
-			await this.#submitToFocusedSession(text, "followUp");
-			return;
-		}
-
-		// Detach before the first await: another Ctrl+Enter cannot submit the
-		// same draft, and later typing belongs to the next submission.
-		this.ctx.editor.clearDraft();
-
-		if (this.ctx.session.extensionRunner?.hasHandlers("input")) {
-			try {
-				const input = await this.#runInputHandlers(text, images, imageLinks);
-				if (!input) return;
-				({ text, images, imageLinks } = input);
-			} catch (error) {
-				restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
-				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			// Focused subagent session: follow-ups go to it; non-chat input is gated.
+			if (this.ctx.focusedAgentId) {
+				await this.#submitToFocusedSession(text, "followUp");
 				return;
 			}
-		}
 
-		// Compaction first: while compacting, free text gets queued via
-		// `queueCompactionMessage`, and `/skill:*` rides the same queue so a
-		// skill typed during compaction is not lost or short-circuited through
-		// `promptCustomMessage`. The compaction-resume path re-parses the
-		// queued text into a user-attributed skill invocation before delivery.
-		if (this.ctx.session.isCompacting) {
-			this.ctx.queueCompactionMessage(text, "followUp", images, { preserveDraft: true });
-			return;
-		}
+			// Detach before the first await: another Ctrl+Enter cannot submit the
+			// same draft, and later typing belongs to the next submission.
+			this.ctx.editor.clearDraft();
 
-		if (text) {
-			try {
-				const input =
-					(images?.length ?? 0) > 0 || (imageLinks?.length ?? 0) > 0 ? { images, imageLinks } : undefined;
-				const slashResult = await executeBuiltinSlashCommand(text, { ctx: this.ctx, input, draftDetached: true });
-				if (slashResult === true) {
-					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+			if (this.ctx.session.extensionRunner?.hasHandlers("input")) {
+				try {
+					const input = await this.#runInputHandlers(text, images, imageLinks);
+					if (!input) return;
+					({ text, images, imageLinks } = input);
+				} catch (error) {
+					restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
 					return;
 				}
-				if (typeof slashResult === "string") {
-					// Command handled but returned remaining text to use as prompt.
-					// Record the original slash command text so Up Arrow recalls it.
-					if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
-					text = slashResult;
-				}
-			} catch (error) {
-				restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
-				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			}
+
+			// Compaction first: while compacting, free text gets queued via
+			// `queueCompactionMessage`, and `/skill:*` rides the same queue so a
+			// skill typed during compaction is not lost or short-circuited through
+			// `promptCustomMessage`. The compaction-resume path re-parses the
+			// queued text into a user-attributed skill invocation before delivery.
+			if (this.ctx.session.isCompacting) {
+				this.ctx.queueCompactionMessage(text, "followUp", images, { preserveDraft: true });
 				return;
 			}
-		}
 
-		// Skill commands invoke through the custom-message path regardless of
-		// which keybinding submitted them. Enter routes them as `steer`;
-		// Ctrl+Enter (this handler) routes them as `followUp`.
-		if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks, true))) {
-			return;
-		}
+			if (text) {
+				try {
+					const input =
+						(images?.length ?? 0) > 0 || (imageLinks?.length ?? 0) > 0 ? { images, imageLinks } : undefined;
+					const slashResult = await executeBuiltinSlashCommand(text, {
+						ctx: this.ctx,
+						input,
+						draftDetached: true,
+					});
+					if (slashResult === true) {
+						if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+						return;
+					}
+					if (typeof slashResult === "string") {
+						// Command handled but returned remaining text to use as prompt.
+						// Record the original slash command text so Up Arrow recalls it.
+						if (!shouldSkipHistory(text)) this.ctx.editor.addToHistory(text);
+						text = slashResult;
+					}
+				} catch (error) {
+					restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+					this.ctx.showError(error instanceof Error ? error.message : String(error));
+					return;
+				}
+			}
 
-		// Hand the message back on dispatch failure (model/API-key validation,
-		// queue rejection): restore both text AND pending images so an image-only
-		// or text+image draft can be retried, mirroring the main submit error path.
-		const restoreOnError = (error: unknown) => {
-			restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
-			this.ctx.showError(error instanceof Error ? error.message : String(error));
-		};
+			// Skill commands invoke through the custom-message path regardless of
+			// which keybinding submitted them. Enter routes them as `steer`;
+			// Ctrl+Enter (this handler) routes them as `followUp`.
+			if (text && (await this.#invokeSkillCommand(text, "followUp", images, imageLinks, true))) {
+				return;
+			}
 
-		if (this.ctx.session.isStreaming) {
+			// Hand the message back on dispatch failure (model/API-key validation,
+			// queue rejection): restore both text AND pending images so an image-only
+			// or text+image draft can be retried, mirroring the main submit error path.
+			const restoreOnError = (error: unknown) => {
+				restoreDetachedDraft(this.ctx.editor, text, images, imageLinks);
+				this.ctx.showError(error instanceof Error ? error.message : String(error));
+			};
+
+			if (this.ctx.session.isStreaming) {
+				this.ctx.editor.addToHistory(text);
+				try {
+					await this.ctx.withLocalSubmission(
+						text,
+						() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
+						{ imageCount: images?.length ?? 0 },
+					);
+				} catch (error) {
+					restoreOnError(error);
+				}
+				this.ctx.updatePendingMessagesDisplay();
+				this.ctx.ui.requestRender();
+				return;
+			}
+
+			// Not streaming — just submit normally
 			this.ctx.editor.addToHistory(text);
 			try {
-				await this.ctx.withLocalSubmission(
-					text,
-					() => this.ctx.session.prompt(text, { streamingBehavior: "followUp", images }),
-					{ imageCount: images?.length ?? 0 },
-				);
+				await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
+					imageCount: images?.length ?? 0,
+				});
 			} catch (error) {
 				restoreOnError(error);
 			}
-			this.ctx.updatePendingMessagesDisplay();
-			this.ctx.ui.requestRender();
-			return;
-		}
-
-		// Not streaming — just submit normally
-		this.ctx.editor.addToHistory(text);
-		try {
-			await this.ctx.withLocalSubmission(text, () => this.ctx.session.prompt(text, { images }), {
-				imageCount: images?.length ?? 0,
-			});
-		} catch (error) {
-			restoreOnError(error);
+		} finally {
+			this.#editorInputOperations--;
 		}
 	}
 
