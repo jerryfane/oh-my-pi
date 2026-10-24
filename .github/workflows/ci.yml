@@ -190,6 +190,27 @@ jobs:
    # native behavior fails visibly and the native side lands via main.
    # Main (kata, cluster remote cache) builds all Linux-hosted targets with
    # bazel. Job name says "bazel" for continuity with required checks.
+   recap_baseline_diagnosis:
+      name: Compare pinned recap baseline failures
+      if: github.event_name == 'pull_request' && github.head_ref == 'feat/chat-recap-metadata'
+      runs-on: ubuntu-22.04
+      timeout-minutes: 15
+      steps:
+         - uses: actions/checkout@v4
+           with:
+              fetch-depth: 0
+         - uses: ./.github/actions/setup-system-deps
+         - uses: ./.github/actions/bun-install
+         - name: Compare exact base and retained failing head
+           run: bash .github/recap-baseline-diagnosis.sh
+         - name: Preserve bounded baseline evidence
+           if: always()
+           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+           with:
+              name: recap-baseline-evidence
+              path: recap-baseline-evidence
+              retention-days: 7
+
    native_addons:
       name: Build native addons (bazel)
       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}

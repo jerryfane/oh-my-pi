@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Persist the existing completion recap as versioned, turn-bound session metadata for transcript clients, without adding a model-context message or another generation. New work clears it; delayed results cannot cross turns or sessions.
+
 ### Fixed
 
 - Fixed `omp stats` and `/stats` dashboards being unreachable from container hosts by accepting an explicit `--host` bind address while preserving the `127.0.0.1` default.
