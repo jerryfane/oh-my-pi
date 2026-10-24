@@ -1,9 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
+import { mkdtemp, rm } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { EventController } from "@oh-my-pi/pi-coding-agent/modes/controllers/event-controller";
 import { initTheme } from "@oh-my-pi/pi-coding-agent/modes/theme/theme";
 import type { InteractiveModeContext } from "@oh-my-pi/pi-coding-agent/modes/types";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 
 async function flushMicrotasks(): Promise<void> {
 	for (let i = 0; i < 10; i++) {
@@ -43,6 +47,7 @@ function createContext(
 			signal?: AbortSignal;
 		}) => Promise<{ replyText: string; assistantMessage: AssistantMessage }>;
 		sessionName?: string;
+		sessionManager?: SessionManager;
 		showStatus?: (message: string, options?: { dim?: boolean }) => void;
 		todoPhases?: InteractiveModeContext["todoPhases"];
 	} = {},
@@ -65,6 +70,9 @@ function createContext(
 				},
 			}
 		: undefined;
+	const manager = options.sessionManager ?? SessionManager.inMemory();
+	if (manager.getBranch().length === 0) manager.appendMessage(createAssistantMessage());
+	vi.spyOn(manager, "getSessionName").mockReturnValue(options.sessionName);
 	const context = {
 		isInitialized: true,
 		loadingAnimation: undefined,
@@ -79,8 +87,10 @@ function createContext(
 		statusContainer: { clear: vi.fn() },
 		statusLine: { invalidate: vi.fn(), markActivityStart: vi.fn(), markActivityEnd: vi.fn() },
 		updateEditorTopBorder: vi.fn(),
+		clearPinnedError: vi.fn(),
+		ensureLoadingAnimation: vi.fn(),
 		editor: { getText: () => options.editorText ?? "" },
-		sessionManager: { getSessionName: () => options.sessionName },
+		sessionManager: manager,
 		todoPhases: options.todoPhases ?? [],
 		showStatus: options.showStatus ?? (() => {}),
 		session: {
@@ -267,5 +277,92 @@ describe("EventController idle compaction teardown", () => {
 		resolve({ replyText: "stale recap", assistantMessage: createAssistantMessage() });
 		await flushMicrotasks();
 		expect(showStatus).not.toHaveBeenCalled();
+	});
+	it("persists a turn-bound recap without adding model messages and clears it on new work", async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		const dir = await mkdtemp(join(tmpdir(), "omp-recap-"));
+		const manager = SessionManager.create(dir, dir);
+		const turnId = manager.appendMessage(createAssistantMessage());
+		const before = manager.buildSessionContext().messages;
+		const runEphemeralTurn = vi.fn(async () => ({
+			replyText: "Fixed the parser; the next step is review.",
+			assistantMessage: createAssistantMessage(),
+		}));
+		const controller = new EventController(createContext({ sessionManager: manager, runEphemeralTurn }));
+		try {
+			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+			vi.advanceTimersByTime(240_000);
+			await flushMicrotasks();
+			await manager.flush();
+			const records = (await Bun.file(manager.getSessionFile()!).text())
+				.trim().split("\n").map(line => JSON.parse(line))
+				.filter(entry => entry.type === "custom" && entry.customType === "completion-recap");
+			expect(records.map(entry => entry.data)).toEqual([{
+				version: 1, sessionId: manager.getSessionId(), turnId, state: "available",
+				text: "Fixed the parser; the next step is review.",
+			}]);
+			expect(manager.buildSessionContext().messages).toEqual(before);
+			expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
+			await controller.handleEvent({ type: "agent_start" });
+			const cleared = manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
+			expect(cleared?.type === "custom" && cleared.data).toEqual({
+				version: 1, sessionId: manager.getSessionId(), turnId, state: "cleared",
+			});
+			expect(manager.buildSessionContext().messages).toEqual(before);
+		} finally {
+			controller.dispose();
+			await manager.close();
+			await rm(dir, { recursive: true, force: true });
+		}
+	});
+
+	it.each(["user", "assistant"])("rejects a recap after newer %s work arrives during generation", async latestRole => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		const { promise, resolve } = Promise.withResolvers<{ replyText: string; assistantMessage: AssistantMessage }>();
+		const context = createContext({
+			runEphemeralTurn: () => promise,
+			showStatus: vi.fn(),
+		});
+		const controller = new EventController(context);
+		try {
+			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+			vi.advanceTimersByTime(240_000);
+			await flushMicrotasks();
+			context.sessionManager.appendMessage({ role: "user", content: "New work", timestamp: Date.now() });
+			if (latestRole === "assistant") context.sessionManager.appendMessage(createAssistantMessage());
+			resolve({ replyText: "The previous turn is finished.", assistantMessage: createAssistantMessage() });
+			await flushMicrotasks();
+			expect(context.showStatus).not.toHaveBeenCalled();
+			expect(context.sessionManager.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap")).toBe(false);
+		} finally {
+			controller.dispose();
+		}
+	});
+
+	it("rejects a recap after the active session manager is replaced", async () => {
+		resetSettingsForTest();
+		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		const { promise, resolve } = Promise.withResolvers<{ replyText: string; assistantMessage: AssistantMessage }>();
+		const context = createContext({
+			runEphemeralTurn: () => promise,
+			showStatus: vi.fn(),
+		});
+		const controller = new EventController(context);
+		try {
+			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+			vi.advanceTimersByTime(240_000);
+			await flushMicrotasks();
+			const replacement = SessionManager.inMemory();
+			replacement.appendMessage(createAssistantMessage());
+			Object.assign(context, { sessionManager: replacement });
+			resolve({ replyText: "An old session's recap.", assistantMessage: createAssistantMessage() });
+			await flushMicrotasks();
+			expect(context.showStatus).not.toHaveBeenCalled();
+			expect(replacement.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap")).toBe(false);
+		} finally {
+			controller.dispose();
+		}
 	});
 });

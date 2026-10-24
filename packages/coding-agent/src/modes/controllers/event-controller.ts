@@ -762,6 +762,7 @@ export class EventController {
 		}
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.#clearPublishedRecap();
 		this.ctx.statusLine.markActivityStart();
 		this.#setTerminalProgress(true);
 		this.ctx.ensureLoadingAnimation();
@@ -1828,6 +1829,7 @@ export class EventController {
 	): Promise<void> {
 		this.#cancelIdleCompaction();
 		this.#cancelIdleRecap();
+		this.#clearPublishedRecap();
 		this.#setTerminalProgress(true);
 		this.#stopWorkingLoader();
 		this.ctx.statusContainer.disposeChildren();
@@ -2093,6 +2095,28 @@ export class EventController {
 		}
 	}
 
+	#recapAnchor(): { sessionId: string; turnId: string } | undefined {
+		const turn = this.ctx.sessionManager.getBranch().findLast(entry => entry.type === "message");
+		return turn?.type === "message" && turn.message.role === "assistant"
+			? { sessionId: this.ctx.sessionManager.getSessionId(), turnId: turn.id }
+			: undefined;
+	}
+
+	#clearPublishedRecap(): void {
+		const manager = this.ctx.sessionManager;
+		const entry = manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
+		if (!entry || entry.type !== "custom" || !entry.data || typeof entry.data !== "object") return;
+		const data = entry.data as Record<string, unknown>;
+		if (data.version !== 1 || data.state !== "available" || data.sessionId !== manager.getSessionId()) return;
+		if (typeof data.turnId !== "string") return;
+		manager.appendCustomEntry("completion-recap", {
+			version: 1,
+			sessionId: data.sessionId,
+			turnId: data.turnId,
+			state: "cleared",
+		});
+	}
+
 	#scheduleIdleCompaction(): void {
 		this.#cancelIdleCompaction();
 		// Don't schedule idle work while context maintenance is already running; the
@@ -2159,14 +2183,27 @@ export class EventController {
 			task: nextActionableTask(this.ctx.todoPhases)?.content ?? "",
 		});
 
+		const manager = this.ctx.sessionManager;
+		const anchor = this.#recapAnchor();
 		const abort = new AbortController();
 		this.#idleRecapAbort = abort;
 		try {
 			const { replyText } = await this.ctx.viewSession.runEphemeralTurn({ promptText, signal: abort.signal });
 			if (this.#idleRecapAbort !== abort || abort.signal.aborted || !this.#idleConditionsHold()) return;
+			const currentAnchor = this.#recapAnchor();
+			if (manager !== this.ctx.sessionManager || anchor?.sessionId !== currentAnchor?.sessionId) return;
+			if (anchor?.turnId !== currentAnchor?.turnId) return;
 			const recap = previewLine(replyText, TRUNCATE_LENGTHS.RECAP);
 			if (!recap) return;
 			this.ctx.showStatus(theme.fg("dim", theme.italic(`※ recap: ${recap}`)), { dim: false });
+			if (anchor) {
+				manager.appendCustomEntry("completion-recap", {
+					version: 1,
+					...anchor,
+					state: "available",
+					text: recap,
+				});
+			}
 		} catch (error) {
 			if (!abort.signal.aborted) logger.debug("Idle recap turn failed", { error: String(error) });
 		} finally {

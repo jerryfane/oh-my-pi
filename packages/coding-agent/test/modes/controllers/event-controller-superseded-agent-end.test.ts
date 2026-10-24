@@ -33,7 +33,7 @@ function createContext() {
 		chatContainer: { removeChild: vi.fn() },
 		flushPendingModelSwitch: vi.fn(async () => {}),
 		editor: { getText: () => "" },
-		sessionManager: { getSessionName: () => "test-session" },
+		sessionManager: { getSessionName: () => "test-session", getBranch: () => [] },
 		ensureLoadingAnimation: vi.fn(),
 		ui: { requestRender: vi.fn() },
 		viewSession: { isCompacting: false, getLastAssistantMessage: () => undefined },

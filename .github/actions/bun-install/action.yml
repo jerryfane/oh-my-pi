@@ -13,6 +13,8 @@ runs:
         id: env
         shell: bash
         run: |
+           printf 'Runner: %s; environment: %s; OS: %s\n' "${RUNNER_NAME:-unknown}" "${RUNNER_ENVIRONMENT:-unknown}" "${RUNNER_OS:-unknown}"
+           df -Pk .
            # bun is baked into the omp-kata runner image — only fetch it when the
            # runner doesn't already provide it (GitHub-hosted), so we don't
            # re-download bun from GitHub releases on every job.

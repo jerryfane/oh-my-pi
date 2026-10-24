@@ -95,6 +95,7 @@ function createFixture(streamingMessage?: AssistantMessage) {
 	};
 	const ctx = {
 		isInitialized: true,
+		sessionManager: { getBranch: () => [] },
 		init: vi.fn(async () => {}),
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn() },
 		settings: { get: vi.fn(() => false) },

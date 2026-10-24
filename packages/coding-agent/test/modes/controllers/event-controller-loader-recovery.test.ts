@@ -73,7 +73,7 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		showWarning: vi.fn(),
 		showError: vi.fn(),
 		editor: { getText: () => "" },
-		sessionManager: { getSessionName: () => "test-session" },
+		sessionManager: { getSessionName: () => "test-session", getBranch: () => [] },
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), terminal: { setProgress } },
 		viewSession: {
 			isCompacting: false,

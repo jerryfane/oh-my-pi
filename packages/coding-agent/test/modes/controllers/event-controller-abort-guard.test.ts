@@ -103,7 +103,7 @@ function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage }
 		statusContainer: { clear: () => {}, disposeChildren: () => {}, addChild: () => {} },
 		statusLine: { markActivityEnd: () => {}, markActivityStart: () => {} },
 		editor: { getText: () => "" },
-		sessionManager: { getSessionName: () => "test-session" },
+		sessionManager: { getSessionName: () => "test-session", getBranch: () => [] },
 		clearPinnedError: () => {},
 		ensureLoadingAnimation: () => {},
 		showError: () => {},
