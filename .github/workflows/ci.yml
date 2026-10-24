@@ -365,6 +365,8 @@ jobs:
       timeout-minutes: 25
       steps:
          - uses: actions/checkout@v4
+           with:
+              fetch-depth: 0
          - uses: ./.github/actions/setup-system-deps
          - uses: ./.github/actions/bun-install
          - uses: ./.github/actions/native-artifacts
@@ -374,6 +376,25 @@ jobs:
            env:
               OMP_TEST_CONCURRENCY: "2"
            run: bun run ci:test:coding-agent:ui
+         - name: Prove recap lifecycle regressions
+           if: github.event_name == 'pull_request'
+           env:
+              BASE_SHA: ${{ github.event.pull_request.base.sha }}
+           run: |
+              go install github.com/gitmoot/test-check/cmd/test-check@v0.0.0-20261007050326-d5f169ab623e
+              "$(go env GOPATH)/bin/test-check" prove --base "$BASE_SHA" \
+                --test "bun test packages/coding-agent/test/modes/controllers/event-controller-idle-compaction.test.ts --test-name-pattern '{name}'" \
+                --each "persists a turn-bound recap without adding model messages and clears it on new work,rejects a recap after newer user work arrives during generation,rejects a recap after newer assistant work arrives during generation,rejects a recap after the active session manager is replaced" \
+                --json | tee recap-proof.json
+         - name: Preserve recap regression proof
+           if: always() && github.event_name == 'pull_request'
+           uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+           with:
+              name: recap-regression-proof
+              path: |
+                 recap-proof.json
+                 ~/.local/state/test-check/receipts
+              retention-days: 7
 
    test_coding_agent_runtime:
       name: Test coding-agent runtime/session (TS)

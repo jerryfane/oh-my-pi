@@ -280,7 +280,10 @@ describe("EventController idle compaction teardown", () => {
 	});
 	it("persists a turn-bound recap without adding model messages and clears it on new work", async () => {
 		resetSettingsForTest();
-		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		await Settings.init({
+			inMemory: true,
+			overrides: { "compaction.idleEnabled": false, "completion.notify": "off" },
+		});
 		const dir = await mkdtemp(join(tmpdir(), "omp-recap-"));
 		const manager = SessionManager.create(dir, dir);
 		const turnId = manager.appendMessage(createAssistantMessage());
@@ -296,18 +299,30 @@ describe("EventController idle compaction teardown", () => {
 			await flushMicrotasks();
 			await manager.flush();
 			const records = (await Bun.file(manager.getSessionFile()!).text())
-				.trim().split("\n").map(line => JSON.parse(line))
+				.trim()
+				.split("\n")
+				.map(line => JSON.parse(line))
 				.filter(entry => entry.type === "custom" && entry.customType === "completion-recap");
-			expect(records.map(entry => entry.data)).toEqual([{
-				version: 1, sessionId: manager.getSessionId(), turnId, state: "available",
-				text: "Fixed the parser; the next step is review.",
-			}]);
+			expect(records.map(entry => entry.data)).toEqual([
+				{
+					version: 1,
+					sessionId: manager.getSessionId(),
+					turnId,
+					state: "available",
+					text: "Fixed the parser; the next step is review.",
+				},
+			]);
 			expect(manager.buildSessionContext().messages).toEqual(before);
 			expect(runEphemeralTurn).toHaveBeenCalledTimes(1);
 			await controller.handleEvent({ type: "agent_start" });
-			const cleared = manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
+			const cleared = manager
+				.getBranch()
+				.findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
 			expect(cleared?.type === "custom" && cleared.data).toEqual({
-				version: 1, sessionId: manager.getSessionId(), turnId, state: "cleared",
+				version: 1,
+				sessionId: manager.getSessionId(),
+				turnId,
+				state: "cleared",
 			});
 			expect(manager.buildSessionContext().messages).toEqual(before);
 		} finally {
@@ -319,7 +334,10 @@ describe("EventController idle compaction teardown", () => {
 
 	it.each(["user", "assistant"])("rejects a recap after newer %s work arrives during generation", async latestRole => {
 		resetSettingsForTest();
-		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		await Settings.init({
+			inMemory: true,
+			overrides: { "compaction.idleEnabled": false, "completion.notify": "off" },
+		});
 		const { promise, resolve } = Promise.withResolvers<{ replyText: string; assistantMessage: AssistantMessage }>();
 		const context = createContext({
 			runEphemeralTurn: () => promise,
@@ -335,7 +353,11 @@ describe("EventController idle compaction teardown", () => {
 			resolve({ replyText: "The previous turn is finished.", assistantMessage: createAssistantMessage() });
 			await flushMicrotasks();
 			expect(context.showStatus).not.toHaveBeenCalled();
-			expect(context.sessionManager.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap")).toBe(false);
+			expect(
+				context.sessionManager
+					.getBranch()
+					.some(entry => entry.type === "custom" && entry.customType === "completion-recap"),
+			).toBe(false);
 		} finally {
 			controller.dispose();
 		}
@@ -343,7 +365,10 @@ describe("EventController idle compaction teardown", () => {
 
 	it("rejects a recap after the active session manager is replaced", async () => {
 		resetSettingsForTest();
-		await Settings.init({ inMemory: true, overrides: { "compaction.idleEnabled": false, "completion.notify": "off" } });
+		await Settings.init({
+			inMemory: true,
+			overrides: { "compaction.idleEnabled": false, "completion.notify": "off" },
+		});
 		const { promise, resolve } = Promise.withResolvers<{ replyText: string; assistantMessage: AssistantMessage }>();
 		const context = createContext({
 			runEphemeralTurn: () => promise,
@@ -360,7 +385,9 @@ describe("EventController idle compaction teardown", () => {
 			resolve({ replyText: "An old session's recap.", assistantMessage: createAssistantMessage() });
 			await flushMicrotasks();
 			expect(context.showStatus).not.toHaveBeenCalled();
-			expect(replacement.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap")).toBe(false);
+			expect(
+				replacement.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap"),
+			).toBe(false);
 		} finally {
 			controller.dispose();
 		}

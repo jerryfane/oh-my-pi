@@ -2104,8 +2104,10 @@ export class EventController {
 
 	#clearPublishedRecap(): void {
 		const manager = this.ctx.sessionManager;
-		const entry = manager.getBranch().findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
-		if (!entry || entry.type !== "custom" || !entry.data || typeof entry.data !== "object") return;
+		const entry = manager
+			.getBranch()
+			.findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
+		if (entry?.type !== "custom" || !entry.data || typeof entry.data !== "object") return;
 		const data = entry.data as Record<string, unknown>;
 		if (data.version !== 1 || data.state !== "available" || data.sessionId !== manager.getSessionId()) return;
 		if (typeof data.turnId !== "string") return;
