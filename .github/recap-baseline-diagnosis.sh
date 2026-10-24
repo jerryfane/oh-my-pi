@@ -25,7 +25,7 @@ run_case() {
   local directory="$1" label="$2"
   shift 2
   set +e
-  (cd "$directory" && "$@") > "$out/$side-$label.log" 2>&1
+  (cd "$directory" && timeout --kill-after=10s 120s "$@") > "$out/$side-$label.log" 2>&1
   local status=$?
   set -e
   cat "$out/$side-$label.log"
@@ -46,7 +46,7 @@ for side in base head; do
   run_case "$root/packages/snapcompact" snapcompact bun test --parallel=2 --timeout=30000
   run_case "$root/packages/tui" sixel bun test test/image-render.test.ts test/slash-autocomplete-viewport.test.ts --parallel=2 --timeout=30000
   run_case "$root/packages/coding-agent" native-unit bun test test/core/block-replace.test.ts test/tools/ast-edit.test.ts test/tools/ast-grep.test.ts --parallel=1 --timeout=30000
-  run_case "$root" install-methods bun run ci:test:install-methods
+  run_case "$root" install-methods env OMP_INSTALL_TEST_SKIP_NATIVE_BUILD=1 bun run ci:test:install-methods
   sha256sum "$root/packages/natives/native/"*.node | tee "$out/$side-native-after-sha256.txt"
 done
 # A diagnostic comparison does not turn failing product checks green.
