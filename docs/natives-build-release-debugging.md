@@ -142,6 +142,8 @@ build --tls_certificate=infra/bazel-remote/ca.crt
 
 Before upload, CI loads both binaries through `process.dlopen` (Bazel's `.node` symlinks resolve to `.so` files), requires every export declared by `packages/natives/native/index.js`, and checks the sole version sentinel against `packages/natives/package.json`. `native-addons-provenance.json` records the tested merge revision, PR head/base, platform, architecture, package version and SHA256 of each addon. PR consumers verify the downloaded revision, platform, version and hashes before installation. An unrelated npm release is not a substitute for these source-matched artifacts; successful ABI checks also do not replace the downstream behavioral suites.
 
+After install-method smoke tests pass, PR CI uploads their existing compiled `dist/omp` as `tested-pr-runtime` (one-day retention; no additional build). Its `omp-provenance.json` records the tested source, PR head, run, platform, version, byte size, binary SHA256 and native-addon provenance. Use this artifact for isolated runtime checks only after the full run passes; verify its hash and source before execution. This artifact is not a release or deployment.
+
 On non-PR events both jobs run on `omp-kata` pods against the cluster remote cache. `rust_validate` runs:
 
 ```bash

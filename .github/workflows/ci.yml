@@ -472,6 +472,40 @@ jobs:
            env:
               OMP_INSTALL_TEST_SKIP_NATIVE_BUILD: "1"
            run: bun run ci:test:install-methods
+         - name: Record tested PR runtime provenance
+           if: github.event_name == 'pull_request'
+           shell: bash
+           run: |
+              node --input-type=module <<'EOF'
+              import assert from "node:assert/strict";
+              import { createHash } from "node:crypto";
+              import { execFileSync } from "node:child_process";
+              import { createReadStream, readFileSync, statSync, writeFileSync } from "node:fs";
+              const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+              const native = JSON.parse(readFileSync(`${process.env.RUNNER_TEMP}/omp-native-artifacts/native-addons-provenance.json`, "utf8"));
+              assert.equal(native.sourceSha, sourceSha);
+              const binary = "packages/coding-agent/dist/omp";
+              const hash = createHash("sha256");
+              for await (const chunk of createReadStream(binary)) hash.update(chunk);
+              const { version } = JSON.parse(readFileSync("packages/coding-agent/package.json", "utf8"));
+              const receipt = { schema: 1, sourceSha, headSha: native.headSha, runId: process.env.GITHUB_RUN_ID,
+                platform: process.platform, architecture: process.arch, version, file: "omp",
+                bytes: statSync(binary).size, sha256: hash.digest("hex"), native,
+                smoke: "bun run ci:test:install-methods" };
+              const json = JSON.stringify(receipt, null, 2) + "\n";
+              writeFileSync("packages/coding-agent/dist/omp-provenance.json", json);
+              process.stdout.write(json);
+              EOF
+         - name: Upload tested PR runtime
+           if: github.event_name == 'pull_request'
+           uses: actions/upload-artifact@v4
+           with:
+              name: tested-pr-runtime
+              path: |
+                 packages/coding-agent/dist/omp
+                 packages/coding-agent/dist/omp-provenance.json
+              if-no-files-found: error
+              retention-days: 1
 
    # Aggregates every validation job so publish-side release jobs gate on one
    # result. Binary BUILDS deliberately do not wait for this gate — they run
