@@ -33,6 +33,31 @@ runs:
              echo "::error::At least one native addon target is required"
              exit 1
            fi
+           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
+             node - "$RUNNER_TEMP/omp-native-artifacts" "${targets[@]}" <<'EOF'
+           const assert = require("node:assert/strict");
+           const fs = require("node:fs");
+           const path = require("node:path");
+           const { createHash } = require("node:crypto");
+           const { execFileSync } = require("node:child_process");
+           const root = process.argv[2];
+           const receipt = JSON.parse(fs.readFileSync(path.join(root, "native-addons-provenance.json"), "utf8"));
+           const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+           assert.equal(receipt.schema, 1);
+           assert.equal(receipt.sourceSha, sourceSha, "native artifact must match the consumer checkout");
+           assert.equal(receipt.platform, process.platform);
+           assert.equal(receipt.architecture, process.arch);
+           assert.equal(receipt.version, JSON.parse(fs.readFileSync("packages/natives/package.json", "utf8")).version);
+           for (const target of process.argv.slice(3)) {
+             const artifact = receipt.artifacts[target];
+             const file = `natives-${target}/pi_natives.${target}.node`;
+             assert.equal(artifact?.file, file, `missing native artifact provenance for ${target}`);
+             const sha256 = createHash("sha256").update(fs.readFileSync(path.join(root, file))).digest("hex");
+             assert.equal(sha256, artifact.sha256, `native artifact hash mismatch for ${target}`);
+             console.log(`Verified ${target}: ${sourceSha} ${sha256}`);
+           }
+           EOF
+           fi
            bun scripts/bazel-natives.ts "${targets[@]}" \
              --source "$RUNNER_TEMP/omp-native-artifacts" \
              --dest "$NATIVE_DEST"

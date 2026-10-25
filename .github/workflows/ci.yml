@@ -139,10 +139,8 @@ jobs:
            run: bun run collab:web:build
 
    # Rust validation (tests, clippy, rustfmt) runs on non-PR events only.
-   # Native-changing PRs are rare enough that they do not warrant PR-side
-   # Rust validation or a PR-side addon build (see native_addons): Rust is
-   # validated post-merge on main (kata remote cache, warm) and again at
-   # release. A skipped required check still satisfies branch protection.
+   # PRs build the native addons needed by TS consumers below; full Rust
+   # validation remains on main and release.
    rust_validate:
       name: Validate Rust workspace (bazel)
       if: github.event_name != 'pull_request'
@@ -182,76 +180,79 @@ jobs:
          - name: Rustfmt
            run: bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build --config=rustfmt //crates/...
 
-   # Provides the native addons every downstream TS job installs. PRs never
-   # build: they fetch the latest release's Linux x64 pair from the
-   # @oh-my-pi/pi-natives-linux-x64 npm leaf instead. The workspace loader
-   # skips its version sentinel for workspace loads, so release addons load
-   # fine under a newer checkout; a PR whose TS tests depend on changed
-   # native behavior fails visibly and the native side lands via main.
-   # Main (kata, cluster remote cache) builds all Linux-hosted targets with
-   # bazel. Job name says "bazel" for continuity with required checks.
+   # Build addons from the same checkout as their downstream consumers.
+   # Hosted PRs need only the Linux x64 pair; main builds all Linux-hosted
+   # targets on kata. Keep the required job name unchanged.
    native_addons:
       name: Build native addons (bazel)
       runs-on: ${{ github.event_name == 'pull_request' && 'ubuntu-22.04' || 'omp-kata' }}
       steps:
          - uses: actions/checkout@v4
 
-         # ---- PR path: latest release addons from npm ----
-         - name: Fetch release native addons (npm)
+         - id: cache
+           uses: ./.github/actions/bazel-cache
+           with:
+              scope: ${{ github.event_name == 'pull_request' && 'pr-linux-x64' || 'linux' }}
+         - name: Build PR native addons from tested source
            if: github.event_name == 'pull_request'
            shell: bash
            run: |
               set -euo pipefail
-              tarball="$(npm view @oh-my-pi/pi-natives-linux-x64@latest dist.tarball)"
-              echo "Fetching $tarball"
-              curl -fsSL --retry 3 "$tarball" | tar -xz -C "$RUNNER_TEMP"
-              mkdir -p bazel-bin/natives-linux-x64-baseline bazel-bin/natives-linux-x64-modern
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-baseline.node" bazel-bin/natives-linux-x64-baseline/
-              cp "$RUNNER_TEMP/package/pi_natives.linux-x64-modern.node" bazel-bin/natives-linux-x64-modern/
-         # A corrupt download must fail here, not as a confusing dlopen error
-         # in every downstream test shard.
-         - name: Smoke release addons
-           if: github.event_name == 'pull_request'
-           shell: bash
-           run: |
-              set -euo pipefail
-              # NOTE: `bun -e 'require("./x.node")'` swallows dlopen failures
-              # (exit 0 on a bogus addon); a script file enforces them in
-              # both bun and node. Verified against a corrupt .node fixture.
-              cat > "$RUNNER_TEMP/smoke-addons.js" <<'EOF'
-              for (const f of process.argv.slice(2)) {
-               const m = require(f);
-               if (!m || Object.keys(m).length === 0) {
-               	console.error(`addon failed to load: ${f}`);
-               	process.exit(1);
-               }
-              }
-              EOF
-              loader=node
-              if command -v bun >/dev/null 2>&1; then loader=bun; fi
-              "$loader" "$RUNNER_TEMP/smoke-addons.js" \
-                "$PWD/bazel-bin/natives-linux-x64-baseline/pi_natives.linux-x64-baseline.node" \
-                "$PWD/bazel-bin/natives-linux-x64-modern/pi_natives.linux-x64-modern.node"
-         # Make the policy visible on the rare native-touching PR instead of
-         # leaving a reviewer to wonder which addons the tests exercised.
-         # Best-effort: a diff-API failure must not fail the job over a notice.
-         - name: Note native changes tested against release addons
+              if [ "$(ulimit -Sn)" != unlimited ] && [ "$(ulimit -Sn)" -lt 65536 ]; then ulimit -Sn 65536 || true; fi
+              # Serialize the memory-heavy links, as on the main path.
+              for target in natives-linux-x64-baseline natives-linux-x64-modern; do
+                bazelisk --bazelrc="${{ steps.cache.outputs.rc }}" build "//:$target"
+              done
+         - name: Verify PR native provenance and ABI
            if: github.event_name == 'pull_request'
            shell: bash
            env:
-              GH_TOKEN: ${{ github.token }}
+              PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+              PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
            run: |
-              if gh pr diff ${{ github.event.pull_request.number }} --name-only 2>/dev/null \
-                 | grep -qE '^(crates/|bazel/|Cargo\.(toml|lock)|MODULE\.bazel(\.lock)?|BUILD\.bazel|\.bazelrc|\.bazelignore|\.bazelversion|rust-toolchain\.toml|rustfmt\.toml)'; then
-                echo "::notice title=Native sources changed::PR CI tests against the latest release addons by design; native changes are validated post-merge on main and at release."
-              fi
-
-         # ---- main path: bazel build of all Linux-hosted targets ----
-         - id: cache
-           if: github.event_name != 'pull_request'
-           uses: ./.github/actions/bazel-cache
+              set -euo pipefail
+              # Use a script file so dlopen failures cannot be swallowed by bun -e.
+              cat > "$RUNNER_TEMP/verify-addons.cjs" <<'EOF'
+              const assert = require("node:assert/strict");
+              const fs = require("node:fs");
+              const path = require("node:path");
+              const { createHash } = require("node:crypto");
+              const { execFileSync } = require("node:child_process");
+              const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], { encoding: "utf8" }).trim();
+              assert.equal(sourceSha, process.env.GITHUB_SHA, "addon checkout must match the tested merge revision");
+              assert.equal(process.platform, "linux");
+              assert.equal(process.arch, "x64");
+              const { version } = JSON.parse(fs.readFileSync("packages/natives/package.json", "utf8"));
+              const sentinel = `__piNativesV${version.replace(/[^a-zA-Z0-9]/g, "_")}`;
+              const surface = fs.readFileSync("packages/natives/native/index.js", "utf8");
+              const declaredExports = [...surface.matchAll(/^export const \w+ = nativeBindings\.(\w+);$/gm)].map(m => m[1]);
+              assert(declaredExports.includes(sentinel), "declared native surface must carry the package version sentinel");
+              const artifacts = {};
+              for (const target of ["linux-x64-baseline", "linux-x64-modern"]) {
+                const file = `natives-${target}/pi_natives.${target}.node`;
+                const absolute = path.resolve("bazel-bin", file);
+                const addon = require(absolute);
+                assert.deepEqual(Object.keys(addon).filter(name => name.startsWith("__piNativesV")), [sentinel]);
+                for (const name of declaredExports) assert.notEqual(addon[name], undefined, `${target}: missing declared export ${name}`);
+                assert.equal(typeof addon[sentinel], "function");
+                artifacts[target] = { file, sha256: createHash("sha256").update(fs.readFileSync(absolute)).digest("hex") };
+              }
+              const receipt = { schema: 1, sourceSha, headSha: process.env.PR_HEAD_SHA, baseSha: process.env.PR_BASE_SHA,
+                platform: process.platform, architecture: process.arch, version, artifacts };
+              const json = JSON.stringify(receipt, null, 2) + "\n";
+              fs.writeFileSync("bazel-bin/native-addons-provenance.json", json);
+              process.stdout.write(json);
+              EOF
+              node "$RUNNER_TEMP/verify-addons.cjs"
+         - name: Save PR bazel disk cache
+           if: github.event_name == 'pull_request' && steps.cache.outputs.save-needed == 'true'
+           uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
            with:
-              scope: linux
+              path: |
+                 ~/.cache/omp-bazel-disk
+                 ~/.cache/omp-bazel-repo
+              key: ${{ steps.cache.outputs.cache-key }}
+
          - name: Build native addons once
            if: github.event_name != 'pull_request'
            run: |
@@ -294,7 +295,9 @@ jobs:
            uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
            with:
               name: native-addons
-              path: bazel-bin/natives-*/*.node
+              path: |
+                 bazel-bin/natives-*/*.node
+                 bazel-bin/native-addons-provenance.json
               if-no-files-found: error
               retention-days: 1
 
