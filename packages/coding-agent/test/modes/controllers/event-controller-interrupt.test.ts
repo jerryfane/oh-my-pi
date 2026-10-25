@@ -11,6 +11,7 @@ function createContext() {
 	const ensureLoadingAnimation = vi.fn();
 	const pendingTools = new Map<string, unknown>();
 	const session = {
+		sessionManager: { getBranch: () => [] },
 		getToolByName: () => undefined,
 		isAborting: false,
 	};

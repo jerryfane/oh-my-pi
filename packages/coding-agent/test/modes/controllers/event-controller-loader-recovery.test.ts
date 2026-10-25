@@ -76,6 +76,7 @@ function createContext(options: { terminalProgress?: boolean } = {}) {
 		sessionManager: { getSessionName: () => "test-session", getBranch: () => [] },
 		ui: { requestRender: vi.fn(), requestComponentRender: vi.fn(), terminal: { setProgress } },
 		viewSession: {
+			sessionManager: { getBranch: () => [] },
 			isCompacting: false,
 			getLastAssistantMessage: () => undefined,
 			get isStreaming() {

@@ -73,7 +73,12 @@ function createFixture(streamingMessage?: AssistantMessage) {
 	};
 
 	const session = { isStreaming: false };
-	const viewSession = { isStreaming: false, isTtsrAbortPending: false, retryAttempt: 0 };
+	const viewSession = {
+		isStreaming: false,
+		isTtsrAbortPending: false,
+		retryAttempt: 0,
+		sessionManager: { getBranch: () => [] },
+	};
 	let hasDisplayableThinkingContent = false;
 	const noteDisplayableThinkingContent = vi.fn((message: AssistantMessage) => {
 		const hasThinking = message.content.some(

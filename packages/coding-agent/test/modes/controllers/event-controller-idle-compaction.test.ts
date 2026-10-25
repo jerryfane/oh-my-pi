@@ -397,7 +397,9 @@ describe("EventController idle compaction teardown", () => {
 			expect(
 				focusedManager
 					.getBranch()
-					.flatMap(entry => (entry.type === "custom" && entry.customType === "completion-recap" ? [entry.data] : [])),
+					.flatMap(entry =>
+						entry.type === "custom" && entry.customType === "completion-recap" ? [entry.data] : [],
+					),
 			).toEqual([
 				{
 					version: 1,

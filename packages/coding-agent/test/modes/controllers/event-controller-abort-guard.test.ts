@@ -81,6 +81,7 @@ function makeAgentEndEvent(messages: AssistantMessage[]): Extract<AgentSessionEv
 /** Full context needed to drive `#handleAgentEnd` -> `#finishAgentEnd` end to end. */
 function makeTurnEndContext(options: { lastAssistantMessage?: AssistantMessage } = {}): InteractiveModeContext {
 	const session = {
+		sessionManager: { getBranch: () => [] },
 		isStreaming: false,
 		isCompacting: false,
 		messages: [] as AssistantMessage[],
