@@ -23,7 +23,8 @@ import { createUsageRowBlock } from "../../modes/components/usage-row";
 import { getSymbolTheme, theme } from "../../modes/theme/theme";
 import type { InteractiveModeContext, TodoPhase } from "../../modes/types";
 import idleRecapPrompt from "../../prompts/system/recap-user.md" with { type: "text" };
-import type { AgentSessionEvent } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { SessionManager } from "../../session/session-manager";
 import { isSilentAbort, readQueueChipText, resolveAbortLabel } from "../../session/messages";
 import { type ApprovalMode, resolveApproval } from "../../tools/approval";
 import { previewLine, TRUNCATE_LENGTHS } from "../../tools/render-utils";
@@ -2095,15 +2096,17 @@ export class EventController {
 		}
 	}
 
-	#recapAnchor(): { sessionId: string; turnId: string } | undefined {
-		const turn = this.ctx.sessionManager.getBranch().findLast(entry => entry.type === "message");
+	/** Latest assistant turn of `manager`, or undefined when the newest message is not an assistant reply. */
+	#recapAnchor(manager: SessionManager): { sessionId: string; turnId: string } | undefined {
+		const turn = manager.getBranch().findLast(entry => entry.type === "message");
 		return turn?.type === "message" && turn.message.role === "assistant"
-			? { sessionId: this.ctx.sessionManager.getSessionId(), turnId: turn.id }
+			? { sessionId: manager.getSessionId(), turnId: turn.id }
 			: undefined;
 	}
 
+	/** Clears the recap of the session whose events this controller is rendering (main or focused). */
 	#clearPublishedRecap(): void {
-		const manager = this.ctx.sessionManager;
+		const manager = this.ctx.viewSession.sessionManager;
 		const entry = manager
 			.getBranch()
 			.findLast(entry => entry.type === "custom" && entry.customType === "completion-recap");
@@ -2157,11 +2160,15 @@ export class EventController {
 		if (!recapSettings.enabled) return;
 		if (this.ctx.editor.getText().trim()) return;
 
+		// Bind the recap to the session whose agent_end armed it. A focused
+		// subagent's events arrive here too, and focus can change before the
+		// timer fires; the recap must never describe one session under another's ids.
+		const session = this.ctx.viewSession;
 		const timeoutMs =
 			Math.max(IDLE_RECAP_MIN_SECONDS, Math.min(IDLE_RECAP_MAX_SECONDS, recapSettings.idleSeconds)) * 1000;
 		this.#idleRecapTimer = setTimeout(() => {
 			this.#idleRecapTimer = undefined;
-			void this.#runIdleRecap();
+			void this.#runIdleRecap(session);
 		}, timeoutMs);
 		this.#idleRecapTimer.unref?.();
 	}
@@ -2175,25 +2182,27 @@ export class EventController {
 	 * cancels it via #cancelIdleRecap, and idle conditions are re-checked after
 	 * the reply lands so a stale recap never paints over fresh work.
 	 */
-	async #runIdleRecap(): Promise<void> {
+	async #runIdleRecap(session: AgentSession): Promise<void> {
+		if (session !== this.ctx.viewSession) return;
 		if (!this.#idleConditionsHold()) return;
-		if (!this.ctx.viewSession.model) return;
-		if (this.ctx.viewSession.messages.length === 0) return;
+		if (!session.model) return;
+		if (session.messages.length === 0) return;
 
 		const promptText = prompt.render(idleRecapPrompt, {
 			goal: this.#idleRecapGoalText() ?? "",
 			task: nextActionableTask(this.ctx.todoPhases)?.content ?? "",
 		});
 
-		const manager = this.ctx.sessionManager;
-		const anchor = this.#recapAnchor();
+		const manager = session.sessionManager;
+		const anchor = this.#recapAnchor(manager);
 		const abort = new AbortController();
 		this.#idleRecapAbort = abort;
 		try {
-			const { replyText } = await this.ctx.viewSession.runEphemeralTurn({ promptText, signal: abort.signal });
+			const { replyText } = await session.runEphemeralTurn({ promptText, signal: abort.signal });
 			if (this.#idleRecapAbort !== abort || abort.signal.aborted || !this.#idleConditionsHold()) return;
-			const currentAnchor = this.#recapAnchor();
-			if (manager !== this.ctx.sessionManager || anchor?.sessionId !== currentAnchor?.sessionId) return;
+			if (session !== this.ctx.viewSession) return;
+			const currentAnchor = this.#recapAnchor(manager);
+			if (anchor?.sessionId !== currentAnchor?.sessionId) return;
 			if (anchor?.turnId !== currentAnchor?.turnId) return;
 			const recap = previewLine(replyText, TRUNCATE_LENGTHS.RECAP);
 			if (!recap) return;

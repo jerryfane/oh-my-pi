@@ -94,6 +94,7 @@ function createContext(
 		todoPhases: options.todoPhases ?? [],
 		showStatus: options.showStatus ?? (() => {}),
 		session: {
+			sessionManager: manager,
 			isCompacting: options.isCompacting ?? false,
 			isStreaming: options.isStreaming ?? false,
 			runIdleCompaction,
@@ -369,7 +370,52 @@ describe("EventController idle compaction teardown", () => {
 		}
 	});
 
-	it("rejects a recap after the active session manager is replaced", async () => {
+	it("persists a focused session recap into the focused session only", async () => {
+		resetSettingsForTest();
+		await Settings.init({
+			inMemory: true,
+			overrides: { "compaction.idleEnabled": false, "completion.notify": "off" },
+		});
+		const context = createContext({});
+		const main = context.sessionManager;
+		const focusedManager = SessionManager.inMemory();
+		const focusedTurn = focusedManager.appendMessage(createAssistantMessage());
+		const focused = {
+			...context.session,
+			sessionManager: focusedManager,
+			runEphemeralTurn: async () => ({
+				replyText: "The focused agent is mid-refactor.",
+				assistantMessage: createAssistantMessage(),
+			}),
+		};
+		Object.defineProperty(context, "viewSession", { get: () => focused });
+		const controller = new EventController(context);
+		try {
+			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
+			vi.advanceTimersByTime(240_000);
+			await flushMicrotasks();
+			expect(
+				focusedManager
+					.getBranch()
+					.flatMap(entry => (entry.type === "custom" && entry.customType === "completion-recap" ? [entry.data] : [])),
+			).toEqual([
+				{
+					version: 1,
+					sessionId: focusedManager.getSessionId(),
+					turnId: focusedTurn,
+					state: "available",
+					text: "The focused agent is mid-refactor.",
+				},
+			]);
+			expect(
+				main.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap"),
+			).toBe(false);
+		} finally {
+			controller.dispose();
+		}
+	});
+
+	it("rejects a recap when the view switches to another session during generation", async () => {
 		resetSettingsForTest();
 		await Settings.init({
 			inMemory: true,
@@ -385,15 +431,18 @@ describe("EventController idle compaction teardown", () => {
 			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
 			vi.advanceTimersByTime(240_000);
 			await flushMicrotasks();
-			const replacement = SessionManager.inMemory();
-			replacement.appendMessage(createAssistantMessage());
-			Object.assign(context, { sessionManager: replacement });
-			resolve({ replyText: "An old session's recap.", assistantMessage: createAssistantMessage() });
+			const otherManager = SessionManager.inMemory();
+			otherManager.appendMessage(createAssistantMessage());
+			const other = { ...context.session, sessionManager: otherManager };
+			Object.defineProperty(context, "viewSession", { get: () => other });
+			resolve({ replyText: "The previous view's recap.", assistantMessage: createAssistantMessage() });
 			await flushMicrotasks();
 			expect(context.showStatus).not.toHaveBeenCalled();
-			expect(
-				replacement.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap"),
-			).toBe(false);
+			for (const manager of [context.sessionManager, otherManager]) {
+				expect(
+					manager.getBranch().some(entry => entry.type === "custom" && entry.customType === "completion-recap"),
+				).toBe(false);
+			}
 		} finally {
 			controller.dispose();
 		}

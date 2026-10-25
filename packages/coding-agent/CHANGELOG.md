@@ -4,7 +4,7 @@
 
 ### Added
 
-- Persist the existing completion recap as versioned, turn-bound session metadata for transcript clients, without adding a model-context message or another generation. New work clears it; delayed results cannot cross turns or sessions.
+- Persist the existing completion recap as versioned, turn-bound session metadata for transcript clients, without adding a model-context message or another generation. New work clears it; delayed results cannot cross turns or sessions. While a subagent session is focused, its recap is stored in that session; it is dropped if the view switches before generation finishes.
 
 ### Fixed
 
