@@ -138,7 +138,9 @@ build --tls_certificate=infra/bazel-remote/ca.crt
 
 `.github/workflows/ci.yml` separates `rust_validate` from `native_addons`; TypeScript jobs depend only on `native_addons`.
 
-**Pull requests never build or validate Rust.** Native-affecting PRs are rare enough that they don't warrant a PR-side bazel build: `rust_validate` is skipped entirely (`if: github.event_name != 'pull_request'`), and `native_addons` fetches the latest release's Linux x64 addon pair from the `@oh-my-pi/pi-natives-linux-x64` npm leaf, smoke-loads both, and uploads them as the `native-addons` workflow artifact. The loader skips its version sentinel for workspace loads, so release-versioned addons load fine under a newer checkout. A PR whose TypeScript tests depend on changed native behavior fails visibly (and CI emits a notice on any native-touching PR); the Rust side is validated post-merge on main and again at release.
+**Pull requests build the native addons their TypeScript tests consume.** On the existing hosted `ubuntu-22.04` runner, `native_addons` builds the Linux x64 baseline and modern targets serially from the tested checkout, using the `pr-linux-x64` Bazel disk-cache scope. Full Rust validation (`rust_validate`) still runs only on non-PR events.
+
+Before upload, CI loads both binaries through `process.dlopen` (Bazel's `.node` symlinks resolve to `.so` files), requires every export declared by `packages/natives/native/index.js`, and checks the sole version sentinel against `packages/natives/package.json`. `native-addons-provenance.json` records the tested merge revision, PR head/base, platform, architecture, package version and SHA256 of each addon. PR consumers verify the downloaded revision, platform, version and hashes before installation. An unrelated npm release is not a substitute for these source-matched artifacts; successful ABI checks also do not replace the downstream behavioral suites.
 
 On non-PR events both jobs run on `omp-kata` pods against the cluster remote cache. `rust_validate` runs:
 

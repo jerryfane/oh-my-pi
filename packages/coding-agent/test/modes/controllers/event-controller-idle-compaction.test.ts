@@ -279,6 +279,8 @@ describe("EventController idle compaction teardown", () => {
 		expect(showStatus).not.toHaveBeenCalled();
 	});
 	it("persists a turn-bound recap without adding model messages and clears it on new work", async () => {
+		// Keep real filesystem persistence outside the controller's fake-clock window.
+		vi.useRealTimers();
 		resetSettingsForTest();
 		await Settings.init({
 			inMemory: true,
@@ -294,8 +296,11 @@ describe("EventController idle compaction teardown", () => {
 		}));
 		const controller = new EventController(createContext({ sessionManager: manager, runEphemeralTurn }));
 		try {
+			await manager.flush();
+			vi.useFakeTimers();
 			await controller.handleEvent({ type: "agent_end", messages: [createAssistantMessage()] });
 			vi.advanceTimersByTime(240_000);
+			vi.useRealTimers();
 			await flushMicrotasks();
 			await manager.flush();
 			const records = (await Bun.file(manager.getSessionFile()!).text())
@@ -326,6 +331,7 @@ describe("EventController idle compaction teardown", () => {
 			});
 			expect(manager.buildSessionContext().messages).toEqual(before);
 		} finally {
+			vi.useRealTimers();
 			controller.dispose();
 			await manager.close();
 			await rm(dir, { recursive: true, force: true });
