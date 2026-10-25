@@ -231,7 +231,10 @@ jobs:
               for (const target of ["linux-x64-baseline", "linux-x64-modern"]) {
                 const file = `natives-${target}/pi_natives.${target}.node`;
                 const absolute = path.resolve("bazel-bin", file);
-                const addon = require(absolute);
+                // Bazel's .node symlink resolves to .so; load it as native, not JavaScript.
+                const loaded = { exports: {} };
+                process.dlopen(loaded, absolute);
+                const addon = loaded.exports;
                 assert.deepEqual(Object.keys(addon).filter(name => name.startsWith("__piNativesV")), [sentinel]);
                 for (const name of declaredExports) assert.notEqual(addon[name], undefined, `${target}: missing declared export ${name}`);
                 assert.equal(typeof addon[sentinel], "function");
