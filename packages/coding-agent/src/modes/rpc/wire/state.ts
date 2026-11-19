@@ -315,6 +315,17 @@ export const stateDefs = {
 		"progress?": doc(JSON_OBJECT, "Raw `AgentProgress` record."),
 		"parentToolCallId?": "string",
 	},
+	TopicSummary: {
+		id: "string",
+		title: "string",
+		state: "'starting' | 'running' | 'idle' | 'dead' | 'closed'",
+		turns: "number.integer",
+		queued: "number.integer",
+		createdAt: "number.integer",
+		lastActivityAt: "number.integer",
+		"lastActivity?": "string",
+		"sessionFile?": "string",
+	},
 	SubagentMessages: doc(
 		{
 			sessionFile: "string",

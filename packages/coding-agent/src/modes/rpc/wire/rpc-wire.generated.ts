@@ -744,6 +744,18 @@ export interface SubagentSnapshot {
 	parentToolCallId?: string;
 }
 
+export interface TopicSummary {
+	id: string;
+	title: string;
+	state: "starting" | "running" | "idle" | "dead" | "closed";
+	turns: number;
+	queued: number;
+	createdAt: number;
+	lastActivityAt: number;
+	lastActivity?: string;
+	sessionFile?: string;
+}
+
 /** Incremental subagent transcript read. */
 export interface SubagentMessages {
 	sessionFile: string;
@@ -1715,6 +1727,47 @@ export interface SteerSubagentParams {
 	message: string;
 }
 
+export interface TopicsListResult {
+	topics: TopicSummary[];
+}
+
+export interface TopicsNewParams {
+	title: string;
+	message: string;
+}
+
+export interface TopicsNewResult {
+	topicId: string;
+}
+
+export interface TopicsSendParams {
+	topicId: string;
+	message: string;
+}
+
+export interface TopicsSendResult {
+	topicId: string;
+	mode: "steered" | "queued" | "turn";
+}
+
+export interface TopicsReadParams {
+	topicId: string;
+	fromByte?: number;
+}
+
+export interface TopicsCloseParams {
+	topicId: string;
+}
+
+export interface TopicsReopenParams {
+	topicId: string;
+}
+
+export interface TopicsRenameParams {
+	topicId: string;
+	title: string;
+}
+
 export interface LiveStartParams {
 	voice?: string;
 	instructions?: string;
@@ -1970,6 +2023,13 @@ export interface RpcWireCommands {
 	get_subagent_messages: { params: GetSubagentMessagesParams; result: SubagentMessages };
 	cancel_subagent: { params: CancelSubagentParams; result: CancelSubagentResult };
 	steer_subagent: { params: SteerSubagentParams; result: undefined };
+	topics_list: { params: undefined; result: TopicsListResult };
+	topics_new: { params: TopicsNewParams; result: TopicsNewResult };
+	topics_send: { params: TopicsSendParams; result: TopicsSendResult };
+	topics_read: { params: TopicsReadParams; result: SubagentMessages };
+	topics_close: { params: TopicsCloseParams; result: undefined };
+	topics_reopen: { params: TopicsReopenParams; result: undefined };
+	topics_rename: { params: TopicsRenameParams; result: undefined };
 	live_start: { params: LiveStartParams; result: LiveStartResult };
 	live_connect: { params: LiveConnectParams; result: LiveConnectResult };
 	live_stop: { params: undefined; result: undefined };

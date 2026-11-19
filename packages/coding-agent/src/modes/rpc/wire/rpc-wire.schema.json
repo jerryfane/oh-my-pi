@@ -320,6 +320,83 @@
 				"clientOmit": []
 			},
 			{
+				"name": "topics_list",
+				"doc": "List the owner's topics (persistent workers), newest activity first.",
+				"params": null,
+				"result": "TopicsListResult",
+				"nullable": false,
+				"unwrap": "topics",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_new",
+				"doc": "Start a topic with a title and its first message.",
+				"params": "TopicsNewParams",
+				"result": "TopicsNewResult",
+				"nullable": false,
+				"unwrap": "topicId",
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_send",
+				"doc": "Send the owner's message to one topic: steers a running turn, queues behind one, or starts a new turn.",
+				"params": "TopicsSendParams",
+				"result": "TopicsSendResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_read",
+				"doc": "Read a topic's own conversation incrementally.",
+				"params": "TopicsReadParams",
+				"result": "SubagentMessages",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_close",
+				"doc": "Close a topic; its conversation is kept and it can be reopened.",
+				"params": "TopicsCloseParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_reopen",
+				"doc": "Reopen a closed topic.",
+				"params": "TopicsReopenParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_rename",
+				"doc": "Change a topic's title.",
+				"params": "TopicsRenameParams",
+				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
 				"name": "live_start",
 				"doc": "Start a live voice session bound to this session; returns the voice in use.",
 				"params": "LiveStartParams",
@@ -3448,6 +3525,54 @@
 				"agentSource",
 				"status",
 				"lastUpdate"
+			]
+		},
+		"TopicSummary": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string"
+				},
+				"title": {
+					"type": "string"
+				},
+				"state": {
+					"enum": [
+						"starting",
+						"running",
+						"idle",
+						"dead",
+						"closed"
+					],
+					"type": "string"
+				},
+				"turns": {
+					"type": "integer"
+				},
+				"queued": {
+					"type": "integer"
+				},
+				"createdAt": {
+					"type": "integer"
+				},
+				"lastActivityAt": {
+					"type": "integer"
+				},
+				"lastActivity": {
+					"type": "string"
+				},
+				"sessionFile": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"id",
+				"title",
+				"state",
+				"turns",
+				"queued",
+				"createdAt",
+				"lastActivityAt"
 			]
 		},
 		"SubagentMessages": {
@@ -6636,6 +6761,132 @@
 			"required": [
 				"subagentId",
 				"message"
+			]
+		},
+		"TopicsListResult": {
+			"type": "object",
+			"properties": {
+				"topics": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/TopicSummary"
+					}
+				}
+			},
+			"required": [
+				"topics"
+			]
+		},
+		"TopicsNewParams": {
+			"type": "object",
+			"properties": {
+				"title": {
+					"type": "string"
+				},
+				"message": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"title",
+				"message"
+			]
+		},
+		"TopicsNewResult": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId"
+			]
+		},
+		"TopicsSendParams": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				},
+				"message": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId",
+				"message"
+			]
+		},
+		"TopicsSendResult": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				},
+				"mode": {
+					"enum": [
+						"steered",
+						"queued",
+						"turn"
+					],
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId",
+				"mode"
+			]
+		},
+		"TopicsReadParams": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				},
+				"fromByte": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"topicId"
+			]
+		},
+		"TopicsCloseParams": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId"
+			]
+		},
+		"TopicsReopenParams": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId"
+			]
+		},
+		"TopicsRenameParams": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				},
+				"title": {
+					"type": "string"
+				}
+			},
+			"required": [
+				"topicId",
+				"title"
 			]
 		},
 		"LiveStartParams": {

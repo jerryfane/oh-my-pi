@@ -251,6 +251,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import type { TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { recoverAskHtml } from "../tools/ask";
@@ -1266,6 +1267,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
+	readonly #createTopicsHost: (() => TopicsHost) | undefined;
+	#topicsHost: TopicsHost | undefined;
+	/** Parent session file whose persisted topics were last restored (`undefined` = never). */
+	#topicsRestoredFor: string | null | undefined;
 	/** Manager owned by this top-level session; subagents borrow but never dispose it. */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	/** Manager of this session's root, used for its own job queries and deliveries. */
@@ -2289,6 +2294,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			kernelOwnerId: config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`,
 		});
 		this.#evalToolSession = config.evalToolSession;
+		this.#createTopicsHost = config.createTopicsHost;
 		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
 		if (initialEvalStateContext) {
 			// Persist the startup snapshot at the slot this process sends it from, so
@@ -3495,6 +3501,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	get agentOutputManager(): AgentOutputManager | undefined {
 		return this.#evalToolSession?.agentOutputManager;
+	}
+
+	/**
+	 * The owner's topics, with this session's persisted topics restored, or
+	 * `undefined` when topics are disabled or this is a subagent. Restoring is
+	 * repeated once per parent session file, so it also covers session switches.
+	 */
+	async getTopicsHost(): Promise<TopicsHost | undefined> {
+		if (!this.#createTopicsHost) return undefined;
+		this.#topicsHost ??= this.#createTopicsHost();
+		const sessionFile = this.sessionManager.getSessionFile() ?? null;
+		if (this.#topicsRestoredFor !== sessionFile) {
+			await this.#topicsHost.restore();
+			this.#topicsRestoredFor = sessionFile;
+		}
+		return this.#topicsHost;
 	}
 
 	getAgentId(): string | undefined {

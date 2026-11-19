@@ -185,6 +185,46 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		params: { subagentId: "string", message: "string" },
 	},
 	{
+		name: "topics_list",
+		doc: "List the owner's topics (persistent workers), newest activity first.",
+		result: { topics: "TopicSummary[]" },
+		unwrap: "topics",
+	},
+	{
+		name: "topics_new",
+		doc: "Start a topic with a title and its first message.",
+		params: { title: "string", message: "string" },
+		result: { topicId: "string" },
+		unwrap: "topicId",
+	},
+	{
+		name: "topics_send",
+		doc: "Send the owner's message to one topic: steers a running turn, queues behind one, or starts a new turn.",
+		params: { topicId: "string", message: "string" },
+		result: { topicId: "string", mode: "'steered' | 'queued' | 'turn'" },
+	},
+	{
+		name: "topics_read",
+		doc: "Read a topic's own conversation incrementally.",
+		params: { topicId: "string", "fromByte?": "number.integer" },
+		result: "SubagentMessages",
+	},
+	{
+		name: "topics_close",
+		doc: "Close a topic; its conversation is kept and it can be reopened.",
+		params: { topicId: "string" },
+	},
+	{
+		name: "topics_reopen",
+		doc: "Reopen a closed topic.",
+		params: { topicId: "string" },
+	},
+	{
+		name: "topics_rename",
+		doc: "Change a topic's title.",
+		params: { topicId: "string", title: "string" },
+	},
+	{
 		name: "live_start",
 		doc: "Start a live voice session bound to this session; returns the voice in use.",
 		params: { "voice?": "string", "instructions?": "string" },

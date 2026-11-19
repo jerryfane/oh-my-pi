@@ -450,6 +450,8 @@ import { cfgTtsr } from "./export/ttsr-settings";
 import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRoles } from "./config/model-settings";
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
+import { createTopicsHost } from "./topics/host";
+import { cfgTopicsEnabled } from "./topics/settings";
 import {
 	cfgImagesBlockImages,
 	cfgStartupQuiet,
@@ -5571,6 +5573,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			createVibeTools:
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)
+					: undefined,
+			createTopicsHost:
+				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix && cfgTopicsEnabled.get(settings)
+					? () => createTopicsHost(toolSession)
 					: undefined,
 			builtInToolNames: builtInRegistryToolNames,
 			mcpManagerToolNames: initialMcpManagerToolNames,
