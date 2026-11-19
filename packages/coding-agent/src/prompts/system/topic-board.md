@@ -6,5 +6,5 @@ Other topics of your owner: persistent side conversations, each run by its own a
 {{/if}}
 Open topics first, newest activity first, then closed ones{{#if overflow}}; past the first {{cap}}, titles only{{/if}}. Times are UTC.
 {{rows}}
-Read a topic's conversation: `read history://<id>`. Message a topic: write to `agent://<id>`. A closed topic is paused by the owner; NEVER message it.
+Read a topic's conversation: `read history://<id>`. Ask a topic: write to `agent://<id>`; it answers in a turn of its own (after the one it is working on) and the answer comes back to you when that turn ends. A closed topic refuses messages.
 </topic-board>

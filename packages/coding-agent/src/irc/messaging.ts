@@ -85,7 +85,9 @@ export async function executeSend(
 				? `Failed: ${to} ${unavailable ? "is not running" : "could not receive the message"}. ${receipt.error ?? ""}`.trimEnd()
 				: receipt.outcome === "revived"
 					? `Queued for ${to} (was parked; revived).`
-					: `Delivered to ${to}.`;
+					: receipt.outcome === "queued"
+						? `Queued for ${to}; it takes this in its next turn.`
+						: `Delivered to ${to}.`;
 	}
 	return {
 		content: [{ type: "text", text }],

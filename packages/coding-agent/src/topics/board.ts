@@ -32,10 +32,20 @@ function field(text: string): string {
 	return escapeXmlText(oneLineLabel(text, FIELD_MAX));
 }
 
-function stateLabel(topic: WorkerSummary): string {
-	if (topic.state === "closed") return "closed";
-	const base = topic.state === "idle" ? "idle" : "working";
-	return topic.queued > 0 ? `${base}, queued ${topic.queued}` : base;
+/**
+ * State and time of a topic's row. A working topic shows when its turn started
+ * and no gist: its live activity moves on every progress event, and the board
+ * must change only when a turn starts or settles (or the topic changes state).
+ */
+function statusLabel(topic: WorkerSummary): string {
+	if (topic.state === "idle" || topic.state === "closed") {
+		const gist = topic.lastActivity ? `; ${field(topic.lastActivity)}` : "";
+		return `${topic.state}; last activity ${timeLabel(topic.lastActivityAt)}${gist}`;
+	}
+	const queued = topic.queued > 0 ? `, queued ${topic.queued}` : "";
+	return topic.turnStartedAt === undefined
+		? `working${queued}`
+		: `working${queued}; turn started ${timeLabel(topic.turnStartedAt)}`;
 }
 
 /** Minute-precision UTC, so the board text only moves when a topic does. */
@@ -43,8 +53,9 @@ function timeLabel(ms: number): string {
 	return Number.isFinite(ms) ? `${new Date(ms).toISOString().slice(0, 16)}Z` : "unknown";
 }
 
+/** Newest first by the time the row shows: a working topic's turn start, else its last activity. */
 function byNewestActivity(a: WorkerSummary, b: WorkerSummary): number {
-	return b.lastActivityAt - a.lastActivityAt || a.id.localeCompare(b.id);
+	return (b.turnStartedAt ?? b.lastActivityAt) - (a.turnStartedAt ?? a.lastActivityAt) || a.id.localeCompare(b.id);
 }
 
 /**
@@ -59,8 +70,7 @@ export function formatTopicBoard(topics: readonly WorkerSummary[], audience: Top
 	const rows = [...open, ...closed].map((topic, index) => {
 		const head = `- ${field(topic.title)} (id: ${field(topic.id)})`;
 		if (index >= TOPIC_BOARD_FULL_ROWS) return head;
-		const gist = topic.lastActivity ? `; ${field(topic.lastActivity)}` : "";
-		return `${head}: ${stateLabel(topic)}; last activity ${timeLabel(topic.lastActivityAt)}${gist}`;
+		return `${head}: ${statusLabel(topic)}`;
 	});
 	return prompt
 		.render(topicBoardPrompt, {

@@ -47,6 +47,7 @@ function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
 		},
+		dispose: () => {},
 	};
 }
 

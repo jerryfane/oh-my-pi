@@ -939,6 +939,8 @@ class TopicSummary:
     last_activity_at: int
     last_activity: str | None = None
     session_file: str | None = None
+    turn_started_at: int | None = None
+    """When the turn in flight started; absent while no turn runs."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2395,6 +2397,7 @@ def parse_topic_summary(value: object, path: str = "TopicSummary") -> TopicSumma
         last_activity_at=required(payload, "lastActivityAt", decode_int, path),
         last_activity=optional(payload, "lastActivity", decode_str, path),
         session_file=optional(payload, "sessionFile", decode_str, path),
+        turn_started_at=optional(payload, "turnStartedAt", decode_int, path),
     )
 
 

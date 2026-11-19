@@ -3318,6 +3318,8 @@ type TopicSummary struct {
 	LastActivityAt int64             `json:"lastActivityAt"`
 	LastActivity   *string           `json:"lastActivity,omitempty"`
 	SessionFile    *string           `json:"sessionFile,omitempty"`
+	// When the turn in flight started; absent while no turn runs.
+	TurnStartedAt *int64 `json:"turnStartedAt,omitempty"`
 }
 
 func (v *TopicSummary) UnmarshalJSON(data []byte) error {
@@ -3336,6 +3338,7 @@ func (v *TopicSummary) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("lastActivityAt", &out.LastActivityAt)
 	d.optional("lastActivity", &out.LastActivity)
 	d.optional("sessionFile", &out.SessionFile)
+	d.optional("turnStartedAt", &out.TurnStartedAt)
 	if d.err != nil {
 		return d.err
 	}

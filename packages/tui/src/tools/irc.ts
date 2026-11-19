@@ -35,10 +35,13 @@ export interface IrcMessage {
 	progress?: boolean;
 }
 
-/** Delivery outcome for one peer recipient. */
+/**
+ * Delivery outcome for one peer recipient. `queued`: a busy topic holds the
+ * message for a turn of its own once its current turn ends.
+ */
 export interface IrcDeliveryReceipt {
 	to: string;
-	outcome: "injected" | "woken" | "revived" | "failed";
+	outcome: "injected" | "woken" | "revived" | "queued" | "failed";
 	error?: string;
 }
 /** Status ordering for peer rosters in child prompts. */

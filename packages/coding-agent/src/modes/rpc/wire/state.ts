@@ -325,6 +325,7 @@ export const stateDefs = {
 		lastActivityAt: "number.integer",
 		"lastActivity?": "string",
 		"sessionFile?": "string",
+		"turnStartedAt?": doc("number.integer", "When the turn in flight started; absent while no turn runs."),
 	},
 	SubagentMessages: doc(
 		{

@@ -2,8 +2,11 @@
  * Host-facing topics surface: what a host (RPC client, Herdr control socket)
  * may do with the owner's topics. A topic is a persistent worker in the
  * {@link VibeSessionRegistry.topics} scope of the top-level session; the host
- * talks to it directly, without a turn of the main conversation.
+ * talks to it directly, without a turn of the main conversation. While a host
+ * lives, agents' `agent://<id>` messages to its topics run as topic turns
+ * ({@link VibeSessionRegistry.receive}).
  */
+import { IrcBus } from "../irc/bus";
 import { readRpcSubagentTranscript } from "../modes/rpc/rpc-subagents";
 import type { RpcSubagentMessagesResult } from "../modes/rpc/rpc-types";
 import type { ToolSession } from "../tools";
@@ -31,6 +34,8 @@ export interface TopicsHost {
 	/** Restore persisted topics of the current session (startup, session switch). */
 	restore(): Promise<number>;
 	onChange(listener: (change: WorkerChange) => void): () => void;
+	/** Stop taking agents' messages to the topics; the topics themselves are kept. */
+	dispose(): void;
 }
 
 /** Bind the topics registry to the top-level session's tool session. */
@@ -40,6 +45,7 @@ export function createTopicsHost(session: ToolSession): TopicsHost {
 		const scope = registry.ownerScope(session);
 		return change.ownerId === scope.ownerId && change.parentSessionId === scope.parentSessionId;
 	};
+	const unroute = IrcBus.addRoute((message, bus) => registry.receive(session, message, bus));
 	return {
 		list: () => registry.describe(session),
 		async create({ title, message, name }) {
@@ -71,5 +77,6 @@ export function createTopicsHost(session: ToolSession): TopicsHost {
 				if (ownedBySession(change)) listener(change);
 			});
 		},
+		dispose: unroute,
 	};
 }

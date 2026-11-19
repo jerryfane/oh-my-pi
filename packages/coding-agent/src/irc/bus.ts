@@ -83,6 +83,13 @@ export interface UnansweredSend {
 /** A message awaiting delivery; local-only sends never fall through to a peer tunnel. */
 export type IrcSend = Omit<IrcMessage, "id" | "ts"> & { localOnly?: boolean };
 
+/**
+ * Takes delivery for recipients that run their own turns (topics): returns the
+ * receipt, or `undefined` to leave the message to ordinary delivery. `bus` is
+ * the delivering bus, for its send bookkeeping.
+ */
+export type IrcRecipientRoute = (message: IrcMessage, bus: IrcBusApi) => IrcDeliveryReceipt | undefined;
+
 /** Public surface of the process-global IRC bus, implemented locally on main and by a proxy in workers. */
 export interface IrcBusApi {
 	/** Fire-and-forget delivery; the receipt reports how the message reached the recipient. */
@@ -145,6 +152,18 @@ export class IrcBus implements IrcBusApi {
 	 */
 	static recordReply(from: string, to: string): void {
 		IrcBus.#global?.recordReply(from, to);
+	}
+
+	static readonly #routes = new Set<IrcRecipientRoute>();
+
+	/**
+	 * Route local deliveries through `route` first (see {@link IrcRecipientRoute});
+	 * returns the unregister function. Routes are consulted by the bus that
+	 * delivers locally (main's), whichever thread the sender runs on.
+	 */
+	static addRoute(route: IrcRecipientRoute): () => void {
+		IrcBus.#routes.add(route);
+		return () => IrcBus.#routes.delete(route);
 	}
 
 	readonly #registry: AgentRegistryApi;
@@ -295,6 +314,12 @@ export class IrcBus implements IrcBusApi {
 				outcome: "failed",
 				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
 			};
+		}
+		for (const route of IrcBus.#routes) {
+			const receipt = route(message, this);
+			if (!receipt) continue;
+			if (receipt.outcome !== "failed") this.#relayToMainUi(message);
+			return receipt;
 		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {

@@ -9,11 +9,17 @@
  *   reopened; Vibe rehydration never adopts topic records.
  * - Each topic turn carries a board of the owner's other topics (never
  *   itself); Vibe workers get none. The ids it lists address the topics:
- *   `history://<id>` reads one, `agent://<id>` messages it.
+ *   `history://<id>` reads one. A working topic's row stays put through its
+ *   turn's progress and moves when the turn settles.
+ * - With a topics host, an agent's `agent://<id>` message to a topic runs as a
+ *   topic turn: sibling board, counted, labelled with the sender, answered
+ *   back to the sender. A busy topic queues it, a closed one refuses it, and a
+ *   turn an ask started cannot ask other topics (no chains).
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
@@ -23,13 +29,22 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
+import { formatTopicBoard, topicBoardMessage } from "@oh-my-pi/pi-coding-agent/topics/board";
+import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const OWNER = "Main";
+
+type FollowUpOptions = Parameters<typeof executorModule.runSubagentFollowUpTurn>[0];
+
+/** A follow-up turn held in flight until released with its output. */
+interface HeldTurn {
+	options: FollowUpOptions;
+	release(output?: string): void;
+}
 
 function resultFor(options: ExecutorOptions): SingleResult {
 	return {
@@ -55,6 +70,7 @@ describe("topics registry", () => {
 	let delivered: string[];
 	/** Executor options of every first turn, in spawn order. */
 	let spawnOptions: ExecutorOptions[];
+	let hosts: TopicsHost[];
 
 	function parentFor(sm: SessionManager): ToolSession {
 		return {
@@ -121,10 +137,77 @@ describe("topics registry", () => {
 		return spawned.id;
 	}
 
+	/** Hold every follow-up turn in flight; `turn(n)` resolves once the n-th (0-based) has started. */
+	function holdFollowUps(): (index: number) => Promise<HeldTurn> {
+		const slots: PromiseWithResolvers<HeldTurn>[] = [];
+		const slot = (index: number) => (slots[index] ??= Promise.withResolvers<HeldTurn>());
+		let calls = 0;
+		vi.spyOn(executorModule, "runSubagentFollowUpTurn").mockImplementation(options => {
+			const done = Promise.withResolvers<SingleResult>();
+			const base = resultFor({
+				...options,
+				cwd: tempDir.path(),
+				task: options.message,
+				index: 0,
+			} as ExecutorOptions);
+			slot(calls++).resolve({
+				options,
+				release: (output = base.output) => done.resolve({ ...base, output }),
+			});
+			return done.promise;
+		});
+		return index => slot(index).promise;
+	}
+
+	/** Wait until turn `n` of worker `id` has settled. */
+	async function settled(id: string, n: number): Promise<void> {
+		await manager.getJob(`${id}-t${n}`)?.promise.catch(() => {});
+	}
+
+	function hostFor(parent: ToolSession): TopicsHost {
+		const host = createTopicsHost(parent);
+		hosts.push(host);
+		return host;
+	}
+
+	/** Register the Inbox (main agent) as an IRC recipient; returns what it receives. */
+	function registerInbox(): IrcMessage[] {
+		const received: IrcMessage[] = [];
+		AgentRegistry.global().register({
+			id: OWNER,
+			displayName: OWNER,
+			kind: "main",
+			session: {
+				deliverIrcMessage: async (message: IrcMessage) => {
+					received.push(message);
+					return "injected" as const;
+				},
+			} as never,
+			sessionFile: null,
+			status: "idle",
+		});
+		return received;
+	}
+
+	/** `from` writes `body` to `agent://<to>`, as its `write` tool would. */
+	async function ask(from: string, to: string, body: string): Promise<{ text: string; isError: boolean }> {
+		const session = {
+			getAgentId: () => from,
+			agentRegistry: AgentRegistry.global(),
+			settings: Settings.isolated(),
+			taskDepth: from === OWNER ? 0 : 1,
+			getSessionFile: () => null,
+		} as unknown as ToolSession;
+		const result = await InternalUrlRouter.instance().write(`agent://${to}`, body, { session });
+		const first = result?.content[0];
+		return { text: first?.type === "text" ? first.text : "", isError: result?.isError === true };
+	}
+
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@omp-topics-");
 		delivered = [];
 		spawnOptions = [];
+		hosts = [];
 		manager = new AsyncJobManager({});
 		manager.registerDeliverySink(OWNER, async (_jobId, text) => {
 			delivered.push(text);
@@ -136,6 +219,7 @@ describe("topics registry", () => {
 
 	afterEach(async () => {
 		vi.restoreAllMocks();
+		for (const host of hosts) host.dispose();
 		await manager.dispose({ timeoutMs: 100 });
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
@@ -223,7 +307,7 @@ describe("topics registry", () => {
 		expect(board).not.toContain(`(id: ${first})`);
 	});
 
-	it("lists ids that history:// and agent:// resolve to the topic", async () => {
+	it("lists ids that history:// resolves to the topic's conversation", async () => {
 		const parent = parentFor(sessionManager);
 		const topics = VibeSessionRegistry.topics();
 		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
@@ -240,27 +324,134 @@ describe("topics registry", () => {
 		fs.appendFileSync(ref.sessionFile!, `${JSON.stringify(entry)}\n`);
 		const history = await InternalUrlRouter.instance().resolve(`history://${id}`);
 		expect(history.content).toContain("draft v2 is ready");
+	});
 
-		// Live, the topic's session takes the message the way IRC delivers to any agent.
-		const received: IrcMessage[] = [];
-		AgentRegistry.global().unregister(id, ref);
+	it("keeps the board through a working topic's progress and changes it when the turn settles", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const turn = holdFollowUps();
+		await topics.send(parent, { session: id, message: "draft clause 4" });
+		const held = await turn(0);
+
+		const board = () => formatTopicBoard(topics.describe(parent), "inbox");
+		const working = topicBoardMessage(board(), [])!;
+		expect(working.content).toContain(`(id: ${id}): working; turn started`);
+		const history: AgentMessage[] = [working];
+		for (const lastIntent of ["Reading the contract", "Drafting clause 4", "Checking definitions"]) {
+			held.options.onProgress?.({
+				recentTools: [],
+				toolCount: 1,
+				recentOutput: [],
+				lastIntent,
+			} as unknown as AgentProgress);
+			expect(topicBoardMessage(board(), history)).toBeUndefined();
+		}
+
+		held.release("Clause 4 drafted");
+		await settled(id, 2);
+		const after = topicBoardMessage(board(), history);
+		expect(after?.content).toContain(`(id: ${id}): idle; last activity`);
+		expect(after?.content).toContain("Clause 4 drafted");
+	});
+
+	it("runs an Inbox ask as a topic turn with the sibling board, labelled and counted, and answers the Inbox", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
+		const inbox = registerInbox();
+		hostFor(parent);
+		const turn = holdFollowUps();
+
+		expect(await ask(OWNER, diokan, "is clause 4 final?")).toMatchObject({ isError: false });
+		const held = await turn(0);
+		expect(held.options.message).toContain("Asked by Inbox (`Main`):");
+		expect(held.options.message).toContain("is clause 4 final?");
+		expect(held.options.topicBoard).toContain(`(id: ${notes})`);
+		expect(held.options.topicBoard).not.toContain(`(id: ${diokan})`);
+		expect(topics.describe(parent).find(topic => topic.id === diokan)).toMatchObject({ state: "running", turns: 2 });
+
+		held.release("Clause 4 is final.");
+		await settled(diokan, 2);
+		expect(inbox).toMatchObject([{ from: diokan, to: OWNER, body: "Clause 4 is final.", wakeRelay: true }]);
+	});
+
+	it("queues an ask to a busy topic for a turn of its own, and a closed topic refuses asks", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
+		registerInbox();
+		hostFor(parent);
+		const turn = holdFollowUps();
+
+		await topics.send(parent, { session: diokan, message: "owner work" });
+		const ownerTurn = await turn(0);
+		const queued = await ask(OWNER, diokan, "status?");
+		expect(queued).toMatchObject({ isError: false });
+		expect(queued.text).toContain(`Queued for ${diokan}`);
+		expect(topics.describe(parent).find(topic => topic.id === diokan)?.queued).toBe(1);
+
+		ownerTurn.release();
+		const askTurn = await turn(1);
+		expect(askTurn.options.message).toContain("Asked by Inbox (`Main`):");
+		expect(askTurn.options.message).toContain("status?");
+		expect(askTurn.options.message).not.toContain("owner work");
+		askTurn.release();
+		await settled(diokan, 3);
+
+		await topics.close(parent, notes);
+		const refused = await ask(OWNER, notes, "hello?");
+		expect(refused.isError).toBe(true);
+		expect(refused.text).toContain("is closed");
+	});
+
+	it("lets a topic ask another only in a turn its owner started, and routes the answer back to it", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const trip = await spawnSettled(topics, parent, { name: "Trip", title: "Trip planning" });
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
+		registerInbox();
+		hostFor(parent);
+		const turn = holdFollowUps();
+
+		// In a turn its owner started, Trip may ask Diokan.
+		await topics.send(parent, { session: trip, message: "check the term sheet with Diokan" });
+		const tripTurn = await turn(0);
+		expect(await ask(trip, diokan, "is clause 4 final?")).toMatchObject({ isError: false });
+		const diokanTurn = await turn(1);
+		expect(diokanTurn.options.message).toContain(`Asked by \`${trip}\`:`);
+
+		// In the turn Trip's ask started, neither Diokan nor a helper it runs can ask another topic...
+		const chained = await ask(diokan, notes, "can you check this?");
+		expect(chained.isError).toBe(true);
+		expect(chained.text).toContain("no chains");
 		AgentRegistry.global().register({
-			id,
-			displayName: id,
+			id: "DiokanHelper",
+			displayName: "DiokanHelper",
 			kind: "sub",
-			parentId: OWNER,
-			session: {
-				deliverIrcMessage: async (message: IrcMessage) => {
-					received.push(message);
-					return "injected" as const;
-				},
-			} as never,
-			sessionFile: ref.sessionFile,
-			status: "idle",
+			parentId: diokan,
+			session: null,
+			sessionFile: null,
+			status: "running",
 		});
-		const owner = { ...parent, agentRegistry: AgentRegistry.global() } as unknown as ToolSession;
-		const sent = await InternalUrlRouter.instance().write(`agent://${id}`, "please add clause 5", { session: owner });
-		expect(sent?.isError).toBeFalsy();
-		expect(received).toMatchObject([{ from: OWNER, to: id, body: "please add clause 5" }]);
+		expect((await ask("DiokanHelper", notes, "can you check this?")).text).toContain("no chains");
+		// ...but Diokan can answer Trip, and its answer reaches Trip when Trip's turn ends.
+		expect(await ask(diokan, trip, "which version?")).toMatchObject({ isError: false });
+		diokanTurn.release("Clause 4 is final.");
+		await settled(diokan, 2);
+		tripTurn.release();
+		const replyTurn = await turn(2);
+		expect(replyTurn.options.id).toBe(trip);
+		expect(replyTurn.options.message).toContain(`Reply from \`${diokan}\`:`);
+		expect(replyTurn.options.message).toContain("which version?");
+		expect(replyTurn.options.message).toContain("Clause 4 is final.");
+
+		// The answer started Trip's turn, so Trip cannot ask on from it either: no loop.
+		expect((await ask(trip, diokan, "and clause 5?")).text).toContain("no chains");
+		replyTurn.release();
+		await settled(trip, 3);
 	});
 });

@@ -45,24 +45,40 @@ describe("formatTopicBoard", () => {
 					title: "Diokan <term> sheet",
 					state: "running",
 					queued: 2,
-					lastActivity: "Drafting clause\n4",
+					turnStartedAt: T0 - 30_000,
 				}),
-				topic("Notes", { lastActivityAt: T0 - 60_000 }),
-				topic("Starting", { state: "starting", lastActivityAt: T0 - 120_000 }),
+				topic("Notes", { lastActivityAt: T0 - 60_000, lastActivity: "Drafted\nthe notes" }),
+				topic("Starting", { state: "starting", turnStartedAt: T0 - 120_000 }),
 				topic("Old", { state: "closed", lastActivityAt: T0 + 60_000 }),
 			],
 			"inbox",
 		);
 		expect(rows(board)).toEqual([
-			"- Diokan &lt;term&gt; sheet (id: Diokan): working, queued 2; last activity 2026-11-19T07:05Z; Drafting clause 4",
-			"- Notes title (id: Notes): idle; last activity 2026-11-19T07:04Z",
-			"- Starting title (id: Starting): working; last activity 2026-11-19T07:03Z",
+			"- Diokan &lt;term&gt; sheet (id: Diokan): working, queued 2; turn started 2026-11-19T07:05Z",
+			"- Notes title (id: Notes): idle; last activity 2026-11-19T07:04Z; Drafted the notes",
+			"- Starting title (id: Starting): working; turn started 2026-11-19T07:03Z",
 			"- Old title (id: Old): closed; last activity 2026-11-19T07:06Z",
 		]);
 		expect(board).toStartWith("<topic-board>");
 		expect(board).toEndWith("</topic-board>");
 		expect(board).toContain("`read history://<id>`");
 		expect(board).toContain("`agent://<id>`");
+	});
+
+	it("shows a working topic by its turn start, never its live gist or activity time", () => {
+		const working = (lastActivityAt: number, lastActivity: string) =>
+			formatTopicBoard(
+				[
+					topic("Diokan", { state: "running", turnStartedAt: T0, lastActivityAt, lastActivity }),
+					topic("Notes", { lastActivityAt: T0 + 2 * 60_000 }),
+				],
+				"inbox",
+			);
+		const early = working(T0, "reading the contract");
+		expect(early).not.toContain("reading the contract");
+		// Later progress, past the idle topic's last activity: same text, same order.
+		expect(working(T0 + 5 * 60_000, "drafting clause 4")).toBe(early!);
+		expect(rows(early)[0]).toContain("(id: Notes)");
 	});
 
 	it("lists open topics newest first, then closed ones newest first", () => {

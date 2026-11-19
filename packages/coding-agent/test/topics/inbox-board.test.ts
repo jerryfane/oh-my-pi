@@ -62,7 +62,7 @@ function topic(id: string, overrides: Partial<WorkerSummary> = {}): WorkerSummar
 
 /** A topics host listing whatever `topics` holds when asked. */
 function hostOf(topics: WorkerSummary[]): TopicsHost {
-	return { list: () => topics, restore: async () => 0 } as unknown as TopicsHost;
+	return { list: () => topics, restore: async () => 0, dispose: () => {} } as unknown as TopicsHost;
 }
 
 async function createRegistry(): Promise<ModelRegistry> {

@@ -3511,7 +3511,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async getTopicsHost(): Promise<TopicsHost | undefined> {
 		if (!this.#createTopicsHost) return undefined;
-		this.#topicsHost ??= this.#createTopicsHost();
+		if (!this.#topicsHost) {
+			const host = this.#createTopicsHost();
+			this.#topicsHost = host;
+			this.addDisposer(() => host.dispose());
+		}
 		const sessionFile = this.sessionManager.getSessionFile() ?? null;
 		if (this.#topicsRestoredFor !== sessionFile) {
 			await this.#topicsHost.restore();

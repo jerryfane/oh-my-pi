@@ -3563,6 +3563,10 @@
 				},
 				"sessionFile": {
 					"type": "string"
+				},
+				"turnStartedAt": {
+					"type": "integer",
+					"description": "When the turn in flight started; absent while no turn runs."
 				}
 			},
 			"required": [

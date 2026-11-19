@@ -754,6 +754,8 @@ export interface TopicSummary {
 	lastActivityAt: number;
 	lastActivity?: string;
 	sessionFile?: string;
+	/** When the turn in flight started; absent while no turn runs. */
+	turnStartedAt?: number;
 }
 
 /** Incremental subagent transcript read. */
