@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added an SDK and task-executor spawn depth (createAgentSession spawnDepth, ExecutorOptions spawnDepth/parentSpawnDepth) that limits subagent nesting separately from task depth; a subagent started with a reset spawn depth keeps the full task.maxRecursionDepth budget, including after it is parked and revived.
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes
