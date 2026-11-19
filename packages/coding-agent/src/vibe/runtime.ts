@@ -39,7 +39,7 @@ import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
-import { type AgentDefinition } from "../task/types";
+import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -128,6 +128,11 @@ export interface WorkerScopePolicy {
 	scope?: WorkerScopeTag;
 	/** Deliver each settled turn result into the owner conversation as an async job result. */
 	deliverResults: boolean;
+	/**
+	 * Run workers at the owner's own spawn depth, so helpers they start keep the
+	 * nesting a top-level session has (`task.maxRecursionDepth`).
+	 */
+	ownerSpawnDepth: boolean;
 }
 
 /** Record state change observed by {@link VibeSessionRegistry.onChange} listeners. */
@@ -305,7 +310,11 @@ export class VibeSessionRegistry {
 	/** Process-global registry of owner-facing topic workers (see {@link WorkerScopePolicy}). */
 	static topics(): VibeSessionRegistry {
 		if (!VibeSessionRegistry.#topics) {
-			VibeSessionRegistry.#topics = new VibeSessionRegistry({ scope: "topics", deliverResults: false });
+			VibeSessionRegistry.#topics = new VibeSessionRegistry({
+				scope: "topics",
+				deliverResults: false,
+				ownerSpawnDepth: true,
+			});
 		}
 		return VibeSessionRegistry.#topics;
 	}
@@ -319,7 +328,7 @@ export class VibeSessionRegistry {
 	readonly policy: WorkerScopePolicy;
 	readonly #listeners = new Set<(change: WorkerChange) => void>();
 
-	constructor(policy: WorkerScopePolicy = { deliverResults: true }) {
+	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false }) {
 		this.policy = policy;
 	}
 
@@ -1480,6 +1489,7 @@ export class VibeSessionRegistry {
 			index: 0,
 			id: record.id,
 			taskDepth: session.taskDepth ?? 0,
+			...(this.policy.ownerSpawnDepth ? { spawnDepth: spawnDepthOf(session) } : {}),
 			detached: true,
 			modelOverride: record.modelOverride,
 			modelRole: record.modelRole,

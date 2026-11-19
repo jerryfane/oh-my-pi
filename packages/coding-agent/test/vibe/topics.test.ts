@@ -46,6 +46,8 @@ describe("topics registry", () => {
 	let manager: AsyncJobManager;
 	let sessionManager: SessionManager;
 	let delivered: string[];
+	/** Executor options of every first turn, in spawn order. */
+	let spawnOptions: ExecutorOptions[];
 
 	function parentFor(sm: SessionManager): ToolSession {
 		return {
@@ -72,6 +74,7 @@ describe("topics registry", () => {
 		args: { name: string; title?: string },
 	): Promise<string> {
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			spawnOptions.push(options);
 			const childFile = path.join(
 				path.dirname(sessionManager.getSessionFile()!),
 				path.basename(sessionManager.getSessionFile()!, ".jsonl"),
@@ -114,6 +117,7 @@ describe("topics registry", () => {
 	beforeEach(async () => {
 		tempDir = TempDir.createSync("@omp-topics-");
 		delivered = [];
+		spawnOptions = [];
 		manager = new AsyncJobManager({});
 		manager.registerDeliverySink(OWNER, async (_jobId, text) => {
 			delivered.push(text);
@@ -139,6 +143,17 @@ describe("topics registry", () => {
 
 		expect(delivered.some(text => text.includes("answer from Worker"))).toBe(true);
 		expect(delivered.some(text => text.includes("answer from Diokan"))).toBe(false);
+	});
+
+	it("starts topic workers at the owner's spawn depth, while vibe workers count one level down", async () => {
+		const parent = parentFor(sessionManager);
+		await spawnSettled(VibeSessionRegistry.topics(), parent, { name: "Diokan", title: "Diokan" });
+		await spawnSettled(VibeSessionRegistry.global(), parent, { name: "Worker" });
+		const [topicOptions, vibeOptions] = spawnOptions;
+
+		// spawnDepth 0 = same nesting allowance as the main session; absent = executor's parent + 1.
+		expect(topicOptions).toMatchObject({ taskDepth: 0, spawnDepth: 0 });
+		expect(vibeOptions?.spawnDepth).toBeUndefined();
 	});
 
 	it("persists title and close across a restart and reopens with the conversation", async () => {
