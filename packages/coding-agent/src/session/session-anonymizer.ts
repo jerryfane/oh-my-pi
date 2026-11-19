@@ -572,7 +572,7 @@ const TOOL_ENUM_VALUES: Record<string, ReadonlySet<string>> = {
 	agentSource: new Set(["bundled", "user", "project"]),
 	modelRole: new Set(["default", "smol", "slow", "plan", "vision", "commit"]),
 	resolvedThinkingLevel: new Set(["off", "minimal", "low", "medium", "high", "xhigh", "max", "auto"]),
-	outcome: new Set(["injected", "woken", "revived", "failed"]),
+	outcome: new Set(["injected", "woken", "revived", "queued", "failed"]),
 	server: new Set(["typescript-native", "typescript-language-server", "rust-analyzer", "gopls", "pyright", "clangd"]),
 	contentType: MIME_TYPES,
 	mimeType: MIME_TYPES,

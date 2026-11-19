@@ -39,6 +39,7 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { CustomTool } from "../extensibility/custom-tools/types";
 import type { ExtensionRunner, PreparedExtension } from "../extensibility/extensions";
 import type { MCPLoadResult } from "../mcp";
+import type { TopicsHost } from "../topics/host";
 import type { CacheWarmer } from "./cache-warmer";
 import type { ContextUsage } from "../extensibility/extensions/types";
 import type { SkillDescriptionCatalog } from "../extensibility/skill-descriptions";
@@ -311,6 +312,8 @@ export interface AgentSessionConfig {
 	toolRegistry?: Map<string, AgentTool>;
 	/** Creates tools registered only while vibe mode is active. */
 	createVibeTools?: () => AgentTool[];
+	/** Owner-facing topics of this top-level session; absent when topics are disabled or for subagents. */
+	createTopicsHost?: () => TopicsHost;
 	/** Names whose current registry entry is the built-in implementation. */
 	builtInToolNames?: Iterable<string>;
 	/** MCP names whose initial registry entries came from the manager snapshot. */
@@ -481,6 +484,8 @@ export interface PromptOptions {
 	skipCompactionCheck?: boolean;
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */
 	solutionSpace?: string;
+	/** A topic worker's board of its siblings for this turn (see `topicBoardForTurn` in `topics/board`). */
+	topicBoard?: string;
 	/**
 	 * Called synchronously once this prompt is admitted: idle, at the start of
 	 * #promptWithMessage's own turn setup (before preflight, image

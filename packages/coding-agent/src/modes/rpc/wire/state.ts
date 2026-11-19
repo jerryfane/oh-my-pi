@@ -6,6 +6,7 @@
  * omits them.
  */
 import { absentAs, doc, type WireDefs } from "./dsl";
+import { topicsStateDefs } from "./topics";
 
 const JSON_OBJECT = "Record<string, unknown>";
 
@@ -315,6 +316,7 @@ export const stateDefs = {
 		"progress?": doc(JSON_OBJECT, "Raw `AgentProgress` record."),
 		"parentToolCallId?": "string",
 	},
+	...topicsStateDefs,
 	SubagentMessages: doc(
 		{
 			sessionFile: "string",

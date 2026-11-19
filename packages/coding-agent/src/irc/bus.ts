@@ -16,6 +16,7 @@ import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry
 import type { CustomMessage } from "../session/messages";
 import { agentMesh } from "./mesh";
 import { parsePeerAddress } from "./mesh-protocol";
+import { routeIrcMessage } from "./routes";
 
 interface IrcWaiter {
 	filter: IrcWaitFilter;
@@ -296,6 +297,12 @@ export class IrcBus implements IrcBusApi {
 				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
 			};
 		}
+		const routed = routeIrcMessage(message, this);
+		if (routed.receipt) {
+			if (routed.receipt.outcome !== "failed") this.#relayToMainUi(message);
+			return routed.receipt;
+		}
+		message = routed.message;
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
 			return {

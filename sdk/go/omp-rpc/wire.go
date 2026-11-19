@@ -3308,6 +3308,70 @@ func (v *SubagentSnapshot) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type TopicSummary struct {
+	ID             string            `json:"id"`
+	Title          string            `json:"title"`
+	State          TopicSummaryState `json:"state"`
+	Turns          int64             `json:"turns"`
+	Queued         int64             `json:"queued"`
+	CreatedAt      int64             `json:"createdAt"`
+	LastActivityAt int64             `json:"lastActivityAt"`
+	LastActivity   *string           `json:"lastActivity,omitempty"`
+	// First line of the owner's latest message to the topic, when this process saw one.
+	OwnerLine   *string `json:"ownerLine,omitempty"`
+	SessionFile *string `json:"sessionFile,omitempty"`
+	// When the turn in flight started; absent while no turn runs.
+	TurnStartedAt *int64 `json:"turnStartedAt,omitempty"`
+}
+
+func (v *TopicSummary) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicSummary", v.decodeFrom)
+}
+
+func (v *TopicSummary) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicSummary
+	d := fieldDecoder{raw: raw, owner: "TopicSummary"}
+	d.required("id", &out.ID)
+	d.required("title", &out.Title)
+	d.required("state", &out.State)
+	d.required("turns", &out.Turns)
+	d.required("queued", &out.Queued)
+	d.required("createdAt", &out.CreatedAt)
+	d.required("lastActivityAt", &out.LastActivityAt)
+	d.optional("lastActivity", &out.LastActivity)
+	d.optional("ownerLine", &out.OwnerLine)
+	d.optional("sessionFile", &out.SessionFile)
+	d.optional("turnStartedAt", &out.TurnStartedAt)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicSummaryState string
+
+const (
+	TopicSummaryStateStarting TopicSummaryState = "starting"
+	TopicSummaryStateRunning  TopicSummaryState = "running"
+	TopicSummaryStateIdle     TopicSummaryState = "idle"
+	TopicSummaryStateDead     TopicSummaryState = "dead"
+	TopicSummaryStateClosed   TopicSummaryState = "closed"
+)
+
+func (v *TopicSummaryState) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "TopicSummaryState")
+	if err != nil {
+		return err
+	}
+	switch value := TopicSummaryState(s); value {
+	case TopicSummaryStateStarting, TopicSummaryStateRunning, TopicSummaryStateIdle, TopicSummaryStateDead, TopicSummaryStateClosed:
+		*v = value
+		return nil
+	}
+	return unknownValue("TopicSummaryState", s)
+}
+
 // Incremental subagent transcript read.
 type SubagentMessages struct {
 	SessionFile string `json:"sessionFile"`
@@ -7449,6 +7513,86 @@ func (v *CancelSubagentResult) decodeFrom(raw map[string]json.RawMessage) error 
 	return nil
 }
 
+type TopicsListResult struct {
+	Topics []TopicSummary `json:"topics"`
+}
+
+func (v *TopicsListResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsListResult", v.decodeFrom)
+}
+
+func (v *TopicsListResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsListResult
+	d := fieldDecoder{raw: raw, owner: "TopicsListResult"}
+	d.required("topics", &out.Topics)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicsNewResult struct {
+	TopicID string `json:"topicId"`
+}
+
+func (v *TopicsNewResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsNewResult", v.decodeFrom)
+}
+
+func (v *TopicsNewResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsNewResult
+	d := fieldDecoder{raw: raw, owner: "TopicsNewResult"}
+	d.required("topicId", &out.TopicID)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicsSendResult struct {
+	TopicID string               `json:"topicId"`
+	Mode    TopicsSendResultMode `json:"mode"`
+}
+
+func (v *TopicsSendResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsSendResult", v.decodeFrom)
+}
+
+func (v *TopicsSendResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsSendResult
+	d := fieldDecoder{raw: raw, owner: "TopicsSendResult"}
+	d.required("topicId", &out.TopicID)
+	d.required("mode", &out.Mode)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicsSendResultMode string
+
+const (
+	TopicsSendResultModeSteered TopicsSendResultMode = "steered"
+	TopicsSendResultModeQueued  TopicsSendResultMode = "queued"
+	TopicsSendResultModeTurn    TopicsSendResultMode = "turn"
+)
+
+func (v *TopicsSendResultMode) UnmarshalJSON(data []byte) error {
+	s, err := decodeString(data, "TopicsSendResultMode")
+	if err != nil {
+		return err
+	}
+	switch value := TopicsSendResultMode(s); value {
+	case TopicsSendResultModeSteered, TopicsSendResultModeQueued, TopicsSendResultModeTurn:
+		*v = value
+		return nil
+	}
+	return unknownValue("TopicsSendResultMode", s)
+}
+
 type LiveStartResult struct {
 	Voice string `json:"voice"`
 }
@@ -8146,6 +8290,83 @@ type SteerSubagentCommand struct {
 // SteerSubagent sends "steer_subagent": Send a message to a running subagent as its user.
 func (c Commands) SteerSubagent(ctx context.Context, p SteerSubagentCommand) error {
 	return c.call(ctx, "steer_subagent", p, 0, nil)
+}
+
+// TopicsList sends "topics_list": List the owner's topics (persistent workers), newest activity first.
+func (c Commands) TopicsList(ctx context.Context) ([]TopicSummary, error) {
+	var out TopicsListResult
+	err := c.call(ctx, "topics_list", nil, 0, &out)
+	return out.Topics, err
+}
+
+// TopicsNewCommand holds the parameters of "topics_new".
+type TopicsNewCommand struct {
+	Title   string `json:"title"`
+	Message string `json:"message"`
+}
+
+// TopicsNew sends "topics_new": Start a topic with a title and its first message.
+func (c Commands) TopicsNew(ctx context.Context, p TopicsNewCommand) (string, error) {
+	var out TopicsNewResult
+	err := c.call(ctx, "topics_new", p, 0, &out)
+	return out.TopicID, err
+}
+
+// TopicsSendCommand holds the parameters of "topics_send".
+type TopicsSendCommand struct {
+	TopicID string `json:"topicId"`
+	Message string `json:"message"`
+}
+
+// TopicsSend sends "topics_send": Send the owner's message to one topic: steers a running turn, queues behind one, or starts a new turn.
+func (c Commands) TopicsSend(ctx context.Context, p TopicsSendCommand) (TopicsSendResult, error) {
+	var out TopicsSendResult
+	err := c.call(ctx, "topics_send", p, 0, &out)
+	return out, err
+}
+
+// TopicsReadCommand holds the parameters of "topics_read".
+type TopicsReadCommand struct {
+	TopicID  string `json:"topicId"`
+	FromByte *int64 `json:"fromByte,omitempty"`
+}
+
+// TopicsRead sends "topics_read": Read a topic's own conversation incrementally.
+func (c Commands) TopicsRead(ctx context.Context, p TopicsReadCommand) (SubagentMessages, error) {
+	var out SubagentMessages
+	err := c.call(ctx, "topics_read", p, 0, &out)
+	return out, err
+}
+
+// TopicsCloseCommand holds the parameters of "topics_close".
+type TopicsCloseCommand struct {
+	TopicID string `json:"topicId"`
+}
+
+// TopicsClose sends "topics_close": Close a topic; its conversation is kept and it can be reopened.
+func (c Commands) TopicsClose(ctx context.Context, p TopicsCloseCommand) error {
+	return c.call(ctx, "topics_close", p, 0, nil)
+}
+
+// TopicsReopenCommand holds the parameters of "topics_reopen".
+type TopicsReopenCommand struct {
+	TopicID string `json:"topicId"`
+}
+
+// TopicsReopen sends "topics_reopen": Reopen a closed topic.
+func (c Commands) TopicsReopen(ctx context.Context, p TopicsReopenCommand) error {
+	return c.call(ctx, "topics_reopen", p, 0, nil)
+}
+
+// TopicsRenameCommand holds the parameters of "topics_rename".
+type TopicsRenameCommand struct {
+	TopicID string `json:"topicId"`
+	Title   string `json:"title"`
+}
+
+// TopicsRename sends "topics_rename": Change a topic's title.
+func (c Commands) TopicsRename(ctx context.Context, p TopicsRenameCommand) error {
+	return c.call(ctx, "topics_rename", p, 0, nil)
 }
 
 // LiveStartCommand holds the parameters of "live_start".

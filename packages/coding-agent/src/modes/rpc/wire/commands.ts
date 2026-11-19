@@ -6,6 +6,7 @@
  * `<Command>Params` / `<Command>Result`; a string names a shared definition.
  */
 import { doc } from "./dsl";
+import { topicsRpcCommands } from "./topics";
 
 /** One RPC command as described to generators. */
 export interface RpcCommandSpec {
@@ -184,6 +185,7 @@ export const rpcCommands: readonly RpcCommandSpec[] = [
 		doc: "Send a message to a running subagent as its user.",
 		params: { subagentId: "string", message: "string" },
 	},
+	...topicsRpcCommands,
 	{
 		name: "live_start",
 		doc: "Start a live voice session bound to this session; returns the voice in use.",

@@ -3481,6 +3481,29 @@ pub struct SubagentSnapshot {
 	pub parent_tool_call_id: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicSummary {
+	pub id: String,
+	pub title: String,
+	pub state: TopicSummaryState,
+	pub turns: i64,
+	pub queued: i64,
+	#[serde(rename = "createdAt")]
+	pub created_at: i64,
+	#[serde(rename = "lastActivityAt")]
+	pub last_activity_at: i64,
+	#[serde(rename = "lastActivity", default, skip_serializing_if = "Option::is_none")]
+	pub last_activity: Option<String>,
+	/// First line of the owner's latest message to the topic, when this process saw one.
+	#[serde(rename = "ownerLine", default, skip_serializing_if = "Option::is_none")]
+	pub owner_line: Option<String>,
+	#[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
+	pub session_file: Option<String>,
+	/// When the turn in flight started; absent while no turn runs.
+	#[serde(rename = "turnStartedAt", default, skip_serializing_if = "Option::is_none")]
+	pub turn_started_at: Option<i64>,
+}
+
 /// Incremental subagent transcript read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentMessages {
@@ -5467,6 +5490,64 @@ pub struct SteerSubagentParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsListResult {
+	pub topics: Vec<TopicSummary>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsNewParams {
+	pub title: String,
+	pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsNewResult {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsSendParams {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	pub message: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsSendResult {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	pub mode: TopicsSendResultMode,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsReadParams {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	#[serde(rename = "fromByte", default, skip_serializing_if = "Option::is_none")]
+	pub from_byte: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsCloseParams {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsReopenParams {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsRenameParams {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LiveStartParams {
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub voice: Option<String>,
@@ -6004,6 +6085,33 @@ impl<'de> Deserialize<'de> for LitCompleted {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TopicSummaryState {
+	#[serde(rename = "starting")]
+	Starting,
+	#[serde(rename = "running")]
+	Running,
+	#[serde(rename = "idle")]
+	Idle,
+	#[serde(rename = "dead")]
+	Dead,
+	#[serde(rename = "closed")]
+	Closed,
+}
+
+impl TopicSummaryState {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Starting => "starting",
+			Self::Running => "running",
+			Self::Idle => "idle",
+			Self::Dead => "dead",
+			Self::Closed => "closed",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum LogoutAccountType {
 	#[serde(rename = "api_key")]
 	ApiKey,
@@ -6119,6 +6227,27 @@ impl HostUriResultContentType {
 			Self::TextMarkdown => "text/markdown",
 			Self::ApplicationJson => "application/json",
 			Self::TextPlain => "text/plain",
+		}
+	}
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum TopicsSendResultMode {
+	#[serde(rename = "steered")]
+	Steered,
+	#[serde(rename = "queued")]
+	Queued,
+	#[serde(rename = "turn")]
+	Turn,
+}
+
+impl TopicsSendResultMode {
+	/// Wire value.
+	pub fn as_str(self) -> &'static str {
+		match self {
+			Self::Steered => "steered",
+			Self::Queued => "queued",
+			Self::Turn => "turn",
 		}
 	}
 }
@@ -6697,6 +6826,129 @@ pub struct SteerSubagentCommand {
 
 impl Command for SteerSubagentCommand {
 	const NAME: &'static str = "steer_subagent";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
+	}
+}
+
+/// List the owner's topics (persistent workers), newest activity first.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TopicsListCommand {}
+
+impl Command for TopicsListCommand {
+	const NAME: &'static str = "topics_list";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = Vec<TopicSummary>;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsListResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.topics)
+	}
+}
+
+/// Start a topic with a title and its first message.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsNewCommand {
+	pub title: String,
+	pub message: String,
+}
+
+impl Command for TopicsNewCommand {
+	const NAME: &'static str = "topics_new";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = String;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsNewResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.topic_id)
+	}
+}
+
+/// Send the owner's message to one topic: steers a running turn, queues behind one, or starts a new turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsSendCommand {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	pub message: String,
+}
+
+impl Command for TopicsSendCommand {
+	const NAME: &'static str = "topics_send";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = TopicsSendResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsSendResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Read a topic's own conversation incrementally.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsReadCommand {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	#[serde(rename = "fromByte", default, skip_serializing_if = "Option::is_none")]
+	pub from_byte: Option<i64>,
+}
+
+impl Command for TopicsReadCommand {
+	const NAME: &'static str = "topics_read";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = SubagentMessages;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<SubagentMessages>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Close a topic; its conversation is kept and it can be reopened.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsCloseCommand {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+}
+
+impl Command for TopicsCloseCommand {
+	const NAME: &'static str = "topics_close";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
+	}
+}
+
+/// Reopen a closed topic.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsReopenCommand {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+}
+
+impl Command for TopicsReopenCommand {
+	const NAME: &'static str = "topics_reopen";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
+	}
+}
+
+/// Change a topic's title.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsRenameCommand {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	pub title: String,
+}
+
+impl Command for TopicsRenameCommand {
+	const NAME: &'static str = "topics_rename";
 	const TIMEOUT_MS: Option<u64> = None;
 	type Output = ();
 

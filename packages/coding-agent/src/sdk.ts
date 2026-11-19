@@ -450,6 +450,7 @@ import { cfgTtsr } from "./export/ttsr-settings";
 import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRoles } from "./config/model-settings";
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
+import { topicsHostFactory } from "./topics/host";
 import {
 	cfgImagesBlockImages,
 	cfgStartupQuiet,
@@ -951,6 +952,11 @@ export interface CreateAgentSessionOptions {
 	bindProcessState?: boolean;
 	/** Task recursion depth (for subagent sessions). Default: 0 */
 	taskDepth?: number;
+	/**
+	 * Depth that gates spawn capacity (`task.maxRecursionDepth`) for this session. Default: `taskDepth`.
+	 * Only spawn gating reads it; every other depth-dependent behaviour keys on `taskDepth`.
+	 */
+	spawnDepth?: number;
 	/** Parent Hindsight state to alias for subagent memory tools. */
 	parentHindsightSessionState?: HindsightSessionStateApi;
 	/** Parent Mnemopi state: subagents alias it; a top-level fork (`/tan`) inherits its delivered recall. */
@@ -2749,6 +2755,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				return prewalk !== undefined || deferredPrewalk !== undefined;
 			},
 			taskDepth: options.taskDepth ?? 0,
+			spawnDepth: options.spawnDepth ?? options.taskDepth ?? 0,
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -5572,6 +5579,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)
 					: undefined,
+			createTopicsHost: topicsHostFactory(toolSession, (options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix),
 			builtInToolNames: builtInRegistryToolNames,
 			mcpManagerToolNames: initialMcpManagerToolNames,
 			transformContext,

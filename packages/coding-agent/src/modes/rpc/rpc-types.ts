@@ -18,6 +18,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type { RpcTopicsCommand, RpcTopicsResponse } from "./rpc-topics";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { WireSessionEvent } from "../../session/loop-end-wire";
 import type { SessionLeaseReport } from "../../session/session-storage";
@@ -86,6 +87,7 @@ export type RpcCommand =
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
 	| { id?: string; type: "cancel_subagent"; subagentId: string }
 	| { id?: string; type: "steer_subagent"; subagentId: string; message: string }
+	| RpcTopicsCommand
 	// Live voice (GPT live bound to this session)
 	| { id?: string; type: "live_start"; voice?: string; instructions?: string }
 	| { id?: string; type: "live_connect"; sdpOffer: string; voice?: string; instructions?: string }
@@ -534,6 +536,7 @@ export type RpcResponse =
 			data: { cancelled: boolean };
 	  }
 	| { id?: string; type: "response"; command: "steer_subagent"; success: true }
+	| RpcTopicsResponse
 
 	// Model
 	| {

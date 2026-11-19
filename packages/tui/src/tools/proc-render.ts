@@ -352,6 +352,7 @@ const RECEIPT_TONE: Record<IrcDeliveryReceipt["outcome"], TspTone> = {
 	injected: "success",
 	woken: "success",
 	revived: "warning",
+	queued: "success",
 	failed: "error",
 };
 

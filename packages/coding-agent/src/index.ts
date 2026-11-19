@@ -85,3 +85,11 @@ export * from "@oh-my-pi/pi-tui/chrome/form-theme";
 export * from "@oh-my-pi/pi-tui/native/spans";
 export * from "@oh-my-pi/pi-tui/tools/xd-url";
 export { cfgExtensionTranscriptPresenters, type SkillsSettings } from "./extensibility/settings";
+// Topics control endpoint for host extensions (the event bus only signals changes)
+export {
+	currentTopicsControl,
+	TOPICS_CONTROL_CHANNEL,
+	TOPICS_CONTROL_REQUEST_CHANNEL,
+	type TopicsControlChanged,
+	type TopicsControlEndpoint,
+} from "./topics/control";

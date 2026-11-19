@@ -33,12 +33,21 @@ export interface IrcMessage {
 	 * so the recipient's `wait` keeps waiting for the actual reply.
 	 */
 	progress?: boolean;
+	/**
+	 * Set by delivery routing, never by a sender: an idle recipient takes the
+	 * message into its history for its next turn instead of starting one (a
+	 * progress note from a topic turn another agent's message started).
+	 */
+	noWake?: boolean;
 }
 
-/** Delivery outcome for one peer recipient. */
+/**
+ * Delivery outcome for one peer recipient. `queued`: a busy topic holds the
+ * message for a turn of its own once its current turn ends.
+ */
 export interface IrcDeliveryReceipt {
 	to: string;
-	outcome: "injected" | "woken" | "revived" | "failed";
+	outcome: "injected" | "woken" | "revived" | "queued" | "failed";
 	error?: string;
 }
 /** Status ordering for peer rosters in child prompts. */

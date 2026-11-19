@@ -251,6 +251,8 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import { topicBoardForTurn } from "../topics/board";
+import { SessionTopics, type TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { recoverAskHtml } from "../tools/ask";
@@ -1266,6 +1268,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
+	readonly #topics: SessionTopics | undefined;
 	/** Manager owned by this top-level session; subagents borrow but never dispose it. */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	/** Manager of this session's root, used for its own job queries and deliveries. */
@@ -2289,6 +2292,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			kernelOwnerId: config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`,
 		});
 		this.#evalToolSession = config.evalToolSession;
+		this.#topics = config.createTopicsHost && new SessionTopics(config.createTopicsHost, d => this.addDisposer(d));
 		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
 		if (initialEvalStateContext) {
 			// Persist the startup snapshot at the slot this process sends it from, so
@@ -3495,6 +3499,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	get agentOutputManager(): AgentOutputManager | undefined {
 		return this.#evalToolSession?.agentOutputManager;
+	}
+
+	/** The owner's topics with this session's restored, or `undefined` when disabled or a subagent. */
+	async getTopicsHost(): Promise<TopicsHost | undefined> {
+		return this.#topics?.host(this.sessionManager.getSessionFile() ?? null);
 	}
 
 	getAgentId(): string | undefined {
@@ -9892,7 +9901,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted"
+			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted" | "topicBoard"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -9994,6 +10003,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (vibeModeMessage) {
 				messages.push(vibeModeMessage);
 			}
+			// After the stable prefix, never in the system prompt: a changed board appends one message here.
+			const topicBoard = await topicBoardForTurn(options?.topicBoard, () => this.getTopicsHost(), this.messages);
+			if (topicBoard) messages.push(topicBoard);
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);
 			}

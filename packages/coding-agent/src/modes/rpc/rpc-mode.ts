@@ -93,6 +93,7 @@ import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isSessionSettled } from "../../session/session-settle";
 import { RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+import { isRpcTopicsCommand, respondRpcTopicsCommand } from "./rpc-topics";
 import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
@@ -2024,6 +2025,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommandImpl = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (isRpcTopicsCommand(command)) return respondRpcTopicsCommand(session.getTopicsHost(), command);
 
 		switch (command.type) {
 			case "negotiate_protocol": {

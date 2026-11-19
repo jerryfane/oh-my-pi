@@ -39,7 +39,7 @@ import { getBundledAgent } from "../task/agents";
 import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
-import { type AgentDefinition } from "../task/types";
+import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -56,6 +56,17 @@ import {
 	type VibeTombstoneReason,
 } from "./lifecycle";
 import { type VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
+import type {
+	QueuedMessage,
+	WorkerChange,
+	WorkerScopePolicy,
+	WorkerSummary,
+	WorkerTurnOrigin,
+	WorkerView,
+} from "./worker-scope";
+
+/** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
+export type { WorkerChange, WorkerSummary } from "./worker-scope";
 
 import { cfgTaskAgentAccountPools, cfgTaskAgentModelOverrides } from "../task/settings";
 /**
@@ -114,6 +125,7 @@ interface VibeRestoreCandidate {
 	lastActivityAt: number;
 	inFlight: boolean;
 	tombstoneReason?: VibeTombstoneReason;
+	title?: string;
 }
 
 interface ResolvedVibeWorker {
@@ -123,7 +135,7 @@ interface ResolvedVibeWorker {
 	modelRole?: string;
 }
 
-interface VibeTurn {
+interface VibeTurn extends WorkerTurnOrigin {
 	jobId: string;
 	message: string;
 	startedAt: number;
@@ -145,10 +157,16 @@ interface VibeRecord {
 	/** Pre-expansion role alias behind {@link modelOverride}, when the worker agent named one. */
 	modelRole?: string;
 	state: VibeSessionState;
+	/** Owner-facing title (topics). */
+	title?: string;
+	/** Closed by the owner (topics): sends are refused until reopened; the conversation is kept. */
+	closed?: boolean;
 	createdAt: number;
 	lastActivityAt: number;
 	/** One-line gist of the latest activity (intent, tool, or result preview). */
 	lastActivity?: string;
+	/** First line of the owner's latest message (spawn or send); see {@link WorkerSummary.ownerLine}. */
+	ownerLine?: string;
 	/** Resolved model display string once known. */
 	resolvedModel?: string;
 	turn?: VibeTurn;
@@ -162,8 +180,8 @@ interface VibeRecord {
 	};
 	/** Job id of the most recently settled turn (wait snapshots after settle). */
 	lastJobId?: string;
-	/** Messages queued while a turn was in flight; drained into the next turn. */
-	queue: string[];
+	/** Messages queued while a turn was in flight, and progress notes held while idle; drained into the next turn. */
+	queue: QueuedMessage[];
 	turnCount: number;
 	killed: boolean;
 	/** True while a parent switch is detaching this process-local record without terminating it. */
@@ -266,6 +284,43 @@ export class VibeSessionRegistry {
 		VibeSessionRegistry.#global = undefined;
 	}
 
+	readonly policy: WorkerScopePolicy;
+	readonly #listeners = new Set<(change: WorkerChange) => void>();
+
+	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false }) {
+		this.policy = policy;
+	}
+
+	/** Observe record state changes; returns an unsubscribe function. */
+	onChange(listener: (change: WorkerChange) => void): () => void {
+		this.#listeners.add(listener);
+		return () => this.#listeners.delete(listener);
+	}
+
+	#emit(record: VibeRecord, reason: WorkerChange["reason"]): void {
+		const change: WorkerChange = {
+			id: record.id,
+			ownerId: record.ownerId,
+			parentSessionId: record.parentSessionId,
+			reason,
+		};
+		for (const listener of this.#listeners) {
+			try {
+				listener(change);
+			} catch (error) {
+				logger.warn("vibe: worker change listener failed", {
+					id: record.id,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
+	/** Whether a persisted event belongs to this registry's scope. */
+	#ownsEvent(event: VibeLifecycleEvent): boolean {
+		return event.scope === this.policy.scope;
+	}
+
 	/**
 	 * Insert a bare worker record without the spawn machinery. Test-only —
 	 * lets focused runtime tests attach an optional synthetic in-flight job.
@@ -297,7 +352,15 @@ export class VibeSessionRegistry {
 			createdAt: now,
 			lastActivityAt: now,
 			turn: record.jobId
-				? { jobId: record.jobId, message: "test turn", startedAt: now, trace: [], toolCount: 0 }
+				? {
+						jobId: record.jobId,
+						message: "test turn",
+						startedAt: now,
+						trace: [],
+						toolCount: 0,
+						startedBy: [],
+						askers: [],
+					}
 				: undefined,
 			queue: [],
 			turnCount: 0,
@@ -396,6 +459,7 @@ export class VibeSessionRegistry {
 	#eventBase(record: VibeRecord): VibeLifecycleBase {
 		return {
 			version: VIBE_LIFECYCLE_VERSION,
+			...(this.policy.scope ? { scope: this.policy.scope } : {}),
 			id: record.id,
 			ownerId: record.ownerId,
 			parentSessionId: record.parentSessionId,
@@ -425,6 +489,7 @@ export class VibeSessionRegistry {
 			const event = parseLifecycleEvent(entry.data);
 			if (
 				!event ||
+				!this.#ownsEvent(event) ||
 				event.id !== record.id ||
 				event.ownerId !== record.ownerId ||
 				event.parentSessionId !== record.parentSessionId
@@ -432,7 +497,7 @@ export class VibeSessionRegistry {
 				continue;
 			}
 			if (event.action === "tombstone") terminalReason = event.reason;
-			else if (event.action === "tombstone-revoked" && terminalReason === "mode-exit") terminalReason = undefined;
+			else if (event.action === "tombstone-revoked" && terminalReason === event.reason) terminalReason = undefined;
 		}
 		return terminalReason !== undefined;
 	}
@@ -697,9 +762,12 @@ export class VibeSessionRegistry {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;
+			if (!this.#ownsEvent(event)) continue;
 			if (event.action === "spawn") allSpawns.set(event.id, event);
-			else if (event.action === "tombstone") terminalIntents.set(event.id, event.reason);
-			else if (event.action === "tombstone-revoked" && terminalIntents.get(event.id) === "mode-exit") {
+			// A closed topic keeps its conversation: it is restored as closed, never terminal.
+			else if (event.action === "tombstone" && event.reason !== "closed")
+				terminalIntents.set(event.id, event.reason);
+			else if (event.action === "tombstone-revoked" && terminalIntents.get(event.id) === event.reason) {
 				terminalIntents.delete(event.id);
 			}
 		}
@@ -709,6 +777,7 @@ export class VibeSessionRegistry {
 			if (entry.type !== "custom" || entry.customType !== VIBE_LIFECYCLE_CUSTOM_TYPE) continue;
 			const event = parseLifecycleEvent(entry.data);
 			if (!event || event.ownerId !== scope.ownerId || event.parentSessionId !== scope.parentSessionId) continue;
+			if (!this.#ownsEvent(event)) continue;
 			const eventTime = Date.parse(entry.timestamp);
 			if (event.action === "spawn") {
 				candidates.set(event.id, {
@@ -730,8 +799,10 @@ export class VibeSessionRegistry {
 				candidate.inFlight = false;
 			} else if (event.action === "tombstone") {
 				candidate.tombstoneReason = event.reason;
-			} else if (event.action === "tombstone-revoked" && candidate.tombstoneReason === "mode-exit") {
+			} else if (event.action === "tombstone-revoked" && candidate.tombstoneReason === event.reason) {
 				candidate.tombstoneReason = undefined;
+			} else if (event.action === "retitled") {
+				candidate.title = event.title;
 			}
 		}
 
@@ -747,7 +818,9 @@ export class VibeSessionRegistry {
 		let restored = 0;
 		for (const candidate of candidates.values()) {
 			const { spawn } = candidate;
-			if (candidate.tombstoneReason || terminalIntents.has(spawn.id) || candidate.turnCount < 1) continue;
+			const closed = candidate.tombstoneReason === "closed";
+			if ((candidate.tombstoneReason && !closed) || terminalIntents.has(spawn.id) || candidate.turnCount < 1)
+				continue;
 			const childSessionFile = await this.#resolvePersistedChild(sessionFile, spawn);
 			if (!childSessionFile) continue;
 			const key = scopeKey(scope, spawn.id);
@@ -771,7 +844,7 @@ export class VibeSessionRegistry {
 					status: "parked",
 				});
 			}
-			this.#records.set(key, {
+			const record: VibeRecord = {
 				id: spawn.id,
 				cli: spawn.cli,
 				ownerId: scope.ownerId,
@@ -782,6 +855,8 @@ export class VibeSessionRegistry {
 				modelOverride,
 				modelRole,
 				state: "idle",
+				title: candidate.title ?? spawn.title,
+				closed,
 				createdAt: spawn.createdAt,
 				lastActivityAt: candidate.lastActivityAt,
 				lastActivity: blockedByCollision
@@ -794,14 +869,19 @@ export class VibeSessionRegistry {
 				killed: false,
 				suspended: false,
 				terminalPersisted: false,
-			});
+			};
+			this.#records.set(key, record);
 			restored++;
+			this.#emit(record, "restored");
 		}
 		return restored;
 	}
 
 	/** Spawn a persistent worker session and start its first turn in the background. */
-	async spawn(session: ToolSession, args: { cli: VibeCli; name?: string; prompt: string }): Promise<VibeSpawnOutcome> {
+	async spawn(
+		session: ToolSession,
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string },
+	): Promise<VibeSpawnOutcome> {
 		const scope = this.ownerScope(session);
 		return this.#withTerminationLock(scope, () => this.#spawnLocked(session, scope, args));
 	}
@@ -809,7 +889,7 @@ export class VibeSessionRegistry {
 	async #spawnLocked(
 		session: ToolSession,
 		scope: VibeOwnerScope,
-		args: { cli: VibeCli; name?: string; prompt: string },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string },
 	): Promise<VibeSpawnOutcome> {
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
@@ -842,6 +922,8 @@ export class VibeSessionRegistry {
 			modelOverride,
 			modelRole,
 			state: "starting",
+			title: args.title,
+			ownerLine: firstLine(args.prompt),
 			createdAt,
 			lastActivityAt: createdAt,
 			queue: [],
@@ -864,12 +946,14 @@ export class VibeSessionRegistry {
 						agent: agent.name,
 						childSessionFile: childSessionName,
 						createdAt,
+						...(args.title ? { title: args.title } : {}),
 					},
 					record.parentSessionFile,
 				);
 				if (!spawnPersisted) throw new ToolError("Vibe parent session changed before the worker could start.");
 			}
 			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true });
+			this.#emit(record, "spawned");
 			return { id, jobId };
 		} catch (error) {
 			record.killed = true;
@@ -891,7 +975,9 @@ export class VibeSessionRegistry {
 	/**
 	 * Send a message to a worker. Mid-turn and streaming → steering; mid-turn
 	 * otherwise → queued for the next turn; idle/parked → starts a new
-	 * background turn immediately.
+	 * background turn immediately. A turn another agent's message started is
+	 * never steered: the owner's message waits for a turn of its own, which
+	 * keeps the owner's rights (it may ask other topics).
 	 */
 	async send(session: ToolSession, args: { session: string; message: string }): Promise<VibeSendOutcome> {
 		const scope = this.ownerScope(session);
@@ -900,31 +986,177 @@ export class VibeSessionRegistry {
 			throw new ToolError(`Vibe session "${record.id}" is dead. Spawn a new one with vibe_spawn.`);
 		}
 		const message = args.message.trim();
+		if (record.closed) {
+			throw new ToolError(`Topic "${record.id}" is closed. Reopen it before sending.`);
+		}
 		if (!message) throw new ToolError("Message must not be empty.");
 		const registered = this.#registeredAgent(record);
 		if (AgentRegistry.global().get(record.id) && !registered) {
 			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
 		}
 
+		if (!record.turn && (!registered || (registered.status !== "idle" && registered.status !== "parked"))) {
+			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+		}
+		// The board's gist for the topic: what its owner last asked, not what an agent wrote.
+		record.ownerLine = firstLine(message);
 		if (record.turn) {
 			const live = registered?.session;
-			if (live?.isStreaming) {
+			if (live?.isStreaming && record.turn.startedBy.length === 0) {
 				await live.steer(message, undefined, { attribution: "agent" });
 				record.lastActivityAt = Date.now();
 				return { id: record.id, mode: "steered" };
 			}
-			record.queue.push(message);
+			record.queue.push({ text: message });
 			record.lastActivityAt = Date.now();
 			return { id: record.id, mode: "queued" };
 		}
+		return { id: record.id, mode: "turn", jobId: this.enqueue(session, record.id, { text: message })! };
+	}
 
-		if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
-			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+	/** The live worker `id` of `session`'s scope (agents' asks to topics; see `topics/workers`). */
+	worker(session: ToolSession, id: string): WorkerView | undefined {
+		const record = this.#records.get(scopeKey(this.ownerScope(session), id));
+		return record && record.state !== "dead" ? this.#view(record) : undefined;
+	}
+
+	#view(record: VibeRecord): WorkerView {
+		const turn = record.turn;
+		const streaming = turn !== undefined && this.#registeredAgent(record)?.session?.isStreaming === true;
+		return {
+			id: record.id,
+			ownerId: record.ownerId,
+			closed: record.closed === true,
+			turn: turn && { startedBy: turn.startedBy, askers: turn.askers, streaming },
+		};
+	}
+
+	/**
+	 * Hold `entry` for worker `id`'s next turn, and start that turn now when the
+	 * worker is idle and `entry` is not a note. Returns the started turn's job id.
+	 */
+	enqueue(session: ToolSession, id: string, entry: QueuedMessage): string | undefined {
+		const record = this.#record(this.ownerScope(session), id);
+		if (!record.turn && !entry.note) {
+			const registered = this.#registeredAgent(record);
+			if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
+				throw new ToolError(`Topic "${record.id}" no longer resolves to this session.`);
+			}
 		}
+		record.queue.push(entry);
+		if (record.turn || entry.note) return undefined;
+		try {
+			return this.#startQueued(session, this.#manager(session), record);
+		} catch (error) {
+			record.queue.splice(record.queue.indexOf(entry), 1);
+			throw error;
+		}
+	}
 
-		const manager = this.#manager(session);
-		const jobId = this.#registerTurnJob(session, manager, record, message, { first: false });
-		return { id: record.id, mode: "turn", jobId };
+	/**
+	 * Start a turn with the next batch of queued messages: those of one origin
+	 * (the owner, or agents), so an agent's message never takes asking rights
+	 * from an owner's turn; progress notes ride along. Returns the turn's job
+	 * id, or `undefined` when only notes are queued. A failed start leaves the
+	 * batch queued.
+	 */
+	#startQueued(session: ToolSession, manager: AsyncJobManagerApi, record: VibeRecord): string | undefined {
+		if (!record.queue.some(entry => !entry.note)) return undefined;
+		let fromAgent: boolean | undefined;
+		let end = 0;
+		for (; end < record.queue.length; end++) {
+			const entry = record.queue[end]!;
+			if (entry.note) continue;
+			if (fromAgent === undefined) fromAgent = entry.from !== undefined;
+			else if (fromAgent !== (entry.from !== undefined)) break;
+		}
+		const batch = record.queue.splice(0, end);
+		try {
+			return this.#registerTurnJob(session, manager, record, batch.map(entry => entry.text).join("\n\n"), {
+				first: false,
+				batch,
+			});
+		} catch (error) {
+			record.queue.unshift(...batch);
+			throw error;
+		}
+	}
+
+	/** Owner-facing summary of every worker in the caller's scope, newest activity first (topics list). */
+	describe(session: VibeParentSession): WorkerSummary[] {
+		const scope = this.ownerScope(session);
+		const summaries: WorkerSummary[] = [];
+		for (const record of this.#records.values()) {
+			if (!matchesScope(record, scope) || record.state === "dead") continue;
+			summaries.push({
+				id: record.id,
+				title: record.title ?? record.id,
+				state: record.closed ? "closed" : record.state,
+				turns: record.turnCount,
+				queued: record.queue.length,
+				createdAt: record.createdAt,
+				lastActivityAt: record.lastActivityAt,
+				lastActivity: record.lastActivity,
+				ownerLine: record.ownerLine,
+				sessionFile: record.childSessionFile,
+				turnStartedAt: record.turn?.startedAt,
+			});
+		}
+		return summaries.sort((a, b) => b.lastActivityAt - a.lastActivityAt);
+	}
+
+	/**
+	 * Close a worker without losing it: sends are refused until {@link reopen},
+	 * the conversation file is kept, and a restart restores it as closed.
+	 * Refused while a turn is in flight so a closing note is never cut off.
+	 */
+	async close(session: VibeParentSession, id: string): Promise<void> {
+		const record = this.#record(this.ownerScope(session), id);
+		if (record.state === "dead") throw new ToolError(`Topic "${record.id}" no longer exists.`);
+		if (record.closed) return;
+		if (record.turn) throw new ToolError(`Topic "${record.id}" is working; close it once its turn settles.`);
+		await this.#appendRequired(session, record, {
+			...this.#eventBase(record),
+			action: "tombstone",
+			reason: "closed",
+		});
+		record.closed = true;
+		record.queue.length = 0;
+		record.lastActivityAt = Date.now();
+		this.#emit(record, "closed");
+	}
+
+	/** Reopen a closed worker; its next send continues the full conversation. */
+	async reopen(session: VibeParentSession, id: string): Promise<void> {
+		const record = this.#record(this.ownerScope(session), id);
+		if (!record.closed) return;
+		await this.#appendRequired(session, record, {
+			...this.#eventBase(record),
+			action: "tombstone-revoked",
+			reason: "closed",
+		});
+		record.closed = false;
+		record.lastActivityAt = Date.now();
+		this.#emit(record, "reopened");
+	}
+
+	/** Change a worker's owner-facing title. */
+	async rename(session: VibeParentSession, id: string, title: string): Promise<void> {
+		const record = this.#record(this.ownerScope(session), id);
+		const trimmed = title.trim();
+		if (!trimmed) throw new ToolError("Title must not be empty.");
+		if (record.title === trimmed) return;
+		await this.#appendRequired(session, record, { ...this.#eventBase(record), action: "retitled", title: trimmed });
+		record.title = trimmed;
+		this.#emit(record, "retitled");
+	}
+
+	/** Persist an owner action; an in-memory-only change would be lost or contradicted on resume. */
+	async #appendRequired(session: VibeParentSession, record: VibeRecord, event: VibeLifecycleEvent): Promise<void> {
+		if (!record.childSessionFile) return;
+		if (!(await this.#appendLifecycleEvent(session, event, record.parentSessionFile))) {
+			throw new ToolError(`Topic "${record.id}" changed parent session; the change was not saved.`);
+		}
 	}
 
 	/**
@@ -1295,6 +1527,7 @@ export class VibeSessionRegistry {
 			index: 0,
 			id: record.id,
 			taskDepth: session.taskDepth ?? 0,
+			...(this.policy.ownerSpawnDepth ? { spawnDepth: spawnDepthOf(session) } : {}),
 			detached: true,
 			modelOverride: record.modelOverride,
 			modelRole: record.modelRole,
@@ -1345,15 +1578,22 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManagerApi,
 		record: VibeRecord,
 		message: string,
-		options: { first: boolean },
+		options: { first: boolean; batch?: readonly QueuedMessage[] },
 	): string {
 		const turnIndex = record.turnCount + 1;
+		const starters = (options.batch ?? []).filter(entry => entry.from !== undefined && !entry.note);
+		const askers = new Map<string, string>();
+		for (const entry of starters) {
+			if (entry.askId && !askers.has(entry.from!)) askers.set(entry.from!, entry.askId);
+		}
 		const turn: VibeTurn = {
 			jobId: "",
 			message,
 			startedAt: Date.now(),
 			trace: [],
 			toolCount: 0,
+			startedBy: [...new Set(starters.map(entry => entry.from!))],
+			askers: [...askers].map(([from, messageId]) => ({ from, messageId })),
 		};
 		const onProgress = (progress: AgentProgress): void => {
 			mergeTrace(turn, progress);
@@ -1379,6 +1619,7 @@ export class VibeSessionRegistry {
 				record.state = "running";
 				record.turnCount = turnIndex;
 				record.lastActivityAt = Date.now();
+				this.#emit(record, "turn-started");
 				try {
 					const turnStartedPersisted = await this.#appendLifecycleEvent(
 						session,
@@ -1392,8 +1633,14 @@ export class VibeSessionRegistry {
 					if (record.childSessionFile && !turnStartedPersisted) {
 						throw new ToolError(`Vibe session "${record.id}" changed parent scope before its turn started.`);
 					}
+					const topicBoard = this.policy.boardFor?.(
+						this.describe(session).filter(topic => topic.id !== record.id),
+					);
 					const result = options.first
-						? await runSubprocess(await this.#buildSpawnOptions(session, record, message, signal, onProgress))
+						? await runSubprocess({
+								...(await this.#buildSpawnOptions(session, record, message, signal, onProgress)),
+								topicBoard,
+							})
 						: await runSubagentFollowUpTurn({
 								id: record.id,
 								agent: record.agent,
@@ -1404,13 +1651,15 @@ export class VibeSessionRegistry {
 								eventBus: session.eventBus,
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
+								topicBoard,
 							});
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
-					await this.#finishTurn(session, manager, record, ownJobId);
 					const reason = error instanceof Error ? error.message : String(error);
 					record.lastActivity = firstLine(`turn failed: ${reason}`);
+					await this.#finishTurn(session, manager, record, ownJobId);
+					await this.policy.onTurnSettled?.({ id: record.id, askers: turn.askers, error: reason });
 					throw new VibeTurnError(
 						`[vibe:${record.id} cli=${record.cli} turn=${turnIndex}] turn failed: ${reason}`,
 					);
@@ -1418,6 +1667,8 @@ export class VibeSessionRegistry {
 			},
 			{ id: `${record.id}-t${turnIndex}`, agentId: record.id, ownerId: record.ownerId },
 		);
+		// Topic results are read by the owner from the topic itself; they must not land in the parent conversation.
+		if (!this.policy.deliverResults) manager.acknowledgeDeliveries([jobId]);
 		turn.jobId = jobId;
 		record.turn = turn;
 		return jobId;
@@ -1458,13 +1709,11 @@ export class VibeSessionRegistry {
 			record.state = "dead";
 			return;
 		}
-		if (record.queue.length === 0) return;
-		const nextMessage = record.queue.splice(0, record.queue.length).join("\n\n");
+		this.#emit(record, "turn-settled");
 		try {
-			this.#registerTurnJob(session, manager, record, nextMessage, { first: false });
+			this.#startQueued(session, manager, record);
 		} catch (error) {
 			// Leave the messages recoverable: a later vibe_send flushes again.
-			record.queue.unshift(nextMessage);
 			logger.warn("vibe: failed to start queued follow-up turn", {
 				id: record.id,
 				error: error instanceof Error ? error.message : String(error),
@@ -1482,14 +1731,16 @@ export class VibeSessionRegistry {
 		turnIndex: number,
 		result: SingleResult,
 	): Promise<AsyncJobRunResult> {
-		await this.#finishTurn(session, manager, record, settledJobId);
 		const failed = result.exitCode !== 0 || result.aborted === true;
 		const status = result.aborted ? "aborted" : failed ? "failed" : "completed";
+		// Set before the record goes idle, so an idle topic never shows its in-turn gist.
 		record.lastActivity = firstLine(
 			failed
 				? `turn ${turnIndex} ${status}: ${result.abortReason ?? result.error ?? ""}`
 				: (result.lastIntent ?? result.output),
 		);
+		await this.#finishTurn(session, manager, record, settledJobId);
+		await this.policy.onTurnSettled?.({ id: record.id, askers: turn.askers, result });
 
 		const traceLines = turn.trace.map(entry =>
 			firstLine(`${entry.tool}${entry.args ? `(${entry.args})` : ""}`, TRACE_LINE_MAX),

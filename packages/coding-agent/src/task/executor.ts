@@ -140,6 +140,7 @@ import { recordStepsSent, type StepProgress, type StepReportRoute, sendStepRepor
 import type { WorkPoolYieldItem } from "./workpool-yield";
 import {
 	type AgentDefinition,
+	canSpawnAtDepth,
 	MAX_OUTPUT_BYTES,
 	MAX_OUTPUT_LINES,
 	TASK_SUBAGENT_EVENT_CHANNEL,
@@ -466,6 +467,8 @@ export interface ExecutorOptions {
 	 * the previous one was delivered. Absent for a single-prompt assignment.
 	 */
 	steps?: string[];
+	/** Topic board sent ahead of the first prompt (topic workers; see {@link PromptOptions.topicBoard}). */
+	topicBoard?: string;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -528,6 +531,13 @@ export interface ExecutorOptions {
 	outputSchemaOverridesAgent?: boolean;
 	/** Parent task recursion depth (0 = top-level, 1 = first child, etc.) */
 	taskDepth?: number;
+	/** Parent spawn depth (see {@link ToolSession.spawnDepth}); defaults to {@link taskDepth}. */
+	parentSpawnDepth?: number;
+	/**
+	 * Spawn depth the child runs at; it gates the child's spawn capacity (`task.maxRecursionDepth`)
+	 * and its descendants count up from it. Defaults to the parent's spawn depth + 1.
+	 */
+	spawnDepth?: number;
 	/**
 	 * Override the `task.maxRuntimeMs` wall-clock cap for this run. When provided
 	 * it wins over the settings value; `0` disables the per-subagent wall-clock
@@ -2680,9 +2690,11 @@ async function driveSessionToResult(
 		steps?: StepProgress;
 		/** Where what each prompt before the last delivered goes; unset, the reports go nowhere. */
 		stepReports?: StepReportRoute;
+		/** Topic board for the initial prompt; see {@link PromptOptions.topicBoard}. */
+		topicBoard?: string;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore, steps, stepReports } = options;
+	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard } = options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2795,7 +2807,7 @@ async function driveSessionToResult(
 			for (;;) {
 				try {
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
-					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
+					else await dispatchPrompt(task, { attribution: "agent", solutionSpace, topicBoard }, "initial prompt");
 					return;
 				} catch (error) {
 					promptAttempts++;
@@ -3974,6 +3986,8 @@ export interface FollowUpTurnOptions {
 	agent: AgentDefinition;
 	/** The follow-up message; sent as the turn's user prompt (with {@link restore}, only the run's label). */
 	message: string;
+	/** Topic board sent ahead of the follow-up prompt (topic workers; see {@link PromptOptions.topicBoard}). */
+	topicBoard?: string;
 	/**
 	 * Go on with the turn the previous process left unfinished instead of sending
 	 * `message` (`omp --restore`: {@link AgentSession.restoreInterruptedTurn}).
@@ -4189,6 +4203,7 @@ async function driveFollowUpTurn(
 				restore: options.restore,
 				steps: options.steps,
 				stepReports: parentId ? { from: id, to: parentId } : undefined,
+				topicBoard: options.topicBoard,
 				onPromptBusy: async () => {
 					attemptUnsubscribe();
 					logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
@@ -4731,8 +4746,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	const { softRequestBudget, softRequestBudgetNotice } = softRequestBudgetFor(agent.name, settings);
 	const parentDepth = options.taskDepth ?? 0;
 	const childDepth = parentDepth + 1;
+	const childSpawnDepth = options.spawnDepth ?? (options.parentSpawnDepth ?? parentDepth) + 1;
 	const restrictToolNames = options.restrictToolNames === true;
-	const atMaxDepth = maxRecursionDepth >= 0 && childDepth >= maxRecursionDepth;
+	const atMaxDepth = !canSpawnAtDepth(maxRecursionDepth, childSpawnDepth);
 
 	// Add tools if specified. Unstructured runs never get `yield`, even when
 	// the frontmatter lists it.
@@ -5226,6 +5242,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					prewalk,
 					spawns: spawnsEnv,
 					taskDepth: childDepth,
+					spawnDepth: childSpawnDepth,
 					// The whole spawn tree shares the root session's observability bus,
 					// so nested lifecycle/progress/event frames reach its surfaces
 					// without leaking into another root session's traffic.
@@ -5462,6 +5479,9 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				// stamp the contract so cold revival leaves them transcript-only
 				// even when the workspace was retained for recovery.
 				isolated: worktree !== undefined || undefined,
+				// Recorded only when reset away from the task depth, so revival restores the
+				// spawn budget; absent = the task depth revival derives from the parent chain.
+				...(childSpawnDepth !== childDepth ? { spawnDepth: childSpawnDepth } : undefined),
 			});
 
 			abortSignal.addEventListener(
@@ -5526,6 +5546,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				structured,
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
+				topicBoard: options.topicBoard,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left

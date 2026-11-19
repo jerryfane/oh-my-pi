@@ -929,6 +929,23 @@ class SubagentSnapshot:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class TopicSummary:
+    id: str
+    title: str
+    state: Literal["starting", "running", "idle", "dead", "closed"]
+    turns: int
+    queued: int
+    created_at: int
+    last_activity_at: int
+    last_activity: str | None = None
+    owner_line: str | None = None
+    """First line of the owner's latest message to the topic, when this process saw one."""
+    session_file: str | None = None
+    turn_started_at: int | None = None
+    """When the turn in flight started; absent while no turn runs."""
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SubagentMessages:
     """Incremental subagent transcript read."""
     session_file: str
@@ -1709,6 +1726,12 @@ class NegotiateProtocolResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class TopicsSendResult:
+    topic_id: str
+    mode: Literal["steered", "queued", "turn"]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class LiveConnectResult:
     voice: str
     sdp_answer: str
@@ -2361,6 +2384,23 @@ def parse_subagent_snapshot(value: object, path: str = "SubagentSnapshot") -> Su
         session_file=optional(payload, "sessionFile", decode_str, path),
         progress=optional(payload, "progress", decode_json_object, path),
         parent_tool_call_id=optional(payload, "parentToolCallId", decode_str, path),
+    )
+
+
+def parse_topic_summary(value: object, path: str = "TopicSummary") -> TopicSummary:
+    payload = expect_object(value, path)
+    return TopicSummary(
+        id=required(payload, "id", decode_str, path),
+        title=required(payload, "title", decode_str, path),
+        state=required(payload, "state", cast('Decoder[Literal["starting", "running", "idle", "dead", "closed"]]', literal(frozenset({"starting", "running", "idle", "dead", "closed"}))), path),
+        turns=required(payload, "turns", decode_int, path),
+        queued=required(payload, "queued", decode_int, path),
+        created_at=required(payload, "createdAt", decode_int, path),
+        last_activity_at=required(payload, "lastActivityAt", decode_int, path),
+        last_activity=optional(payload, "lastActivity", decode_str, path),
+        owner_line=optional(payload, "ownerLine", decode_str, path),
+        session_file=optional(payload, "sessionFile", decode_str, path),
+        turn_started_at=optional(payload, "turnStartedAt", decode_int, path),
     )
 
 
@@ -3233,6 +3273,14 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_topics_send_result(value: object, path: str = "TopicsSendResult") -> TopicsSendResult:
+    payload = expect_object(value, path)
+    return TopicsSendResult(
+        topic_id=required(payload, "topicId", decode_str, path),
+        mode=required(payload, "mode", cast('Decoder[Literal["steered", "queued", "turn"]]', literal(frozenset({"steered", "queued", "turn"}))), path),
+    )
+
+
 def parse_live_connect_result(value: object, path: str = "LiveConnectResult") -> LiveConnectResult:
     payload = expect_object(value, path)
     return LiveConnectResult(
@@ -3532,6 +3580,52 @@ class WireClient:
         params["subagentId"] = subagent_id
         params["message"] = message
         self._command("steer_subagent", params)
+
+    def topics_list(self) -> tuple[TopicSummary, ...]:
+        """List the owner's topics (persistent workers), newest activity first."""
+        params: dict[str, object] = {}
+        return required(expect_object(self._command("topics_list", params), "topics_list"), "topics", array(parse_topic_summary), "topics_list")
+
+    def topics_new(self, title: str, message: str) -> str:
+        """Start a topic with a title and its first message."""
+        params: dict[str, object] = {}
+        params["title"] = title
+        params["message"] = message
+        return required(expect_object(self._command("topics_new", params), "topics_new"), "topicId", decode_str, "topics_new")
+
+    def topics_send(self, topic_id: str, message: str) -> TopicsSendResult:
+        """Send the owner's message to one topic: steers a running turn, queues behind one, or starts a new turn."""
+        params: dict[str, object] = {}
+        params["topicId"] = topic_id
+        params["message"] = message
+        return parse_topics_send_result(self._command("topics_send", params), "topics_send")
+
+    def topics_read(self, topic_id: str, *, from_byte: int | None = None) -> SubagentMessages:
+        """Read a topic's own conversation incrementally."""
+        params: dict[str, object] = {}
+        params["topicId"] = topic_id
+        if from_byte is not None:
+            params["fromByte"] = from_byte
+        return parse_subagent_messages(self._command("topics_read", params), "topics_read")
+
+    def topics_close(self, topic_id: str) -> None:
+        """Close a topic; its conversation is kept and it can be reopened."""
+        params: dict[str, object] = {}
+        params["topicId"] = topic_id
+        self._command("topics_close", params)
+
+    def topics_reopen(self, topic_id: str) -> None:
+        """Reopen a closed topic."""
+        params: dict[str, object] = {}
+        params["topicId"] = topic_id
+        self._command("topics_reopen", params)
+
+    def topics_rename(self, topic_id: str, title: str) -> None:
+        """Change a topic's title."""
+        params: dict[str, object] = {}
+        params["topicId"] = topic_id
+        params["title"] = title
+        self._command("topics_rename", params)
 
     def live_start(self, *, voice: str | None = None, instructions: str | None = None) -> str:
         """Start a live voice session bound to this session; returns the voice in use."""
@@ -4243,6 +4337,8 @@ __all__ = [
     "ToolLoadMode",
     "ToolResultMessage",
     "ToolStreamUpdateEvent",
+    "TopicSummary",
+    "TopicsSendResult",
     "TtsrTriggeredEvent",
     "TurnEndEvent",
     "TurnStartEvent",
@@ -4414,6 +4510,8 @@ __all__ = [
     "parse_tool_execution_update_event",
     "parse_tool_result_message",
     "parse_tool_stream_update_event",
+    "parse_topic_summary",
+    "parse_topics_send_result",
     "parse_ttsr_triggered_event",
     "parse_turn_end_event",
     "parse_turn_start_event",
