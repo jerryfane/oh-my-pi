@@ -3317,7 +3317,9 @@ type TopicSummary struct {
 	CreatedAt      int64             `json:"createdAt"`
 	LastActivityAt int64             `json:"lastActivityAt"`
 	LastActivity   *string           `json:"lastActivity,omitempty"`
-	SessionFile    *string           `json:"sessionFile,omitempty"`
+	// First line of the owner's latest message to the topic, when this process saw one.
+	OwnerLine   *string `json:"ownerLine,omitempty"`
+	SessionFile *string `json:"sessionFile,omitempty"`
 	// When the turn in flight started; absent while no turn runs.
 	TurnStartedAt *int64 `json:"turnStartedAt,omitempty"`
 }
@@ -3337,6 +3339,7 @@ func (v *TopicSummary) decodeFrom(raw map[string]json.RawMessage) error {
 	d.required("createdAt", &out.CreatedAt)
 	d.required("lastActivityAt", &out.LastActivityAt)
 	d.optional("lastActivity", &out.LastActivity)
+	d.optional("ownerLine", &out.OwnerLine)
 	d.optional("sessionFile", &out.SessionFile)
 	d.optional("turnStartedAt", &out.TurnStartedAt)
 	if d.err != nil {

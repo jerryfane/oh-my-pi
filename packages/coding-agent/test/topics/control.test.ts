@@ -1,12 +1,16 @@
 /**
  * Contract: the topics control socket is an owner-only door that a host
  * opens with its per-launch token and that reaches topics, nothing else.
+ * Extensions read the endpoint from omp's own state, never from the event
+ * bus, which only says that it changed; startup clears what crashed runs left.
  */
 import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
+	currentTopicsControl,
 	MIN_TOKEN_LENGTH,
 	offerTopicsControl,
 	startTopicsControl,
@@ -209,66 +213,134 @@ describe("topics control socket", () => {
 	});
 });
 
-describe("topics control endpoint offered to extensions", () => {
-	it("opens a fresh private endpoint per launch, re-offers it on request, and withdraws it on stop", async () => {
-		const tempDir = TempDir.createSync("@omp-topics-offer-");
+/** Leave a socket inode at `socketPath` with nobody listening, as a SIGKILLed run does. */
+function deadSocket(socketPath: string): void {
+	const crashed = Bun.listen({ unix: socketPath, socket: { data() {} } });
+	fs.linkSync(socketPath, `${socketPath}.keep`);
+	crashed.stop(true);
+	fs.renameSync(`${socketPath}.keep`, socketPath);
+}
+
+describe("topics control endpoint for extensions", () => {
+	let tempDir: TempDir;
+	const stops: Array<() => void> = [];
+
+	beforeEach(() => {
+		tempDir = TempDir.createSync("@omp-topics-offer-");
+	});
+
+	afterEach(() => {
+		for (const stop of stops.splice(0)) stop();
+		tempDir.removeSync();
+	});
+
+	async function offer(bus: EventBus, runtimeDir?: string): Promise<TopicsControlEndpoint> {
+		const stop = await offerTopicsControl(bus, async () => fakeHost([]), runtimeDir);
+		if (!stop) throw new Error("control socket did not start");
+		stops.push(stop);
+		const endpoint = currentTopicsControl();
+		if (!endpoint) throw new Error("no endpoint published");
+		return endpoint;
+	}
+
+	it("publishes a fresh private endpoint, signals changes without the secret, and withdraws it on stop", async () => {
 		const bus = new EventBus();
-		const offers: Array<TopicsControlEndpoint | null> = [];
-		bus.on(TOPICS_CONTROL_CHANNEL, data => offers.push(data as TopicsControlEndpoint | null));
-		const stops: Array<() => void> = [];
-		try {
-			const host = fakeHost([]);
-			const stop1 = await offerTopicsControl(bus, async () => host, tempDir.path());
-			const stop2 = await offerTopicsControl(new EventBus(), async () => host, tempDir.path());
-			if (!stop1 || !stop2) throw new Error("control socket did not start");
-			stops.push(stop1, stop2);
-			const first = offers[0];
-			if (!first) throw new Error("no endpoint offered");
+		const signals: unknown[] = [];
+		bus.on(TOPICS_CONTROL_CHANNEL, data => signals.push(data));
+		const endpoint = await offer(bus, tempDir.path());
 
-			expect(first.protocol).toBe(TOPICS_CONTROL_PROTOCOL);
-			expect(first.token.length).toBeGreaterThanOrEqual(MIN_TOKEN_LENGTH);
-			expect(fs.statSync(path.dirname(first.socketPath)).mode & 0o777).toBe(0o700);
-			// The secret lives only in memory: nothing under the runtime dir contains it.
-			for (const entry of fs.readdirSync(tempDir.path(), { recursive: true })) {
-				const file = path.join(tempDir.path(), String(entry));
-				if (fs.statSync(file).isFile()) expect(fs.readFileSync(file, "utf8")).not.toContain(first.token);
-			}
-			// A late extension asks again and gets the same endpoint; it works with the secret.
-			bus.emit(TOPICS_CONTROL_REQUEST_CHANNEL, undefined);
-			expect(offers[1]).toEqual(first);
-			const client = await connect(first.socketPath);
-			client.send({ type: "hello", token: first.token });
-			expect(await client.next()).toMatchObject({ type: "hello" });
-			client.end();
-
-			stops.shift()?.();
-			expect(offers.at(-1)).toBe(null);
-			expect(fs.existsSync(path.dirname(first.socketPath))).toBe(false);
-		} finally {
-			for (const stop of stops) stop();
-			tempDir.removeSync();
+		expect(endpoint.protocol).toBe(TOPICS_CONTROL_PROTOCOL);
+		expect(endpoint.token.length).toBeGreaterThanOrEqual(MIN_TOKEN_LENGTH);
+		expect(fs.statSync(path.dirname(endpoint.socketPath)).mode & 0o777).toBe(0o700);
+		// The secret lives only in memory: nothing under the runtime dir contains it.
+		for (const entry of fs.readdirSync(tempDir.path(), { recursive: true })) {
+			const file = path.join(tempDir.path(), String(entry));
+			if (fs.statSync(file).isFile()) expect(fs.readFileSync(file, "utf8")).not.toContain(endpoint.token);
 		}
+		// The bus only says "changed", now and when a late extension asks again.
+		bus.emit(TOPICS_CONTROL_REQUEST_CHANNEL, undefined);
+		expect(signals).toEqual([{ changed: true }, { changed: true }]);
+		expect(JSON.stringify(signals)).not.toContain(endpoint.token);
+		const client = await connect(endpoint.socketPath);
+		client.send({ type: "hello", token: endpoint.token });
+		expect(await client.next()).toMatchObject({ type: "hello" });
+		client.end();
+
+		stops.shift()?.();
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(signals.at(-1)).toEqual({ changed: true });
+		expect(fs.existsSync(path.dirname(endpoint.socketPath))).toBe(false);
 	});
 
 	it("gives every launch its own path and secret", async () => {
-		const tempDir = TempDir.createSync("@omp-topics-offer-");
-		const seen: TopicsControlEndpoint[] = [];
-		const stops: Array<() => void> = [];
+		const first = await offer(new EventBus(), tempDir.path());
+		const second = await offer(new EventBus(), tempDir.path());
+		expect(first.socketPath).not.toBe(second.socketPath);
+		expect(first.token).not.toBe(second.token);
+	});
+
+	it("reaches an extension through its injected pi API, and a fake emission on the channel changes nothing", async () => {
+		const bus = new EventBus();
+		const seen: Array<TopicsControlEndpoint | undefined> = [];
+		let forge: (() => void) | undefined;
+		await loadExtensionFromFactory(
+			pi => {
+				pi.events.on(TOPICS_CONTROL_CHANNEL, () => seen.push(pi.pi.currentTopicsControl()));
+				forge = () =>
+					pi.events.emit(TOPICS_CONTROL_CHANNEL, {
+						socketPath: path.join(tempDir.path(), "evil.sock"),
+						token: "x".repeat(MIN_TOKEN_LENGTH),
+						protocol: TOPICS_CONTROL_PROTOCOL,
+						pid: 1,
+					});
+			},
+			tempDir.path(),
+			bus,
+			new ExtensionRuntime(),
+			"host-extension",
+		);
+		const endpoint = await offer(bus, tempDir.path());
+		expect(seen).toEqual([endpoint]);
+
+		forge?.();
+		expect(currentTopicsControl()).toEqual(endpoint);
+		expect(seen.at(-1)).toEqual(endpoint);
+	});
+
+	it("opens under $XDG_RUNTIME_DIR when it is set", async () => {
+		const previous = process.env.XDG_RUNTIME_DIR;
+		process.env.XDG_RUNTIME_DIR = tempDir.path();
 		try {
-			for (let launch = 0; launch < 2; launch++) {
-				const bus = new EventBus();
-				bus.on(TOPICS_CONTROL_CHANNEL, data => {
-					if (data) seen.push(data as TopicsControlEndpoint);
-				});
-				const stop = await offerTopicsControl(bus, async () => undefined, tempDir.path());
-				if (stop) stops.push(stop);
-			}
-			expect(seen).toHaveLength(2);
-			expect(seen[0]?.socketPath).not.toBe(seen[1]?.socketPath);
-			expect(seen[0]?.token).not.toBe(seen[1]?.token);
+			const endpoint = await offer(new EventBus());
+			expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(tempDir.path());
 		} finally {
-			for (const stop of stops) stop();
-			tempDir.removeSync();
+			if (previous === undefined) delete process.env.XDG_RUNTIME_DIR;
+			else process.env.XDG_RUNTIME_DIR = previous;
+		}
+	});
+
+	it("removes control dirs whose socket is dead at startup, and never one that answers", async () => {
+		const dirOf = (name: string) => {
+			const dir = path.join(tempDir.path(), name);
+			fs.mkdirSync(dir, { mode: 0o700 });
+			return dir;
+		};
+		const stale = dirOf("omp-topics-stale");
+		deadSocket(path.join(stale, "control.sock"));
+		const live = dirOf("omp-topics-live");
+		const listener = Bun.listen({ unix: path.join(live, "control.sock"), socket: { data() {} } });
+		const starting = dirOf("omp-topics-starting");
+		const other = dirOf("other-dir");
+		deadSocket(path.join(other, "control.sock"));
+		try {
+			const endpoint = await offer(new EventBus(), tempDir.path());
+			expect(fs.existsSync(stale)).toBe(false);
+			expect(fs.existsSync(path.join(live, "control.sock"))).toBe(true);
+			expect(fs.existsSync(starting)).toBe(true);
+			expect(fs.existsSync(other)).toBe(true);
+			expect(fs.existsSync(endpoint.socketPath)).toBe(true);
+		} finally {
+			listener.stop(true);
 		}
 	});
 });

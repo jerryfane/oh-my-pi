@@ -33,6 +33,12 @@ export interface IrcMessage {
 	 * so the recipient's `wait` keeps waiting for the actual reply.
 	 */
 	progress?: boolean;
+	/**
+	 * Set by delivery routing, never by a sender: an idle recipient takes the
+	 * message into its history for its next turn instead of starting one (a
+	 * progress note from a topic turn another agent's message started).
+	 */
+	noWake?: boolean;
 }
 
 /**

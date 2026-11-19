@@ -938,6 +938,8 @@ class TopicSummary:
     created_at: int
     last_activity_at: int
     last_activity: str | None = None
+    owner_line: str | None = None
+    """First line of the owner's latest message to the topic, when this process saw one."""
     session_file: str | None = None
     turn_started_at: int | None = None
     """When the turn in flight started; absent while no turn runs."""
@@ -2396,6 +2398,7 @@ def parse_topic_summary(value: object, path: str = "TopicSummary") -> TopicSumma
         created_at=required(payload, "createdAt", decode_int, path),
         last_activity_at=required(payload, "lastActivityAt", decode_int, path),
         last_activity=optional(payload, "lastActivity", decode_str, path),
+        owner_line=optional(payload, "ownerLine", decode_str, path),
         session_file=optional(payload, "sessionFile", decode_str, path),
         turn_started_at=optional(payload, "turnStartedAt", decode_int, path),
     )

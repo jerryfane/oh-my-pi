@@ -84,11 +84,17 @@ export interface UnansweredSend {
 export type IrcSend = Omit<IrcMessage, "id" | "ts"> & { localOnly?: boolean };
 
 /**
- * Takes delivery for recipients that run their own turns (topics): returns the
- * receipt, or `undefined` to leave the message to ordinary delivery. `bus` is
+ * What a {@link IrcRecipientRoute} decides: take delivery (`{ receipt }`), have
+ * ordinary delivery carry a rewritten `{ message }` instead, or leave the
+ * message as it is (`undefined`).
+ */
+export type IrcRouteDecision = { receipt: IrcDeliveryReceipt } | { message: IrcMessage } | undefined;
+
+/**
+ * Routing for recipients whose turns another registry runs (topics). `bus` is
  * the delivering bus, for its send bookkeeping.
  */
-export type IrcRecipientRoute = (message: IrcMessage, bus: IrcBusApi) => IrcDeliveryReceipt | undefined;
+export type IrcRecipientRoute = (message: IrcMessage, bus: IrcBusApi) => IrcRouteDecision;
 
 /** Public surface of the process-global IRC bus, implemented locally on main and by a proxy in workers. */
 export interface IrcBusApi {
@@ -299,7 +305,8 @@ export class IrcBus implements IrcBusApi {
 		return this.#lastReply.get(from)?.get(to)?.ts;
 	}
 
-	async #deliver(message: IrcMessage, options: { localOnly?: boolean }): Promise<IrcDeliveryReceipt> {
+	async #deliver(sent: IrcMessage, options: { localOnly?: boolean }): Promise<IrcDeliveryReceipt> {
+		let message = sent;
 		const ref = this.#registry.get(message.to);
 		const mesh = ref || options.localOnly ? undefined : agentMesh();
 		const peer = mesh && parsePeerAddress(message.to);
@@ -316,10 +323,14 @@ export class IrcBus implements IrcBusApi {
 			};
 		}
 		for (const route of IrcBus.#routes) {
-			const receipt = route(message, this);
-			if (!receipt) continue;
-			if (receipt.outcome !== "failed") this.#relayToMainUi(message);
-			return receipt;
+			const decision = route(message, this);
+			if (!decision) continue;
+			if ("message" in decision) {
+				message = decision.message;
+				continue;
+			}
+			if (decision.receipt.outcome !== "failed") this.#relayToMainUi(message);
+			return decision.receipt;
 		}
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {

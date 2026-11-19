@@ -3,12 +3,14 @@
  *
  * A host that runs omp in a terminal pane (Herdr) cannot use stdio RPC. When
  * topics are enabled, omp opens its own socket at a fresh random path inside
- * an owner-only (0700) directory, with a random per-launch secret held only in
- * memory: never in a file, an environment variable or a command line. It
- * offers the endpoint to in-process extensions on the session event bus
- * ({@link TOPICS_CONTROL_CHANNEL}); a host's extension reports it to its host
- * over the host's own API. Every launch, restart and session switch gets a
- * working endpoint. A client must present the secret in its first frame.
+ * an owner-only (0700) directory under `$XDG_RUNTIME_DIR` (else the temp
+ * dir), with a random per-launch secret held only in memory: never in a file,
+ * an environment variable or a command line. In-process extensions read the
+ * endpoint from {@link currentTopicsControl} (exported from the package root,
+ * so `pi.pi.currentTopicsControl()`), prompted by a payload-free change signal
+ * on the session event bus ({@link TOPICS_CONTROL_CHANNEL}); a host's extension
+ * reports it to its host over the host's own API. Every launch, restart and
+ * session switch gets a working endpoint. A client must present the secret in its first frame.
  * Frames are newline-delimited JSON, one per line:
  *
  * - client `{"type":"hello","token":"…"}` → `{"type":"hello","protocol":1,"pid":…}`
@@ -19,8 +21,9 @@
  * Privilege: the socket cannot prompt the main session, but `topics_send`
  * runs a topic worker with the agent's full tools, so holding the secret is
  * equivalent to controlling the agent. Every loaded extension can read the
- * endpoint from the event bus (extensions already run in-process with the
- * agent's full rights), so loading an extension grants this control too.
+ * endpoint (extensions already run in-process with the agent's full rights),
+ * so loading an extension grants this control too; emitting on the event bus
+ * cannot change what they read.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -103,6 +106,17 @@ function send(socket: ControlSocket, frame: object): void {
 	flush(socket);
 }
 
+/** Whether a server accepts connections on `socketPath`; a dead socket left by a crash refuses them. */
+async function socketAnswers(socketPath: string): Promise<boolean> {
+	try {
+		const probe = await Bun.connect({ unix: socketPath, socket: { data() {} } });
+		probe.end();
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 /**
  * Remove a socket left by a crashed run: only a socket that refuses connections
  * is removed; anything else at the path (a live server, a regular file) is kept
@@ -116,14 +130,8 @@ async function clearStaleSocket(socketPath: string): Promise<void> {
 		return;
 	}
 	if (!stat.isSocket()) throw new Error(`Topics control path exists and is not a socket: ${socketPath}`);
-	try {
-		const probe = await Bun.connect({ unix: socketPath, socket: { data() {} } });
-		probe.end();
-	} catch {
-		fs.rmSync(socketPath, { force: true });
-		return;
-	}
-	throw new Error(`Topics control socket is in use: ${socketPath}`);
+	if (await socketAnswers(socketPath)) throw new Error(`Topics control socket is in use: ${socketPath}`);
+	fs.rmSync(socketPath, { force: true });
 }
 
 /** Start the control socket; returns a stop function. */
@@ -274,12 +282,21 @@ async function handleLine(
 	}
 }
 
-/** Event-bus channel carrying the endpoint to extensions; see {@link offerTopicsControl}. */
+/**
+ * Event-bus channel signalling that the endpoint changed (opened or closed).
+ * Its payload is only {@link TopicsControlChanged}: any extension can emit on
+ * the bus, so the endpoint itself is read from {@link currentTopicsControl}.
+ */
 export const TOPICS_CONTROL_CHANNEL = "topics:control";
-/** Extensions emit this to ask for the current endpoint (e.g. after they loaded late). */
+/** Extensions emit this to have the change signal repeated (e.g. after they loaded late). */
 export const TOPICS_CONTROL_REQUEST_CHANNEL = "topics:control:request";
 
-/** What an extension receives on {@link TOPICS_CONTROL_CHANNEL}: `null` once the socket closed. */
+/** The only payload omp emits on {@link TOPICS_CONTROL_CHANNEL}. */
+export interface TopicsControlChanged {
+	changed: true;
+}
+
+/** The open endpoint, as {@link currentTopicsControl} returns it. */
 export interface TopicsControlEndpoint {
 	socketPath: string;
 	token: string;
@@ -287,25 +304,72 @@ export interface TopicsControlEndpoint {
 	pid: number;
 }
 
-/** The event bus surface the endpoint is offered on (the session's extension bus). */
+/** The event bus surface the change signal is emitted on (the session's extension bus). */
 export interface TopicsControlBus {
 	emit(channel: string, data: unknown): void;
 	on(channel: string, handler: (data: unknown) => void): () => void;
 }
 
+/** Set only by {@link offerTopicsControl}; nothing on the event bus can change it. */
+let currentEndpoint: TopicsControlEndpoint | undefined;
+
 /**
- * Open the control socket at a fresh random path with a random secret and
- * offer it on `bus`: once now, again on every {@link TOPICS_CONTROL_REQUEST_CHANNEL},
- * and `null` when stopped. Returns a stop function, or undefined when it could
- * not start.
+ * The control endpoint omp opened, or `undefined` while none is open. Exported
+ * from the package root, so an extension reads it through its injected API
+ * (`pi.pi.currentTopicsControl()`) when {@link TOPICS_CONTROL_CHANNEL} fires.
+ */
+export function currentTopicsControl(): TopicsControlEndpoint | undefined {
+	return currentEndpoint;
+}
+
+/**
+ * Remove control directories that crashed runs left in `runtimeDir`: our own
+ * `omp-topics-*` directories whose `control.sock` refuses connections. One
+ * that answers belongs to a live omp and is kept, as is one without a socket
+ * (another omp may be between creating it and listening).
+ */
+async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
+	const uid = process.getuid?.();
+	if (uid === undefined) return;
+	let names: string[];
+	try {
+		names = fs.readdirSync(runtimeDir);
+	} catch {
+		return;
+	}
+	for (const name of names) {
+		if (!name.startsWith("omp-topics-")) continue;
+		const dir = path.join(runtimeDir, name);
+		const socketPath = path.join(dir, "control.sock");
+		try {
+			const dirStat = fs.lstatSync(dir);
+			if (!dirStat.isDirectory() || dirStat.uid !== uid) continue;
+			if (!fs.lstatSync(socketPath).isSocket()) continue;
+		} catch {
+			continue;
+		}
+		if (await socketAnswers(socketPath)) continue;
+		fs.rmSync(dir, { recursive: true, force: true });
+	}
+}
+
+/**
+ * Open the control socket at a fresh random path with a random secret, after
+ * removing what crashed runs left behind ({@link removeStaleControlDirs}). The
+ * endpoint is published to {@link currentTopicsControl}; `bus` only hears that
+ * it changed: now, on every {@link TOPICS_CONTROL_REQUEST_CHANNEL}, and when
+ * stopped. Returns a stop function, or undefined when it could not start.
  */
 export async function offerTopicsControl(
 	bus: TopicsControlBus,
 	topics: () => Promise<TopicsHost | undefined>,
-	runtimeDir: string = os.tmpdir(),
+	/** `$XDG_RUNTIME_DIR` (user-private, cleared at logout) when set, else the temp dir. */
+	runtimeDir: string = process.env.XDG_RUNTIME_DIR || os.tmpdir(),
 ): Promise<(() => void) | undefined> {
 	let dir: string | undefined;
+	const changed: TopicsControlChanged = { changed: true };
 	try {
+		await removeStaleControlDirs(runtimeDir);
 		dir = fs.mkdtempSync(path.join(runtimeDir, "omp-topics-"));
 		fs.chmodSync(dir, 0o700);
 		const endpoint: TopicsControlEndpoint = {
@@ -315,13 +379,15 @@ export async function offerTopicsControl(
 			pid: process.pid,
 		};
 		const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
-		const unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, endpoint));
-		bus.emit(TOPICS_CONTROL_CHANNEL, endpoint);
+		currentEndpoint = endpoint;
+		const unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, changed));
+		bus.emit(TOPICS_CONTROL_CHANNEL, changed);
 		const ownedDir = dir;
 		return () => {
 			unsubscribe();
 			stopSocket();
-			bus.emit(TOPICS_CONTROL_CHANNEL, null);
+			if (currentEndpoint === endpoint) currentEndpoint = undefined;
+			bus.emit(TOPICS_CONTROL_CHANNEL, changed);
 			fs.rmSync(ownedDir, { recursive: true, force: true });
 		};
 	} catch (error) {

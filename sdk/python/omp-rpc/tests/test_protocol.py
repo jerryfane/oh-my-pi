@@ -29,6 +29,7 @@ from omp_rpc import (
     assistant_text_with_thinking,
     parse_notification,
     parse_session_state,
+    parse_topic_summary,
 )
 
 
@@ -798,6 +799,35 @@ class ProtocolParsingTests(unittest.TestCase):
 
         self.assertIsInstance(notification, AgentEndEvent)
         self.assertEqual(notification.messages[0]["content"][0]["text"], "hello")
+
+    def test_parse_topic_summary_reads_new_fields_and_ignores_unknown_ones(
+        self,
+    ) -> None:
+        base = {
+            "id": "Diokan",
+            "title": "Diokan term sheet",
+            "state": "running",
+            "turns": 2,
+            "queued": 0,
+            "createdAt": 1,
+            "lastActivityAt": 2,
+        }
+        older = parse_topic_summary(base)
+        self.assertIsNone(older.turn_started_at)
+        self.assertIsNone(older.owner_line)
+
+        newer = parse_topic_summary(
+            {
+                **base,
+                "turnStartedAt": 3,
+                "ownerLine": "Draft clause 4",
+                "fieldFromALaterServer": {"nested": True},
+            }
+        )
+        self.assertEqual(
+            (newer.turn_started_at, newer.owner_line), (3, "Draft clause 4")
+        )
+        self.assertEqual(newer.id, "Diokan")
 
 
 if __name__ == "__main__":

@@ -324,6 +324,7 @@ export const stateDefs = {
 		createdAt: "number.integer",
 		lastActivityAt: "number.integer",
 		"lastActivity?": "string",
+		"ownerLine?": doc("string", "First line of the owner's latest message to the topic, when this process saw one."),
 		"sessionFile?": "string",
 		"turnStartedAt?": doc("number.integer", "When the turn in flight started; absent while no turn runs."),
 	},

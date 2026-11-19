@@ -19,6 +19,8 @@ export const TOPIC_BOARD_CONTEXT_TYPE = "topic-board";
 export const TOPIC_BOARD_FULL_ROWS = 40;
 
 const FIELD_MAX = 120;
+/** Longest quoted gist: enough to tell topics apart, too short to carry a payload of instructions. */
+export const TOPIC_BOARD_GIST_MAX = 80;
 
 /** Whether `message` is a topic board. */
 export function isTopicBoardContext(message: AgentMessage | undefined): message is CustomMessage {
@@ -33,19 +35,26 @@ function field(text: string): string {
 }
 
 /**
- * State and time of a topic's row. A working topic shows when its turn started
- * and no gist: its live activity moves on every progress event, and the board
- * must change only when a turn starts or settles (or the topic changes state).
+ * What a topic is about, quoted as data: the first line of its owner's latest
+ * message when this process saw one; else, once no turn runs, the agent-written
+ * gist of its last turn. A working topic never shows its live activity, which
+ * moves on every progress event: the board changes only when a turn starts or
+ * settles (or the topic changes state).
  */
+function gistLabel(topic: WorkerSummary, working: boolean): string {
+	const quote = (text: string) => escapeXmlText(JSON.stringify(oneLineLabel(text, TOPIC_BOARD_GIST_MAX)));
+	if (topic.ownerLine) return `; owner asked ${quote(topic.ownerLine)}`;
+	return !working && topic.lastActivity ? `; agent note ${quote(topic.lastActivity)}` : "";
+}
+
+/** State and time of a topic's row: a working topic shows when its turn started. */
 function statusLabel(topic: WorkerSummary): string {
 	if (topic.state === "idle" || topic.state === "closed") {
-		const gist = topic.lastActivity ? `; ${field(topic.lastActivity)}` : "";
-		return `${topic.state}; last activity ${timeLabel(topic.lastActivityAt)}${gist}`;
+		return `${topic.state}; last activity ${timeLabel(topic.lastActivityAt)}${gistLabel(topic, false)}`;
 	}
 	const queued = topic.queued > 0 ? `, queued ${topic.queued}` : "";
-	return topic.turnStartedAt === undefined
-		? `working${queued}`
-		: `working${queued}; turn started ${timeLabel(topic.turnStartedAt)}`;
+	const started = topic.turnStartedAt === undefined ? "" : `; turn started ${timeLabel(topic.turnStartedAt)}`;
+	return `working${queued}${started}${gistLabel(topic, true)}`;
 }
 
 /** Minute-precision UTC, so the board text only moves when a topic does. */

@@ -30,7 +30,7 @@ import { validateAgentAccountPools } from "../config/account-pools";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { IrcBus, type IrcBusApi } from "../irc/bus";
+import { IrcBus, type IrcBusApi, type IrcRouteDecision } from "../irc/bus";
 import { MCPManager } from "../mcp/manager";
 import topicAskTemplate from "../prompts/system/topic-ask.md" with { type: "text" };
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
@@ -159,7 +159,10 @@ export interface WorkerSummary {
 	queued: number;
 	createdAt: number;
 	lastActivityAt: number;
+	/** Agent-written gist of the latest activity: intent, tool, or result preview. */
 	lastActivity?: string;
+	/** First line of the owner's latest message to the worker (spawn or send), when this process saw one. */
+	ownerLine?: string;
 	/** Absolute path of the worker's own conversation file, when persisted. */
 	sessionFile?: string;
 	/** When the turn in flight started; absent while no turn runs. */
@@ -218,6 +221,8 @@ interface VibeRecord {
 	lastActivityAt: number;
 	/** One-line gist of the latest activity (intent, tool, or result preview). */
 	lastActivity?: string;
+	/** First line of the owner's latest message (spawn or send); see {@link WorkerSummary.ownerLine}. */
+	ownerLine?: string;
 	/** Resolved model display string once known. */
 	resolvedModel?: string;
 	turn?: VibeTurn;
@@ -989,6 +994,7 @@ export class VibeSessionRegistry {
 			modelRole,
 			state: "starting",
 			title: args.title,
+			ownerLine: firstLine(args.prompt),
 			createdAt,
 			lastActivityAt: createdAt,
 			queue: [],
@@ -1040,7 +1046,9 @@ export class VibeSessionRegistry {
 	/**
 	 * Send a message to a worker. Mid-turn and streaming → steering; mid-turn
 	 * otherwise → queued for the next turn; idle/parked → starts a new
-	 * background turn immediately.
+	 * background turn immediately. A turn another agent's message started is
+	 * never steered: the owner's message waits for a turn of its own, which
+	 * keeps the owner's rights (it may ask other topics).
 	 */
 	async send(session: ToolSession, args: { session: string; message: string }): Promise<VibeSendOutcome> {
 		const scope = this.ownerScope(session);
@@ -1058,9 +1066,14 @@ export class VibeSessionRegistry {
 			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
 		}
 
+		if (!record.turn && (!registered || (registered.status !== "idle" && registered.status !== "parked"))) {
+			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
+		}
+		// The board's gist for the topic: what its owner last asked, not what an agent wrote.
+		record.ownerLine = firstLine(message);
 		if (record.turn) {
 			const live = registered?.session;
-			if (live?.isStreaming) {
+			if (live?.isStreaming && record.turn.startedBy.length === 0) {
 				await live.steer(message, undefined, { attribution: "agent" });
 				record.lastActivityAt = Date.now();
 				return { id: record.id, mode: "steered" };
@@ -1069,11 +1082,6 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 			return { id: record.id, mode: "queued" };
 		}
-
-		if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
-			throw new ToolError(`Vibe session "${record.id}" no longer resolves to this parent session.`);
-		}
-
 		const manager = this.#manager(session);
 		const entry: QueuedMessage = { text: message };
 		record.queue.push(entry);
@@ -1099,26 +1107,28 @@ export class VibeSessionRegistry {
 	 *
 	 * Enforced here, not by prompt: a closed topic refuses all of it, and a
 	 * topic (or a helper it runs) asks another topic only in a turn its owner
-	 * started (no chains), so topics never drive each other in a loop. A reply
-	 * or progress to a streaming turn, and anything from the topic's own
-	 * helpers, is left to ordinary IRC delivery, which hands it into that turn.
-	 * Returns `undefined` for a recipient that is not one of `session`'s workers.
+	 * started (no chains), so topics never drive each other in a loop. In a
+	 * turn another agent's message started, a progress note never starts a turn
+	 * anywhere: to a non-topic recipient it goes with `noWake`. A reply or
+	 * progress to a streaming turn, and anything from the topic's own helpers,
+	 * is left to ordinary IRC delivery, which hands it into that turn. Returns
+	 * `undefined` for anything else: no topic of `session` sent or receives it.
 	 */
-	receive(
-		session: ToolSession,
-		message: IrcMessage,
-		bus: Pick<IrcBusApi, "unansweredSends">,
-	): IrcDeliveryReceipt | undefined {
+	receive(session: ToolSession, message: IrcMessage, bus: Pick<IrcBusApi, "unansweredSends">): IrcRouteDecision {
 		if (!session.getSessionId?.()) return undefined;
 		const scope = this.ownerScope(session);
-		const record = this.#records.get(scopeKey(scope, message.to));
-		if (!record || record.state === "dead") return undefined;
 		// The sender's topic: the sender itself, or the topic it works for.
 		const asking = this.#workerOf(scope, message.from);
-		if (asking === record) return undefined;
-		const failed = (error: string): IrcDeliveryReceipt => ({ to: record.id, outcome: "failed", error });
-		if (record.closed) return failed(`Topic "${record.id}" is closed; its owner has to reopen it first.`);
 		const startedBy = asking?.turn?.startedBy ?? [];
+		const record = this.#records.get(scopeKey(scope, message.to));
+		if (!record || record.state === "dead") {
+			return message.progress === true && startedBy.length > 0
+				? { message: { ...message, noWake: true } }
+				: undefined;
+		}
+		if (asking === record) return undefined;
+		const failed = (error: string) => ({ receipt: { to: record.id, outcome: "failed" as const, error } });
+		if (record.closed) return failed(`Topic "${record.id}" is closed; its owner has to reopen it first.`);
 		const rideAlong =
 			message.progress === true || asking?.turn?.askers.some(asker => asker.from === record.id) === true;
 		const reply =
@@ -1161,14 +1171,14 @@ export class VibeSessionRegistry {
 			...(rideAlong ? { note: true } : {}),
 		};
 		record.queue.push(entry);
-		if (record.turn || rideAlong) return { to: record.id, outcome: "queued" };
+		if (record.turn || rideAlong) return { receipt: { to: record.id, outcome: "queued" } };
 		const registered = this.#registeredAgent(record);
 		try {
 			if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
 				throw new ToolError(`Topic "${record.id}" no longer resolves to this session.`);
 			}
 			this.#startQueued(session, this.#manager(session), record);
-			return { to: record.id, outcome: "woken" };
+			return { receipt: { to: record.id, outcome: "woken" } };
 		} catch (error) {
 			record.queue.splice(record.queue.indexOf(entry), 1);
 			return failed(error instanceof Error ? error.message : String(error));
@@ -1231,6 +1241,7 @@ export class VibeSessionRegistry {
 				createdAt: record.createdAt,
 				lastActivityAt: record.lastActivityAt,
 				lastActivity: record.lastActivity,
+				ownerLine: record.ownerLine,
 				sessionFile: record.childSessionFile,
 				turnStartedAt: record.turn?.startedAt,
 			});

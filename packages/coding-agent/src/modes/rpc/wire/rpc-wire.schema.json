@@ -3561,6 +3561,10 @@
 				"lastActivity": {
 					"type": "string"
 				},
+				"ownerLine": {
+					"type": "string",
+					"description": "First line of the owner's latest message to the topic, when this process saw one."
+				},
 				"sessionFile": {
 					"type": "string"
 				},

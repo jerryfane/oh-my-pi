@@ -3494,6 +3494,9 @@ pub struct TopicSummary {
 	pub last_activity_at: i64,
 	#[serde(rename = "lastActivity", default, skip_serializing_if = "Option::is_none")]
 	pub last_activity: Option<String>,
+	/// First line of the owner's latest message to the topic, when this process saw one.
+	#[serde(rename = "ownerLine", default, skip_serializing_if = "Option::is_none")]
+	pub owner_line: Option<String>,
 	#[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
 	pub session_file: Option<String>,
 	/// When the turn in flight started; absent while no turn runs.

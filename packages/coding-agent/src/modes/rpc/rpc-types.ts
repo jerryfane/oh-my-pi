@@ -441,6 +441,8 @@ export interface RpcTopicSummary {
 	createdAt: number;
 	lastActivityAt: number;
 	lastActivity?: string;
+	/** First line of the owner's latest message to the topic, when this process saw one. */
+	ownerLine?: string;
 	sessionFile?: string;
 	/** When the turn in flight started; absent while no turn runs. */
 	turnStartedAt?: number;

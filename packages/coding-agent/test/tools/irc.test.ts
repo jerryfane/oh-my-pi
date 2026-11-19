@@ -707,6 +707,28 @@ describe("IRC", () => {
 			const event = await ircEvent;
 			expect(event.type).toBe("irc_message");
 		});
+		it("keeps a noWake message in an idle session's history for its next turn instead of starting one", async () => {
+			const { session } = createRealSession();
+			sessions.push(session);
+			const promptSpy = vi.spyOn(session.agent, "prompt").mockResolvedValue(undefined);
+			const outcome = await session.deliverIrcMessage({
+				id: "msg-quiet",
+				from: "0-Topic",
+				to: "0-Me",
+				body: "still drafting",
+				ts: Date.now(),
+				progress: true,
+				noWake: true,
+			});
+			expect(outcome).toBe("injected");
+			for (let i = 0; i < 10; i++) await Promise.resolve();
+			expect(promptSpy).not.toHaveBeenCalled();
+			expect(session.messages.at(-1)).toMatchObject({
+				role: "custom",
+				customType: "irc:incoming",
+				details: { id: "msg-quiet", from: "0-Topic", progress: true },
+			});
+		});
 		it("defers an idle wake while a pooled yield contract is installed", async () => {
 			const { session } = createRealSession();
 			sessions.push(session);

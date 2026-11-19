@@ -352,7 +352,9 @@ describe("topics registry", () => {
 		await settled(id, 2);
 		const after = topicBoardMessage(board(), history);
 		expect(after?.content).toContain(`(id: ${id}): idle; last activity`);
-		expect(after?.content).toContain("Clause 4 drafted");
+		// The gist is the owner's own line, not the agent's result text.
+		expect(after?.content).toContain('owner asked "draft clause 4"');
+		expect(after?.content).not.toContain("Clause 4 drafted");
 	});
 
 	it("runs an Inbox ask as a topic turn with the sibling board, labelled and counted, and answers the Inbox", async () => {
@@ -453,5 +455,72 @@ describe("topics registry", () => {
 		expect((await ask(trip, diokan, "and clause 5?")).text).toContain("no chains");
 		replyTurn.release();
 		await settled(trip, 3);
+	});
+
+	it("runs an owner message sent during an agent's turn as an owner turn of its own, which may ask", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const trip = await spawnSettled(topics, parent, { name: "Trip", title: "Trip planning" });
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		registerInbox();
+		hostFor(parent);
+		const turn = holdFollowUps();
+		// Trip's session is mid-stream, so an owner message could be steered into the running turn.
+		const steer = vi.fn(async () => {});
+		const ref = AgentRegistry.global().get(trip)!;
+		AgentRegistry.global().unregister(trip, ref);
+		AgentRegistry.global().register({
+			id: trip,
+			displayName: trip,
+			kind: "sub",
+			parentId: OWNER,
+			session: { isStreaming: true, steer } as never,
+			sessionFile: ref.sessionFile,
+			status: "idle",
+		});
+
+		await ask(OWNER, trip, "what's the plan?");
+		const askTurn = await turn(0);
+		const sent = await topics.send(parent, { session: trip, message: "check clause 4 with Diokan" });
+		expect(sent.mode).toBe("queued");
+		expect(steer).not.toHaveBeenCalled();
+
+		askTurn.release();
+		const ownerTurn = await turn(1);
+		expect(ownerTurn.options.message).toBe("check clause 4 with Diokan");
+		expect(await ask(trip, diokan, "is clause 4 final?")).toMatchObject({ isError: false });
+		const diokanTurn = await turn(2);
+		expect(diokanTurn.options.message).toContain(`Asked by \`${trip}\`:`);
+		diokanTurn.release();
+		ownerTurn.release();
+		await settled(trip, 3);
+	});
+
+	it("never starts a turn with a progress note from a turn another agent's message started", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
+		const inbox = registerInbox();
+		hostFor(parent);
+		const turn = holdFollowUps();
+
+		await ask(OWNER, diokan, "is clause 4 final?");
+		const askTurn = await turn(0);
+		expect(await ask(diokan, `${OWNER}?progress`, "checking the redlines")).toMatchObject({ isError: false });
+		expect(inbox).toMatchObject([{ from: diokan, progress: true, noWake: true, body: "checking the redlines" }]);
+		expect(await ask(diokan, `${notes}?progress`, "fyi: clause 4 moves")).toMatchObject({ isError: false });
+		expect(topics.describe(parent).find(topic => topic.id === notes)).toMatchObject({ state: "idle", turns: 1 });
+		askTurn.release();
+		await settled(diokan, 2);
+
+		// From a turn its owner started, a progress note is ordinary delivery.
+		await topics.send(parent, { session: diokan, message: "tell the Inbox how it goes" });
+		const ownerTurn = await turn(1);
+		await ask(diokan, `${OWNER}?progress`, "halfway");
+		expect(inbox.at(-1)).toMatchObject({ body: "halfway", progress: true });
+		expect(inbox.at(-1)?.noWake).toBeUndefined();
+		ownerTurn.release();
+		await settled(diokan, 3);
 	});
 });

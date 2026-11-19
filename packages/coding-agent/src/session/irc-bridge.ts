@@ -189,7 +189,9 @@ export class IrcBridge {
 	async deliver(msg: IrcMessage): Promise<"injected" | "woken"> {
 		if (this.#host.isDisposed()) throw new Error("Recipient session is disposed.");
 		const streaming = this.#host.isStreaming();
-		const planModeIdle = !streaming && this.#host.planModeEnabled();
+		// Plan mode, or a message routed not to wake (`noWake`): an idle recipient
+		// keeps it in its history for its next turn instead of starting one.
+		const appendIdle = !streaming && (this.#host.planModeEnabled() || msg.noWake === true);
 		const registry = AgentRegistry.global();
 		const parentId = registry.get(msg.to)?.parentId;
 		const fromParent = parentId === msg.from;
@@ -216,7 +218,7 @@ export class IrcBridge {
 		// agent, mid-turn asides, relays, broadcast legs and progress notes have no such relay.
 		const relayOnStop =
 			!streaming &&
-			!planModeIdle &&
+			!appendIdle &&
 			msg.to !== MAIN_AGENT_ID &&
 			msg.wakeRelay !== true &&
 			msg.broadcast !== true &&
@@ -276,7 +278,7 @@ export class IrcBridge {
 			}
 			return "injected";
 		}
-		if (this.#host.planModeEnabled()) {
+		if (appendIdle) {
 			this.#host.agent.appendMessage(record);
 			this.#host.sessionManager.appendCustomMessageEntry(
 				record.customType,
