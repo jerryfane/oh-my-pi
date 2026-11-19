@@ -6,12 +6,19 @@ import { afterEach, beforeEach, describe, expect, it } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
-import { startTopicsControl, TOPICS_CONTROL_PROTOCOL } from "@oh-my-pi/pi-coding-agent/topics/control";
+import {
+	MIN_TOKEN_LENGTH,
+	startTopicsControl,
+	TOPICS_CONTROL_PROTOCOL,
+	takeTopicsControlRequest,
+} from "@oh-my-pi/pi-coding-agent/topics/control";
 import type { TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { WorkerChange } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
-const TOKEN = "s3cret-token";
+const TOKEN = "s3cret-token-0123456789abcdefghijklmnop";
+/** A transcript page larger than one socket write, to prove replies are not cut off. */
+const BIG_TEXT = "x".repeat(3 * 1024 * 1024);
 
 function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 	const listeners = new Set<(change: WorkerChange) => void>();
@@ -26,7 +33,8 @@ function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 				listener({ id, ownerId: "Main", parentSessionId: "p", reason: "turn-started" });
 			return { id, mode: "turn" };
 		},
-		read: async () => ({}) as RpcSubagentMessagesResult,
+		read: async () =>
+			({ messages: [{ role: "assistant", content: BIG_TEXT }] }) as unknown as RpcSubagentMessagesResult,
 		close: async () => {},
 		reopen: async () => {},
 		rename: async () => {},
@@ -89,12 +97,12 @@ describe("topics control socket", () => {
 	let stop: (() => void) | undefined;
 	let sent: Array<{ id: string; message: string }>;
 
-	beforeEach(() => {
+	beforeEach(async () => {
 		tempDir = TempDir.createSync("@omp-topics-control-");
 		socketPath = path.join(tempDir.path(), "control.sock");
 		sent = [];
 		const host = fakeHost(sent);
-		stop = startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => host });
+		stop = await startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => host, helloTimeoutMs: 50 });
 	});
 
 	afterEach(() => {
@@ -145,9 +153,81 @@ describe("topics control socket", () => {
 		client.end();
 	});
 
-	it("never replaces an existing socket path", () => {
-		expect(() => startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => undefined })).toThrow(
-			"already exists",
-		);
+	it("delivers a reply larger than one socket write whole", async () => {
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		await client.next();
+		client.send({ id: "big", type: "topics_read", topicId: "Diokan" });
+		const reply = await client.next();
+		expect(reply).toMatchObject({ id: "big", success: true });
+		expect(JSON.stringify(reply)).toContain(BIG_TEXT);
+		client.end();
+	});
+
+	it("closes a client that never says hello", async () => {
+		const client = await connect(socketPath);
+		await client.closed;
+		expect(sent).toEqual([]);
+	});
+
+	it("refuses to take over a socket another server is still answering on", async () => {
+		await expect(
+			startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => undefined }),
+		).rejects.toThrow("in use");
+	});
+
+	it("replaces a dead socket left by a crashed run", async () => {
+		stop?.();
+		stop = undefined;
+		// A SIGKILL leaves the socket inode behind with nobody listening. Bun unlinks
+		// on stop(), so keep a hard link to the inode and put it back afterwards.
+		const crashed = Bun.listen({ unix: socketPath, socket: { data() {} } });
+		fs.linkSync(socketPath, `${socketPath}.keep`);
+		crashed.stop(true);
+		fs.renameSync(`${socketPath}.keep`, socketPath);
+		expect(fs.lstatSync(socketPath).isSocket()).toBe(true);
+		stop = await startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => undefined });
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		expect(await client.next()).toMatchObject({ type: "hello" });
+		client.end();
+	});
+
+	it("refuses a token shorter than the minimum", async () => {
+		await expect(
+			startTopicsControl({
+				path: `${socketPath}.2`,
+				token: "a".repeat(MIN_TOKEN_LENGTH - 1),
+				topics: async () => undefined,
+			}),
+		).rejects.toThrow("at least");
+	});
+});
+
+describe("topics control request from the environment", () => {
+	it("reads the secret once and leaves nothing a child process could read it from", async () => {
+		const tempDir = TempDir.createSync("@omp-topics-env-");
+		try {
+			const tokenFile = path.join(tempDir.path(), "token");
+			fs.writeFileSync(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
+			const env: NodeJS.ProcessEnv = {
+				HERDR_OMP_CONTROL: path.join(tempDir.path(), "c.sock"),
+				HERDR_OMP_CONTROL_TOKEN_FILE: tokenFile,
+			};
+
+			const request = takeTopicsControlRequest(env);
+
+			expect(request).toEqual({ path: path.join(tempDir.path(), "c.sock"), token: TOKEN });
+			// A child running as the same user would read the file next; it must be gone.
+			const child = Bun.spawnSync(["sh", "-c", `cat ${tokenFile} 2>/dev/null; echo end`]);
+			expect(child.stdout.toString()).toBe("end\n");
+			expect(env).toEqual({});
+			// A second read (a restarted omp reusing the variables) finds nothing.
+			expect(
+				takeTopicsControlRequest({ ...env, HERDR_OMP_CONTROL_TOKEN_FILE: tokenFile, HERDR_OMP_CONTROL: "x" }),
+			).toBe(undefined);
+		} finally {
+			tempDir.removeSync();
+		}
 	});
 });

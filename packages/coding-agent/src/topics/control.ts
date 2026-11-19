@@ -2,17 +2,24 @@
  * Local control socket for the owner's topics of an interactive session.
  *
  * A host that launched omp in a terminal pane (Herdr) cannot use stdio RPC, so
- * it passes `HERDR_OMP_CONTROL` (socket path inside a directory only it can
- * enter) and `HERDR_OMP_CONTROL_TOKEN` (per-launch secret). omp listens there
- * with owner-only permissions; a client must present the token in its first
- * frame. Frames are newline-delimited JSON, one object per line:
+ * it passes `HERDR_OMP_CONTROL` (a fresh socket path inside a directory only
+ * the host can enter) and `HERDR_OMP_CONTROL_TOKEN_FILE` (an owner-only file
+ * holding a per-launch secret). omp reads the secret once at startup and
+ * deletes the file; the secret is never in any environment or command line.
+ * The two variables are removed from `process.env`, but Bun's default spawn
+ * environment still carries them, so children may see the variable names and
+ * paths: a deleted file and a socket that needs the secret, neither of which
+ * grants access. A client must present the secret in its first frame. Frames
+ * are newline-delimited JSON, one per line:
  *
  * - client `{"type":"hello","token":"…"}` → `{"type":"hello","protocol":1,"pid":…}`
  * - client `{"id":"1","type":"topics_list"}` (any `topics_*` RPC command) →
  *   `{"id":"1","type":"response","command":"topics_list","success":true,"data":…}`
  * - client `{"type":"subscribe"}` → `topic_update` frames `{"type":"topic_update","change":…}`
  *
- * The socket exposes only topics; it cannot prompt the main session.
+ * Privilege: the socket cannot prompt the main session, but `topics_send`
+ * runs a topic worker with the agent's full tools, so holding the secret is
+ * equivalent to controlling the agent. Treat the token like the agent itself.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
@@ -24,14 +31,22 @@ import type { TopicsHost } from "./host";
 
 /** Wire version announced in the hello reply; a host refuses majors it does not know. */
 export const TOPICS_CONTROL_PROTOCOL = 1;
-/** One frame larger than this closes the connection (a transcript read is the largest reply, not request). */
+/** Shortest accepted secret; a weak token from a misconfigured host is refused. */
+export const MIN_TOKEN_LENGTH = 32;
+/** One request larger than this closes the connection. */
 const MAX_REQUEST_BYTES = 1024 * 1024;
+/** Unsent reply bytes beyond this close a client that stopped reading. */
+const MAX_PENDING_OUTPUT_BYTES = 64 * 1024 * 1024;
+const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
+const MAX_UNAUTHENTICATED_CONNECTIONS = 8;
 
 export interface TopicsControlOptions {
 	path: string;
 	token: string;
 	/** Resolves the session's topics on demand (restores them after a session switch). */
 	topics: () => Promise<TopicsHost | undefined>;
+	/** Close a connection that has not authenticated within this time. */
+	helloTimeoutMs?: number;
 }
 
 interface ConnectionState {
@@ -40,7 +55,14 @@ interface ConnectionState {
 	unsubscribe?: () => void;
 	/** Serializes this connection's commands so replies keep request order. */
 	queue: Promise<void>;
+	/** Bytes the kernel did not accept yet; flushed on drain. */
+	pending: Buffer[];
+	pendingBytes: number;
+	helloTimer?: NodeJS.Timeout;
+	closed: boolean;
 }
+
+type ControlSocket = Socket<ConnectionState>;
 
 function constantTimeEqual(a: string, b: string): boolean {
 	const left = Buffer.from(a);
@@ -48,50 +70,132 @@ function constantTimeEqual(a: string, b: string): boolean {
 	return left.length === right.length && crypto.timingSafeEqual(left, right);
 }
 
-/**
- * Start the control socket; returns a stop function. Refuses to start when the
- * path already exists (a stale or foreign socket is never replaced silently).
- */
-export function startTopicsControl(options: TopicsControlOptions): () => void {
-	if (!options.token) throw new Error("Topics control requires a non-empty token.");
-	if (fs.existsSync(options.path)) throw new Error(`Topics control socket already exists: ${options.path}`);
-	const previousUmask = process.umask(0o177);
-	let server: UnixSocketListener<ConnectionState>;
-	try {
-		server = Bun.listen<ConnectionState>({
-			unix: options.path,
-			socket: {
-				open(socket) {
-					socket.data = { buffer: "", authenticated: false, queue: Promise.resolve() };
-				},
-				data(socket, chunk) {
-					const state = socket.data;
-					state.buffer += chunk.toString("utf8");
-					if (state.buffer.length > MAX_REQUEST_BYTES) {
-						socket.end();
-						return;
-					}
-					let newline = state.buffer.indexOf("\n");
-					while (newline >= 0) {
-						const line = state.buffer.slice(0, newline).trim();
-						state.buffer = state.buffer.slice(newline + 1);
-						newline = state.buffer.indexOf("\n");
-						if (!line) continue;
-						state.queue = state.queue.then(() => handleLine(socket, state, line, options));
-					}
-				},
-				close(socket) {
-					socket.data?.unsubscribe?.();
-				},
-				error(socket, error) {
-					logger.debug("topics control connection error", { error: error.message });
-					socket.data?.unsubscribe?.();
-				},
-			},
-		});
-	} finally {
-		process.umask(previousUmask);
+/** Write what the socket accepts now, keep the rest for drain; close a client that stops reading. */
+function flush(socket: ControlSocket): void {
+	const state = socket.data;
+	while (state.pending.length > 0) {
+		const chunk = state.pending[0];
+		const written = socket.write(chunk);
+		if (written < 0) return;
+		state.pendingBytes -= written;
+		if (written < chunk.length) {
+			state.pending[0] = chunk.subarray(written);
+			return;
+		}
+		state.pending.shift();
 	}
+}
+
+function send(socket: ControlSocket, frame: object): void {
+	const state = socket.data;
+	if (state.closed) return;
+	const bytes = Buffer.from(`${JSON.stringify(frame)}\n`);
+	state.pending.push(bytes);
+	state.pendingBytes += bytes.length;
+	if (state.pendingBytes > MAX_PENDING_OUTPUT_BYTES) {
+		logger.warn("topics control: closing a client that stopped reading");
+		socket.end();
+		return;
+	}
+	flush(socket);
+}
+
+/**
+ * Remove a socket left by a crashed run: only a socket that refuses connections
+ * is removed; anything else at the path (a live server, a regular file) is kept
+ * and startup fails.
+ */
+async function clearStaleSocket(socketPath: string): Promise<void> {
+	let stat: fs.Stats;
+	try {
+		stat = fs.lstatSync(socketPath);
+	} catch {
+		return;
+	}
+	if (!stat.isSocket()) throw new Error(`Topics control path exists and is not a socket: ${socketPath}`);
+	try {
+		const probe = await Bun.connect({ unix: socketPath, socket: { data() {} } });
+		probe.end();
+	} catch {
+		fs.rmSync(socketPath, { force: true });
+		return;
+	}
+	throw new Error(`Topics control socket is in use: ${socketPath}`);
+}
+
+/** Start the control socket; returns a stop function. */
+export async function startTopicsControl(options: TopicsControlOptions): Promise<() => void> {
+	if (options.token.length < MIN_TOKEN_LENGTH) {
+		throw new Error(`Topics control token must be at least ${MIN_TOKEN_LENGTH} characters.`);
+	}
+	await clearStaleSocket(options.path);
+	const helloTimeoutMs = options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
+	let unauthenticated = 0;
+	const release = (state: ConnectionState): void => {
+		if (state.closed) return;
+		state.closed = true;
+		clearTimeout(state.helloTimer);
+		if (!state.authenticated) unauthenticated--;
+		state.unsubscribe?.();
+	};
+	const server: UnixSocketListener<ConnectionState> = Bun.listen<ConnectionState>({
+		unix: options.path,
+		socket: {
+			open(socket) {
+				const state: ConnectionState = {
+					buffer: "",
+					authenticated: false,
+					queue: Promise.resolve(),
+					pending: [],
+					pendingBytes: 0,
+					closed: false,
+				};
+				socket.data = state;
+				if (unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS) {
+					state.closed = true;
+					socket.end();
+					return;
+				}
+				unauthenticated++;
+				state.helloTimer = setTimeout(() => {
+					if (!state.authenticated) socket.end();
+				}, helloTimeoutMs);
+			},
+			data(socket, chunk) {
+				const state = socket.data;
+				if (state.closed) return;
+				state.buffer += chunk.toString("utf8");
+				if (state.buffer.length > MAX_REQUEST_BYTES) {
+					socket.end();
+					return;
+				}
+				let newline = state.buffer.indexOf("\n");
+				while (newline >= 0) {
+					const line = state.buffer.slice(0, newline).trim();
+					state.buffer = state.buffer.slice(newline + 1);
+					newline = state.buffer.indexOf("\n");
+					if (!line) continue;
+					state.queue = state.queue.then(() =>
+						handleLine(socket, state, line, options, () => {
+							unauthenticated--;
+							clearTimeout(state.helloTimer);
+						}),
+					);
+				}
+			},
+			drain(socket) {
+				flush(socket);
+			},
+			close(socket) {
+				if (socket.data) release(socket.data);
+			},
+			error(socket, error) {
+				logger.debug("topics control connection error", { error: error.message });
+				if (socket.data) release(socket.data);
+			},
+		},
+	});
+	// Inside the host's 0700 directory the brief default-mode window is unreachable; tighten anyway.
 	fs.chmodSync(options.path, 0o600);
 	return () => {
 		server.stop(true);
@@ -103,27 +207,23 @@ export function startTopicsControl(options: TopicsControlOptions): () => void {
 	};
 }
 
-type ControlSocket = Socket<ConnectionState>;
-
-function send(socket: ControlSocket, frame: object): void {
-	socket.write(`${JSON.stringify(frame)}\n`);
-}
-
 async function handleLine(
 	socket: ControlSocket,
 	state: ConnectionState,
 	line: string,
 	options: TopicsControlOptions,
+	onAuthenticated: () => void,
 ): Promise<void> {
+	if (state.closed) return;
 	let frame: unknown;
 	try {
 		frame = JSON.parse(line);
 	} catch {
-		send(socket, { type: "error", error: "Frame is not valid JSON." });
-		return;
+		frame = undefined;
 	}
 	if (typeof frame !== "object" || frame === null || !("type" in frame) || typeof frame.type !== "string") {
-		send(socket, { type: "error", error: "Frame needs a string `type`." });
+		send(socket, { type: "error", error: "Frame must be a JSON object with a string `type`." });
+		if (!state.authenticated) socket.end();
 		return;
 	}
 	const id = "id" in frame && typeof frame.id === "string" ? frame.id : undefined;
@@ -136,6 +236,7 @@ async function handleLine(
 			return;
 		}
 		state.authenticated = true;
+		onAuthenticated();
 		send(socket, { type: "hello", protocol: TOPICS_CONTROL_PROTOCOL, pid: process.pid });
 		return;
 	}
@@ -150,7 +251,7 @@ async function handleLine(
 		send(socket, { id, type: "response", command: "subscribe", success: true });
 		return;
 	}
-	// Validated as a `topics_*` RPC command below; field checks happen in runRpcTopicsCommand.
+	// Narrowed to a `topics_*` command below; runRpcTopicsCommand validates each field.
 	const command = frame as RpcCommand;
 	if (!isRpcTopicsCommand(command)) {
 		send(socket, { id, type: "response", command: frame.type, success: false, error: "Unknown command." });
@@ -170,16 +271,48 @@ async function handleLine(
 	}
 }
 
-/** Start the control socket when the launching host asked for one; returns a stop function or undefined. */
-export function startTopicsControlFromEnv(topics: () => Promise<TopicsHost | undefined>): (() => void) | undefined {
-	const path = process.env.HERDR_OMP_CONTROL?.trim();
-	const token = process.env.HERDR_OMP_CONTROL_TOKEN?.trim();
-	if (!path || !token) return undefined;
+/** Environment variables a host uses to request the control socket; removed from omp's own environment once read. */
+export const TOPICS_CONTROL_ENV = ["HERDR_OMP_CONTROL", "HERDR_OMP_CONTROL_TOKEN_FILE"] as const;
+
+/** A host's request for the control socket, taken out of the environment by {@link takeTopicsControlRequest}. */
+export interface TopicsControlRequest {
+	path: string;
+	token: string;
+}
+
+/**
+ * Take the control request out of the environment: read the token file once,
+ * delete it, and remove the variables from `process.env`. Call before anything
+ * spawns (MCP servers, LSP, tools) so no child can read the file first.
+ * Returns undefined when no host asked for a socket or the file is unreadable.
+ */
+export function takeTopicsControlRequest(env: NodeJS.ProcessEnv = process.env): TopicsControlRequest | undefined {
+	const socketPath = env.HERDR_OMP_CONTROL?.trim();
+	const tokenFile = env.HERDR_OMP_CONTROL_TOKEN_FILE?.trim();
+	for (const name of TOPICS_CONTROL_ENV) delete env[name];
+	if (!socketPath || !tokenFile) return undefined;
 	try {
-		return startTopicsControl({ path, token, topics });
+		return { path: socketPath, token: fs.readFileSync(tokenFile, "utf8").trim() };
+	} catch (error) {
+		logger.warn("topics control token file unreadable", {
+			error: error instanceof Error ? error.message : String(error),
+		});
+		return undefined;
+	} finally {
+		fs.rmSync(tokenFile, { force: true });
+	}
+}
+
+/** Start the control socket a host requested; returns a stop function, or undefined when it could not start. */
+export async function startRequestedTopicsControl(
+	request: TopicsControlRequest,
+	topics: () => Promise<TopicsHost | undefined>,
+): Promise<(() => void) | undefined> {
+	try {
+		return await startTopicsControl({ ...request, topics });
 	} catch (error) {
 		logger.warn("topics control socket not started", {
-			path,
+			path: request.path,
 			error: error instanceof Error ? error.message : String(error),
 		});
 		return undefined;
