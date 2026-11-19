@@ -6,6 +6,7 @@
  * omits them.
  */
 import { absentAs, doc, type WireDefs } from "./dsl";
+import { topicsStateDefs } from "./topics";
 
 const JSON_OBJECT = "Record<string, unknown>";
 
@@ -315,19 +316,7 @@ export const stateDefs = {
 		"progress?": doc(JSON_OBJECT, "Raw `AgentProgress` record."),
 		"parentToolCallId?": "string",
 	},
-	TopicSummary: {
-		id: "string",
-		title: "string",
-		state: "'starting' | 'running' | 'idle' | 'dead' | 'closed'",
-		turns: "number.integer",
-		queued: "number.integer",
-		createdAt: "number.integer",
-		lastActivityAt: "number.integer",
-		"lastActivity?": "string",
-		"ownerLine?": doc("string", "First line of the owner's latest message to the topic, when this process saw one."),
-		"sessionFile?": "string",
-		"turnStartedAt?": doc("number.integer", "When the turn in flight started; absent while no turn runs."),
-	},
+	...topicsStateDefs,
 	SubagentMessages: doc(
 		{
 			sessionFile: "string",

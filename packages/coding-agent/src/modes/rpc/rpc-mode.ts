@@ -93,7 +93,7 @@ import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isSessionSettled } from "../../session/session-settle";
 import { RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
 import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
-import { runRpcTopicsCommand } from "./rpc-topics";
+import { isRpcTopicsCommand, respondRpcTopicsCommand } from "./rpc-topics";
 import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
@@ -2025,6 +2025,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	// Handle a single command
 	const handleCommandImpl = async (command: RpcCommand): Promise<RpcResponse> => {
 		const id = command.id;
+		if (isRpcTopicsCommand(command)) return respondRpcTopicsCommand(session.getTopicsHost(), command);
 
 		switch (command.type) {
 			case "negotiate_protocol": {
@@ -2521,22 +2522,6 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				}
 				const failure = await handleRpcSteerSubagent(subagentRegistry, command.subagentId, command.message);
 				return failure ? error(id, "steer_subagent", failure) : success(id, "steer_subagent");
-			}
-
-			case "topics_list":
-			case "topics_new":
-			case "topics_send":
-			case "topics_read":
-			case "topics_close":
-			case "topics_reopen":
-			case "topics_rename": {
-				const topics = await session.getTopicsHost();
-				if (!topics) return error(id, command.type, "Topics are disabled; enable the topics.enabled setting.");
-				try {
-					return success(id, command.type, await runRpcTopicsCommand(topics, command));
-				} catch (err) {
-					return error(id, command.type, err instanceof Error ? err.message : String(err));
-				}
 			}
 
 			// =================================================================

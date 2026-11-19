@@ -251,8 +251,8 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
-import { formatTopicBoard, topicBoardMessage } from "../topics/board";
-import type { TopicsHost } from "../topics/host";
+import { topicBoardForTurn } from "../topics/board";
+import { SessionTopics, type TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 import { recoverAskHtml } from "../tools/ask";
@@ -1268,10 +1268,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	readonly #eval: EvalRunner;
 	readonly #evalToolSession: ToolSession | undefined;
-	readonly #createTopicsHost: (() => TopicsHost) | undefined;
-	#topicsHost: TopicsHost | undefined;
-	/** Parent session file whose persisted topics were last restored (`undefined` = never). */
-	#topicsRestoredFor: string | null | undefined;
+	readonly #topics: SessionTopics | undefined;
 	/** Manager owned by this top-level session; subagents borrow but never dispose it. */
 	readonly #ownedAsyncJobManager: AsyncJobManager | undefined;
 	/** Manager of this session's root, used for its own job queries and deliveries. */
@@ -2295,7 +2292,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			kernelOwnerId: config.evalKernelOwnerId ?? `agent-session:${Snowflake.next()}`,
 		});
 		this.#evalToolSession = config.evalToolSession;
-		this.#createTopicsHost = config.createTopicsHost;
+		this.#topics = config.createTopicsHost && new SessionTopics(config.createTopicsHost, d => this.addDisposer(d));
 		const initialEvalStateContext = this.#buildEvalStateContextMessage(this.agent.state.messages);
 		if (initialEvalStateContext) {
 			// Persist the startup snapshot at the slot this process sends it from, so
@@ -3504,24 +3501,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#evalToolSession?.agentOutputManager;
 	}
 
-	/**
-	 * The owner's topics, with this session's persisted topics restored, or
-	 * `undefined` when topics are disabled or this is a subagent. Restoring is
-	 * repeated once per parent session file, so it also covers session switches.
-	 */
+	/** The owner's topics with this session's restored, or `undefined` when disabled or a subagent. */
 	async getTopicsHost(): Promise<TopicsHost | undefined> {
-		if (!this.#createTopicsHost) return undefined;
-		if (!this.#topicsHost) {
-			const host = this.#createTopicsHost();
-			this.#topicsHost = host;
-			this.addDisposer(() => host.dispose());
-		}
-		const sessionFile = this.sessionManager.getSessionFile() ?? null;
-		if (this.#topicsRestoredFor !== sessionFile) {
-			await this.#topicsHost.restore();
-			this.#topicsRestoredFor = sessionFile;
-		}
-		return this.#topicsHost;
+		return this.#topics?.host(this.sessionManager.getSessionFile() ?? null);
 	}
 
 	getAgentId(): string | undefined {
@@ -8952,16 +8934,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
-	/**
-	 * The topic board to send ahead of this turn, if it changed since the last
-	 * one in the history ({@link topicBoardMessage}). A topic worker's comes with
-	 * its prompt; the Inbox builds its own from its topics.
-	 */
-	async #buildTopicBoardMessage(supplied: string | undefined): Promise<CustomMessage | undefined> {
-		const board = supplied ?? formatTopicBoard((await this.getTopicsHost())?.list() ?? [], "inbox");
-		return topicBoardMessage(board, this.agent.state.messages);
-	}
-
 	#sanitizeGoalTodoText(text: string): string {
 		return escapeXmlText(text)
 			.replace(/\r\n/g, "\\n")
@@ -10032,10 +10004,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				messages.push(vibeModeMessage);
 			}
 			// After the stable prefix, never in the system prompt: a changed board appends one message here.
-			const topicBoard = await this.#buildTopicBoardMessage(options?.topicBoard);
-			if (topicBoard) {
-				messages.push(topicBoard);
-			}
+			const topicBoard = await topicBoardForTurn(options?.topicBoard, () => this.getTopicsHost(), this.messages);
+			if (topicBoard) messages.push(topicBoard);
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);
 			}

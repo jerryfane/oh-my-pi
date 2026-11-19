@@ -30,16 +30,13 @@ import { validateAgentAccountPools } from "../config/account-pools";
 import { resolveAgentModelSelection } from "../config/model-resolver";
 import { sessionLocalProtocolOptions } from "../internal-urls/context";
 import { registerArtifactsDir } from "../internal-urls/registry-helpers";
-import { IrcBus, type IrcBusApi, type IrcRouteDecision } from "../irc/bus";
 import { MCPManager } from "../mcp/manager";
-import topicAskTemplate from "../prompts/system/topic-ask.md" with { type: "text" };
 import vibeTurnResultTemplate from "../prompts/tools/vibe-turn-result.md" with { type: "text" };
 import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
-import { escapeHarnessTags } from "../session/harness-tags";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
-import { buildWakeRelayBody, type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
+import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
@@ -48,7 +45,7 @@ import type { ToolSession } from "../tools";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
-import { formatTopicBoard } from "../topics/board";
+import { TOPICS_POLICY } from "../topics/workers";
 
 import {
 	parseLifecycleEvent,
@@ -58,10 +55,19 @@ import {
 	type VibeLifecycleEvent,
 	type VibeSpawnLifecycleEvent,
 	type VibeTombstoneReason,
-	type WorkerScopeTag,
 } from "./lifecycle";
 import { type VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
-import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import type {
+	QueuedMessage,
+	WorkerChange,
+	WorkerScopePolicy,
+	WorkerSummary,
+	WorkerTurnOrigin,
+	WorkerView,
+} from "./worker-scope";
+
+/** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
+export type { WorkerChange, WorkerSummary } from "./worker-scope";
 
 import { cfgTaskAgentAccountPools, cfgTaskAgentModelOverrides } from "../task/settings";
 /**
@@ -123,52 +129,6 @@ interface VibeRestoreCandidate {
 	title?: string;
 }
 
-/**
- * How one registry instance treats its workers. The Vibe director's registry
- * uses the defaults; the topics registry keeps owner-facing, permanent
- * workers whose results are read by the owner instead of the parent model.
- */
-export interface WorkerScopePolicy {
-	/** Persisted scope tag; events of other scopes are ignored. Absent = Vibe. */
-	scope?: WorkerScopeTag;
-	/** Deliver each settled turn result into the owner conversation as an async job result. */
-	deliverResults: boolean;
-	/**
-	 * Run workers at the owner's own spawn depth, so helpers they start keep the
-	 * nesting a top-level session has (`task.maxRecursionDepth`).
-	 */
-	ownerSpawnDepth: boolean;
-	/** Show each worker the owner's other workers as a topic board ahead of its turns (`topics/board`). */
-	siblingBoard: boolean;
-}
-
-/** Record state change observed by {@link VibeSessionRegistry.onChange} listeners. */
-export interface WorkerChange {
-	id: string;
-	ownerId: string;
-	parentSessionId: string;
-	reason: "spawned" | "turn-started" | "turn-settled" | "closed" | "reopened" | "retitled" | "restored";
-}
-
-/** Owner-facing row for one worker (see {@link VibeSessionRegistry.describe}). */
-export interface WorkerSummary {
-	id: string;
-	title: string;
-	state: VibeSessionState | "closed";
-	turns: number;
-	queued: number;
-	createdAt: number;
-	lastActivityAt: number;
-	/** Agent-written gist of the latest activity: intent, tool, or result preview. */
-	lastActivity?: string;
-	/** First line of the owner's latest message to the worker (spawn or send), when this process saw one. */
-	ownerLine?: string;
-	/** Absolute path of the worker's own conversation file, when persisted. */
-	sessionFile?: string;
-	/** When the turn in flight started; absent while no turn runs. */
-	turnStartedAt?: number;
-}
-
 interface ResolvedVibeWorker {
 	agent: AgentDefinition;
 	modelOverride?: string | string[];
@@ -176,7 +136,7 @@ interface ResolvedVibeWorker {
 	modelRole?: string;
 }
 
-interface VibeTurn {
+interface VibeTurn extends WorkerTurnOrigin {
 	jobId: string;
 	message: string;
 	startedAt: number;
@@ -184,21 +144,6 @@ interface VibeTurn {
 	trace: VibeTraceEntry[];
 	/** Total completed tool calls (trace may be narrower than this). */
 	toolCount: number;
-	/** Agents whose messages started this turn; empty when the owner did. Such a turn cannot ask other topics. */
-	startedBy: string[];
-	/** Asks this turn answers when it settles: who asked, and the IRC id of the ask. */
-	askers: { from: string; messageId: string }[];
-}
-
-/** A message held for a worker's next turn. */
-interface QueuedMessage {
-	text: string;
-	/** The agent that sent it; absent for the owner's own sends. */
-	from?: string;
-	/** IRC id of an ask, whose sender gets the turn's answer when it settles. */
-	askId?: string;
-	/** A progress note: rides along with the next turn, never starts one or counts as who started it. */
-	note?: boolean;
 }
 
 interface VibeRecord {
@@ -336,15 +281,10 @@ export class VibeSessionRegistry {
 		return VibeSessionRegistry.#global;
 	}
 
-	/** Process-global registry of owner-facing topic workers (see {@link WorkerScopePolicy}). */
+	/** Process-global registry of owner-facing topic workers (see {@link TOPICS_POLICY}). */
 	static topics(): VibeSessionRegistry {
 		if (!VibeSessionRegistry.#topics) {
-			VibeSessionRegistry.#topics = new VibeSessionRegistry({
-				scope: "topics",
-				deliverResults: false,
-				ownerSpawnDepth: true,
-				siblingBoard: true,
-			});
+			VibeSessionRegistry.#topics = new VibeSessionRegistry(TOPICS_POLICY);
 		}
 		return VibeSessionRegistry.#topics;
 	}
@@ -358,7 +298,7 @@ export class VibeSessionRegistry {
 	readonly policy: WorkerScopePolicy;
 	readonly #listeners = new Set<(change: WorkerChange) => void>();
 
-	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false, siblingBoard: false }) {
+	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false }) {
 		this.policy = policy;
 	}
 
@@ -1082,119 +1022,46 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 			return { id: record.id, mode: "queued" };
 		}
-		const manager = this.#manager(session);
-		const entry: QueuedMessage = { text: message };
+		return { id: record.id, mode: "turn", jobId: this.enqueue(session, record.id, { text: message })! };
+	}
+
+	/** The live worker `id` of `session`'s scope (agents' asks to topics; see `topics/workers`). */
+	worker(session: ToolSession, id: string): WorkerView | undefined {
+		const record = this.#records.get(scopeKey(this.ownerScope(session), id));
+		return record && record.state !== "dead" ? this.#view(record) : undefined;
+	}
+
+	#view(record: VibeRecord): WorkerView {
+		const turn = record.turn;
+		const streaming = turn !== undefined && this.#registeredAgent(record)?.session?.isStreaming === true;
+		return {
+			id: record.id,
+			ownerId: record.ownerId,
+			closed: record.closed === true,
+			turn: turn && { startedBy: turn.startedBy, askers: turn.askers, streaming },
+		};
+	}
+
+	/**
+	 * Hold `entry` for worker `id`'s next turn, and start that turn now when the
+	 * worker is idle and `entry` is not a note. Returns the started turn's job id.
+	 */
+	enqueue(session: ToolSession, id: string, entry: QueuedMessage): string | undefined {
+		const record = this.#record(this.ownerScope(session), id);
+		if (!record.turn && !entry.note) {
+			const registered = this.#registeredAgent(record);
+			if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
+				throw new ToolError(`Topic "${record.id}" no longer resolves to this session.`);
+			}
+		}
 		record.queue.push(entry);
+		if (record.turn || entry.note) return undefined;
 		try {
-			return { id: record.id, mode: "turn", jobId: this.#startQueued(session, manager, record)! };
+			return this.#startQueued(session, this.#manager(session), record);
 		} catch (error) {
 			record.queue.splice(record.queue.indexOf(entry), 1);
 			throw error;
 		}
-	}
-
-	/**
-	 * Take an agent's IRC message to one of `session`'s workers (a topic; see
-	 * `IrcBus.addRoute`) into this registry, so the turn it starts gets the
-	 * sibling board and counts like any other, labelled with the sender. Kinds:
-	 *
-	 * - ask: runs in a turn of its own (queued behind a busy topic), whose
-	 *   outcome goes back to the asker when it settles ({@link #answerAskers});
-	 * - reply (that settled outcome, or a non-topic agent answering what the
-	 *   topic asked it): starts a turn when idle, but no answer goes back;
-	 * - a topic writing to a topic whose ask started its turn (a question back,
-	 *   an early answer), or progress: rides along with the next turn, never starts one.
-	 *
-	 * Enforced here, not by prompt: a closed topic refuses all of it, and a
-	 * topic (or a helper it runs) asks another topic only in a turn its owner
-	 * started (no chains), so topics never drive each other in a loop. In a
-	 * turn another agent's message started, a progress note never starts a turn
-	 * anywhere: to a non-topic recipient it goes with `noWake`. A reply or
-	 * progress to a streaming turn, and anything from the topic's own helpers,
-	 * is left to ordinary IRC delivery, which hands it into that turn. Returns
-	 * `undefined` for anything else: no topic of `session` sent or receives it.
-	 */
-	receive(session: ToolSession, message: IrcMessage, bus: Pick<IrcBusApi, "unansweredSends">): IrcRouteDecision {
-		if (!session.getSessionId?.()) return undefined;
-		const scope = this.ownerScope(session);
-		// The sender's topic: the sender itself, or the topic it works for.
-		const asking = this.#workerOf(scope, message.from);
-		const startedBy = asking?.turn?.startedBy ?? [];
-		const record = this.#records.get(scopeKey(scope, message.to));
-		if (!record || record.state === "dead") {
-			return message.progress === true && startedBy.length > 0
-				? { message: { ...message, noWake: true } }
-				: undefined;
-		}
-		if (asking === record) return undefined;
-		const failed = (error: string) => ({ receipt: { to: record.id, outcome: "failed" as const, error } });
-		if (record.closed) return failed(`Topic "${record.id}" is closed; its owner has to reopen it first.`);
-		const rideAlong =
-			message.progress === true || asking?.turn?.askers.some(asker => asker.from === record.id) === true;
-		const reply =
-			message.wakeRelay === true ||
-			(!asking && bus.unansweredSends(record.id, 0).some(row => row.to === message.from));
-		if ((rideAlong || reply) && record.turn && this.#registeredAgent(record)?.session?.isStreaming) return undefined;
-		if (!rideAlong && !reply && asking && (!asking.turn || startedBy.length > 0)) {
-			const who =
-				asking.id === message.from
-					? `Topic "${asking.id}"`
-					: `"${message.from}", working for topic "${asking.id}",`;
-			return failed(
-				startedBy.length > 0
-					? `${who} cannot ask topic "${record.id}": the current turn was started by a message from ${startedBy.join(", ")}, and a turn another agent started cannot ask other topics (no chains). Its answer goes back to ${startedBy.join(", ")} when the turn ends.`
-					: `${who} cannot ask topic "${record.id}" outside a turn its owner started (no chains).`,
-			);
-		}
-		const sender = message.from === record.ownerId ? `Inbox (\`${message.from}\`)` : `\`${message.from}\``;
-		const ask = !rideAlong && !reply && message.broadcast !== true;
-		const label =
-			message.progress === true
-				? `Progress from ${sender}`
-				: rideAlong || reply
-					? `Reply from ${sender}`
-					: message.broadcast
-						? `Broadcast by ${sender}`
-						: `Asked by ${sender}`;
-		const entry: QueuedMessage = {
-			text: prompt
-				.render(topicAskTemplate, {
-					label,
-					message: escapeHarnessTags(message.body),
-					from: message.from,
-					relay: ask,
-					note: rideAlong,
-				})
-				.trim(),
-			from: message.from,
-			...(ask ? { askId: message.id } : {}),
-			...(rideAlong ? { note: true } : {}),
-		};
-		record.queue.push(entry);
-		if (record.turn || rideAlong) return { receipt: { to: record.id, outcome: "queued" } };
-		const registered = this.#registeredAgent(record);
-		try {
-			if (!registered || (registered.status !== "idle" && registered.status !== "parked")) {
-				throw new ToolError(`Topic "${record.id}" no longer resolves to this session.`);
-			}
-			this.#startQueued(session, this.#manager(session), record);
-			return { receipt: { to: record.id, outcome: "woken" } };
-		} catch (error) {
-			record.queue.splice(record.queue.indexOf(entry), 1);
-			return failed(error instanceof Error ? error.message : String(error));
-		}
-	}
-
-	/** The worker `agentId` is in `scope`, or the nearest one it works for (its spawn ancestry). */
-	#workerOf(scope: VibeOwnerScope, agentId: string): VibeRecord | undefined {
-		const registry = AgentRegistry.global();
-		const seen = new Set<string>();
-		for (let id: string | undefined = agentId; id !== undefined && !seen.has(id); id = registry.get(id)?.parentId) {
-			const record = this.#records.get(scopeKey(scope, id));
-			if (record && record.state !== "dead") return record;
-			seen.add(id);
-		}
-		return undefined;
 	}
 
 	/**
@@ -1777,12 +1644,9 @@ export class VibeSessionRegistry {
 					if (record.childSessionFile && !turnStartedPersisted) {
 						throw new ToolError(`Vibe session "${record.id}" changed parent scope before its turn started.`);
 					}
-					const topicBoard = this.policy.siblingBoard
-						? formatTopicBoard(
-								this.describe(session).filter(topic => topic.id !== record.id),
-								"topic",
-							)
-						: undefined;
+					const topicBoard = this.policy.boardFor?.(
+						this.describe(session).filter(topic => topic.id !== record.id),
+					);
 					const result = options.first
 						? await runSubprocess({
 								...(await this.#buildSpawnOptions(session, record, message, signal, onProgress)),
@@ -1806,7 +1670,7 @@ export class VibeSessionRegistry {
 					const reason = error instanceof Error ? error.message : String(error);
 					record.lastActivity = firstLine(`turn failed: ${reason}`);
 					await this.#finishTurn(session, manager, record, ownJobId);
-					await this.#answerAskers(record, turn, undefined, reason);
+					await this.policy.onTurnSettled?.({ id: record.id, askers: turn.askers, error: reason });
 					throw new VibeTurnError(
 						`[vibe:${record.id} cli=${record.cli} turn=${turnIndex}] turn failed: ${reason}`,
 					);
@@ -1868,54 +1732,6 @@ export class VibeSessionRegistry {
 		}
 	}
 
-	/**
-	 * Send a settled turn's outcome to the agents whose asks started it, as the
-	 * IRC wake-turn relay words it ({@link buildWakeRelayBody}). Always sent,
-	 * even after the topic messaged the asker mid-turn (that may have been a
-	 * question back): the topic is told its answer goes back when the turn
-	 * ends. Relays are answers, so they never draw another relay.
-	 */
-	async #answerAskers(
-		record: VibeRecord,
-		turn: VibeTurn,
-		result: SingleResult | undefined,
-		error?: string,
-	): Promise<void> {
-		if (turn.askers.length === 0) return;
-		const bus = IrcBus.global();
-		const aborted = result?.aborted === true;
-		const failure =
-			error ?? (result && result.exitCode !== 0 && !aborted ? (result.error ?? "turn failed") : undefined);
-		const body = buildWakeRelayBody({
-			id: record.id,
-			yielded: false,
-			result,
-			turnText: result?.output ?? "",
-			error: failure,
-			aborted,
-			abortReason: result?.abortReason,
-			finalizeError: undefined,
-			alreadyMessaged: false,
-		});
-		for (const asker of turn.askers) {
-			// The turn already settled: a failed hand-off is logged, never turned into a turn failure.
-			const receipt = await bus
-				.send({ from: record.id, to: asker.from, body, replyTo: asker.messageId, wakeRelay: true })
-				.catch((error: unknown): IrcDeliveryReceipt => ({
-					to: asker.from,
-					outcome: "failed",
-					error: error instanceof Error ? error.message : String(error),
-				}));
-			if (receipt.outcome === "failed") {
-				logger.warn("topics: answer to an ask was not delivered", {
-					from: record.id,
-					to: asker.from,
-					error: receipt.error,
-				});
-			}
-		}
-	}
-
 	/** Format a settled turn into the self-delivering result text (activity trace + response). */
 	async #settleTurn(
 		session: ToolSession,
@@ -1935,7 +1751,7 @@ export class VibeSessionRegistry {
 				: (result.lastIntent ?? result.output),
 		);
 		await this.#finishTurn(session, manager, record, settledJobId);
-		await this.#answerAskers(record, turn, result);
+		await this.policy.onTurnSettled?.({ id: record.id, askers: turn.askers, result });
 
 		const traceLines = turn.trace.map(entry =>
 			firstLine(`${entry.tool}${entry.args ? `(${entry.args})` : ""}`, TRACE_LINE_MAX),

@@ -31,9 +31,11 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
 import { logger } from "@oh-my-pi/pi-utils";
+import type { Settings } from "../config/settings";
 import { isRpcTopicsCommand, runRpcTopicsCommand } from "../modes/rpc/rpc-topics";
 import type { RpcCommand } from "../modes/rpc/rpc-types";
 import type { TopicsHost } from "./host";
+import { cfgTopicsEnabled } from "./settings";
 
 /** Wire version announced in the hello reply; a host refuses majors it does not know. */
 export const TOPICS_CONTROL_PROTOCOL = 1;
@@ -397,4 +399,15 @@ export async function offerTopicsControl(
 		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 		return undefined;
 	}
+}
+
+/** With `topics.enabled`, offer the control endpoint for `session`'s lifetime (interactive sessions). */
+export async function offerSessionTopicsControl(
+	session: { getTopicsHost(): Promise<TopicsHost | undefined>; addDisposer(dispose: () => void): void },
+	bus: TopicsControlBus,
+	settings: Settings,
+): Promise<void> {
+	if (!cfgTopicsEnabled.get(settings)) return;
+	const stop = await offerTopicsControl(bus, () => session.getTopicsHost());
+	if (stop) session.addDisposer(stop);
 }

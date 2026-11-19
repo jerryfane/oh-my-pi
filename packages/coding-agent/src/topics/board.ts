@@ -10,7 +10,8 @@ import { escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import topicBoardPrompt from "../prompts/system/topic-board.md" with { type: "text" };
 import type { CustomMessage } from "../session/messages";
-import type { WorkerSummary } from "../vibe/runtime";
+import type { WorkerSummary } from "../vibe/worker-scope";
+import type { TopicsHost } from "./host";
 
 /** `customType` of the topic board message. */
 export const TOPIC_BOARD_CONTEXT_TYPE = "topic-board";
@@ -109,4 +110,17 @@ export function topicBoardMessage(
 		attribution: "agent",
 		timestamp: Date.now(),
 	};
+}
+
+/**
+ * The board message for a session's next turn ({@link topicBoardMessage}): a
+ * topic worker's comes with its prompt (`supplied`, its siblings); the Inbox
+ * builds its own from its topics.
+ */
+export async function topicBoardForTurn(
+	supplied: string | undefined,
+	topics: () => Promise<TopicsHost | undefined>,
+	history: readonly AgentMessage[],
+): Promise<CustomMessage | undefined> {
+	return topicBoardMessage(supplied ?? formatTopicBoard((await topics())?.list() ?? [], "inbox"), history);
 }

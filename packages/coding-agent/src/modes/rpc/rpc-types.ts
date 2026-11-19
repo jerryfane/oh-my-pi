@@ -18,6 +18,7 @@ import type {
 } from "@oh-my-pi/pi-ai";
 import type { BashResult } from "../../exec/bash-executor";
 import type { ContextUsage } from "../../extensibility/extensions/types";
+import type { RpcTopicsCommand, RpcTopicsResponse } from "./rpc-topics";
 import type { AgentSessionEvent, SessionStats } from "../../session/agent-session";
 import type { WireSessionEvent } from "../../session/loop-end-wire";
 import type { SessionLeaseReport } from "../../session/session-storage";
@@ -86,14 +87,7 @@ export type RpcCommand =
 	| { id?: string; type: "get_subagent_messages"; subagentId?: string; sessionFile?: string; fromByte?: number }
 	| { id?: string; type: "cancel_subagent"; subagentId: string }
 	| { id?: string; type: "steer_subagent"; subagentId: string; message: string }
-	// Owner-facing topics (persistent workers the host talks to directly)
-	| { id?: string; type: "topics_list" }
-	| { id?: string; type: "topics_new"; title: string; message: string }
-	| { id?: string; type: "topics_send"; topicId: string; message: string }
-	| { id?: string; type: "topics_read"; topicId: string; fromByte?: number }
-	| { id?: string; type: "topics_close"; topicId: string }
-	| { id?: string; type: "topics_reopen"; topicId: string }
-	| { id?: string; type: "topics_rename"; topicId: string; title: string }
+	| RpcTopicsCommand
 	// Live voice (GPT live bound to this session)
 	| { id?: string; type: "live_start"; voice?: string; instructions?: string }
 	| { id?: string; type: "live_connect"; sdpOffer: string; voice?: string; instructions?: string }
@@ -431,23 +425,6 @@ export interface RpcSubagentMessagesResult {
 	messages: AgentMessage[];
 }
 
-/** One owner-facing topic (persistent worker). */
-export interface RpcTopicSummary {
-	id: string;
-	title: string;
-	state: "starting" | "running" | "idle" | "dead" | "closed";
-	turns: number;
-	queued: number;
-	createdAt: number;
-	lastActivityAt: number;
-	lastActivity?: string;
-	/** First line of the owner's latest message to the topic, when this process saw one. */
-	ownerLine?: string;
-	sessionFile?: string;
-	/** When the turn in flight started; absent while no turn runs. */
-	turnStartedAt?: number;
-}
-
 // ============================================================================
 // RPC Responses (stdout)
 // ============================================================================
@@ -559,19 +536,7 @@ export type RpcResponse =
 			data: { cancelled: boolean };
 	  }
 	| { id?: string; type: "response"; command: "steer_subagent"; success: true }
-	| { id?: string; type: "response"; command: "topics_list"; success: true; data: { topics: RpcTopicSummary[] } }
-	| { id?: string; type: "response"; command: "topics_new"; success: true; data: { topicId: string } }
-	| {
-			id?: string;
-			type: "response";
-			command: "topics_send";
-			success: true;
-			data: { topicId: string; mode: "steered" | "queued" | "turn" };
-	  }
-	| { id?: string; type: "response"; command: "topics_read"; success: true; data: RpcSubagentMessagesResult }
-	| { id?: string; type: "response"; command: "topics_close"; success: true }
-	| { id?: string; type: "response"; command: "topics_reopen"; success: true }
-	| { id?: string; type: "response"; command: "topics_rename"; success: true }
+	| RpcTopicsResponse
 
 	// Model
 	| {

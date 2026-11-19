@@ -16,6 +16,7 @@ import { AgentRegistry, type AgentRegistryApi, MAIN_AGENT_ID } from "../registry
 import type { CustomMessage } from "../session/messages";
 import { agentMesh } from "./mesh";
 import { parsePeerAddress } from "./mesh-protocol";
+import { routeIrcMessage } from "./routes";
 
 interface IrcWaiter {
 	filter: IrcWaitFilter;
@@ -83,19 +84,6 @@ export interface UnansweredSend {
 /** A message awaiting delivery; local-only sends never fall through to a peer tunnel. */
 export type IrcSend = Omit<IrcMessage, "id" | "ts"> & { localOnly?: boolean };
 
-/**
- * What a {@link IrcRecipientRoute} decides: take delivery (`{ receipt }`), have
- * ordinary delivery carry a rewritten `{ message }` instead, or leave the
- * message as it is (`undefined`).
- */
-export type IrcRouteDecision = { receipt: IrcDeliveryReceipt } | { message: IrcMessage } | undefined;
-
-/**
- * Routing for recipients whose turns another registry runs (topics). `bus` is
- * the delivering bus, for its send bookkeeping.
- */
-export type IrcRecipientRoute = (message: IrcMessage, bus: IrcBusApi) => IrcRouteDecision;
-
 /** Public surface of the process-global IRC bus, implemented locally on main and by a proxy in workers. */
 export interface IrcBusApi {
 	/** Fire-and-forget delivery; the receipt reports how the message reached the recipient. */
@@ -158,18 +146,6 @@ export class IrcBus implements IrcBusApi {
 	 */
 	static recordReply(from: string, to: string): void {
 		IrcBus.#global?.recordReply(from, to);
-	}
-
-	static readonly #routes = new Set<IrcRecipientRoute>();
-
-	/**
-	 * Route local deliveries through `route` first (see {@link IrcRecipientRoute});
-	 * returns the unregister function. Routes are consulted by the bus that
-	 * delivers locally (main's), whichever thread the sender runs on.
-	 */
-	static addRoute(route: IrcRecipientRoute): () => void {
-		IrcBus.#routes.add(route);
-		return () => IrcBus.#routes.delete(route);
 	}
 
 	readonly #registry: AgentRegistryApi;
@@ -305,8 +281,7 @@ export class IrcBus implements IrcBusApi {
 		return this.#lastReply.get(from)?.get(to)?.ts;
 	}
 
-	async #deliver(sent: IrcMessage, options: { localOnly?: boolean }): Promise<IrcDeliveryReceipt> {
-		let message = sent;
+	async #deliver(message: IrcMessage, options: { localOnly?: boolean }): Promise<IrcDeliveryReceipt> {
 		const ref = this.#registry.get(message.to);
 		const mesh = ref || options.localOnly ? undefined : agentMesh();
 		const peer = mesh && parsePeerAddress(message.to);
@@ -322,16 +297,12 @@ export class IrcBus implements IrcBusApi {
 				error: `Unknown agent "${message.to}" — check the subagent roster or read history:// for known peers.`,
 			};
 		}
-		for (const route of IrcBus.#routes) {
-			const decision = route(message, this);
-			if (!decision) continue;
-			if ("message" in decision) {
-				message = decision.message;
-				continue;
-			}
-			if (decision.receipt.outcome !== "failed") this.#relayToMainUi(message);
-			return decision.receipt;
+		const routed = routeIrcMessage(message, this);
+		if (routed.receipt) {
+			if (routed.receipt.outcome !== "failed") this.#relayToMainUi(message);
+			return routed.receipt;
 		}
+		message = routed.message;
 		// Advisor refs are observability-only transcripts, never messageable peers.
 		if (ref.kind === "advisor") {
 			return {

@@ -4,13 +4,16 @@
  * {@link VibeSessionRegistry.topics} scope of the top-level session; the host
  * talks to it directly, without a turn of the main conversation. While a host
  * lives, agents' `agent://<id>` messages to its topics run as topic turns
- * ({@link VibeSessionRegistry.receive}).
+ * ({@link routeTopicMessage}).
  */
-import { IrcBus } from "../irc/bus";
+import { addIrcRoute } from "../irc/routes";
 import { readRpcSubagentTranscript } from "../modes/rpc/rpc-subagents";
 import type { RpcSubagentMessagesResult } from "../modes/rpc/rpc-types";
 import type { ToolSession } from "../tools";
-import { VibeSessionRegistry, type WorkerChange, type WorkerSummary } from "../vibe/runtime";
+import { VibeSessionRegistry } from "../vibe/runtime";
+import type { WorkerChange, WorkerSummary } from "../vibe/worker-scope";
+import { cfgTopicsEnabled } from "./settings";
+import { routeTopicMessage } from "./workers";
 
 /** One topic as a host sees it. */
 export type TopicSummary = WorkerSummary;
@@ -45,7 +48,7 @@ export function createTopicsHost(session: ToolSession): TopicsHost {
 		const scope = registry.ownerScope(session);
 		return change.ownerId === scope.ownerId && change.parentSessionId === scope.parentSessionId;
 	};
-	const unroute = IrcBus.addRoute((message, bus) => registry.receive(session, message, bus));
+	const unroute = addIrcRoute((message, bus) => routeTopicMessage(registry, session, message, bus));
 	return {
 		list: () => registry.describe(session),
 		async create({ title, message, name }) {
@@ -79,4 +82,41 @@ export function createTopicsHost(session: ToolSession): TopicsHost {
 		},
 		dispose: unroute,
 	};
+}
+
+/** The session's topics host factory: only for a top-level session with `topics.enabled`. */
+export function topicsHostFactory(session: ToolSession, topLevel: boolean): (() => TopicsHost) | undefined {
+	return topLevel && cfgTopicsEnabled.get(session.settings) ? () => createTopicsHost(session) : undefined;
+}
+
+/**
+ * A top-level session's topics host: created on first use and disposed with
+ * the session, its persisted topics restored once per parent session file,
+ * so a session switch restores the new session's topics.
+ */
+export class SessionTopics {
+	readonly #create: () => TopicsHost;
+	readonly #addDisposer: (dispose: () => void) => void;
+	#host: TopicsHost | undefined;
+	/** Parent session file whose persisted topics were last restored (`undefined` = never). */
+	#restoredFor: string | null | undefined;
+
+	constructor(create: () => TopicsHost, addDisposer: (dispose: () => void) => void) {
+		this.#create = create;
+		this.#addDisposer = addDisposer;
+	}
+
+	/** The host, with the topics of `sessionFile` restored. */
+	async host(sessionFile: string | null): Promise<TopicsHost> {
+		if (!this.#host) {
+			const host = this.#create();
+			this.#host = host;
+			this.#addDisposer(() => host.dispose());
+		}
+		if (this.#restoredFor !== sessionFile) {
+			await this.#host.restore();
+			this.#restoredFor = sessionFile;
+		}
+		return this.#host;
+	}
 }
