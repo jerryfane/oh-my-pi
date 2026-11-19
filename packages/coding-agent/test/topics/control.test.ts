@@ -8,10 +8,14 @@ import * as path from "node:path";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
 	MIN_TOKEN_LENGTH,
+	offerTopicsControl,
 	startTopicsControl,
+	TOPICS_CONTROL_CHANNEL,
 	TOPICS_CONTROL_PROTOCOL,
-	takeTopicsControlRequest,
+	TOPICS_CONTROL_REQUEST_CHANNEL,
+	type TopicsControlEndpoint,
 } from "@oh-my-pi/pi-coding-agent/topics/control";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import type { TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { WorkerChange } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -204,29 +208,65 @@ describe("topics control socket", () => {
 	});
 });
 
-describe("topics control request from the environment", () => {
-	it("reads the secret once and leaves nothing a child process could read it from", async () => {
-		const tempDir = TempDir.createSync("@omp-topics-env-");
+describe("topics control endpoint offered to extensions", () => {
+	it("opens a fresh private endpoint per launch, re-offers it on request, and withdraws it on stop", async () => {
+		const tempDir = TempDir.createSync("@omp-topics-offer-");
+		const bus = new EventBus();
+		const offers: Array<TopicsControlEndpoint | null> = [];
+		bus.on(TOPICS_CONTROL_CHANNEL, data => offers.push(data as TopicsControlEndpoint | null));
+		const stops: Array<() => void> = [];
 		try {
-			const tokenFile = path.join(tempDir.path(), "token");
-			fs.writeFileSync(tokenFile, `${TOKEN}\n`, { mode: 0o600 });
-			const env: NodeJS.ProcessEnv = {
-				HERDR_OMP_CONTROL: path.join(tempDir.path(), "c.sock"),
-				HERDR_OMP_CONTROL_TOKEN_FILE: tokenFile,
-			};
+			const host = fakeHost([]);
+			const stop1 = await offerTopicsControl(bus, async () => host, tempDir.path());
+			const stop2 = await offerTopicsControl(new EventBus(), async () => host, tempDir.path());
+			if (!stop1 || !stop2) throw new Error("control socket did not start");
+			stops.push(stop1, stop2);
+			const first = offers[0];
+			if (!first) throw new Error("no endpoint offered");
 
-			const request = takeTopicsControlRequest(env);
+			expect(first.protocol).toBe(TOPICS_CONTROL_PROTOCOL);
+			expect(first.token.length).toBeGreaterThanOrEqual(MIN_TOKEN_LENGTH);
+			expect(fs.statSync(path.dirname(first.socketPath)).mode & 0o777).toBe(0o700);
+			// The secret lives only in memory: nothing under the runtime dir contains it.
+			for (const entry of fs.readdirSync(tempDir.path(), { recursive: true })) {
+				const file = path.join(tempDir.path(), String(entry));
+				if (fs.statSync(file).isFile()) expect(fs.readFileSync(file, "utf8")).not.toContain(first.token);
+			}
+			// A late extension asks again and gets the same endpoint; it works with the secret.
+			bus.emit(TOPICS_CONTROL_REQUEST_CHANNEL, undefined);
+			expect(offers[1]).toEqual(first);
+			const client = await connect(first.socketPath);
+			client.send({ type: "hello", token: first.token });
+			expect(await client.next()).toMatchObject({ type: "hello" });
+			client.end();
 
-			expect(request).toEqual({ path: path.join(tempDir.path(), "c.sock"), token: TOKEN });
-			// A child running as the same user would read the file next; it must be gone.
-			const child = Bun.spawnSync(["sh", "-c", `cat ${tokenFile} 2>/dev/null; echo end`]);
-			expect(child.stdout.toString()).toBe("end\n");
-			expect(env).toEqual({});
-			// A second read (a restarted omp reusing the variables) finds nothing.
-			expect(
-				takeTopicsControlRequest({ ...env, HERDR_OMP_CONTROL_TOKEN_FILE: tokenFile, HERDR_OMP_CONTROL: "x" }),
-			).toBe(undefined);
+			stops.shift()?.();
+			expect(offers.at(-1)).toBe(null);
+			expect(fs.existsSync(path.dirname(first.socketPath))).toBe(false);
 		} finally {
+			for (const stop of stops) stop();
+			tempDir.removeSync();
+		}
+	});
+
+	it("gives every launch its own path and secret", async () => {
+		const tempDir = TempDir.createSync("@omp-topics-offer-");
+		const seen: TopicsControlEndpoint[] = [];
+		const stops: Array<() => void> = [];
+		try {
+			for (let launch = 0; launch < 2; launch++) {
+				const bus = new EventBus();
+				bus.on(TOPICS_CONTROL_CHANNEL, data => {
+					if (data) seen.push(data as TopicsControlEndpoint);
+				});
+				const stop = await offerTopicsControl(bus, async () => undefined, tempDir.path());
+				if (stop) stops.push(stop);
+			}
+			expect(seen).toHaveLength(2);
+			expect(seen[0]?.socketPath).not.toBe(seen[1]?.socketPath);
+			expect(seen[0]?.token).not.toBe(seen[1]?.token);
+		} finally {
+			for (const stop of stops) stop();
 			tempDir.removeSync();
 		}
 	});

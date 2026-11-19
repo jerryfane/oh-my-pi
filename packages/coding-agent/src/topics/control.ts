@@ -1,16 +1,15 @@
 /**
  * Local control socket for the owner's topics of an interactive session.
  *
- * A host that launched omp in a terminal pane (Herdr) cannot use stdio RPC, so
- * it passes `HERDR_OMP_CONTROL` (a fresh socket path inside a directory only
- * the host can enter) and `HERDR_OMP_CONTROL_TOKEN_FILE` (an owner-only file
- * holding a per-launch secret). omp reads the secret once at startup and
- * deletes the file; the secret is never in any environment or command line.
- * The two variables are removed from `process.env`, but Bun's default spawn
- * environment still carries them, so children may see the variable names and
- * paths: a deleted file and a socket that needs the secret, neither of which
- * grants access. A client must present the secret in its first frame. Frames
- * are newline-delimited JSON, one per line:
+ * A host that runs omp in a terminal pane (Herdr) cannot use stdio RPC. When
+ * topics are enabled, omp opens its own socket at a fresh random path inside
+ * an owner-only (0700) directory, with a random per-launch secret held only in
+ * memory: never in a file, an environment variable or a command line. It
+ * offers the endpoint to in-process extensions on the session event bus
+ * ({@link TOPICS_CONTROL_CHANNEL}); a host's extension reports it to its host
+ * over the host's own API. Every launch, restart and session switch gets a
+ * working endpoint. A client must present the secret in its first frame.
+ * Frames are newline-delimited JSON, one per line:
  *
  * - client `{"type":"hello","token":"…"}` → `{"type":"hello","protocol":1,"pid":…}`
  * - client `{"id":"1","type":"topics_list"}` (any `topics_*` RPC command) →
@@ -19,10 +18,14 @@
  *
  * Privilege: the socket cannot prompt the main session, but `topics_send`
  * runs a topic worker with the agent's full tools, so holding the secret is
- * equivalent to controlling the agent. Treat the token like the agent itself.
+ * equivalent to controlling the agent. Every loaded extension can read the
+ * endpoint from the event bus (extensions already run in-process with the
+ * agent's full rights), so loading an extension grants this control too.
  */
 import * as crypto from "node:crypto";
 import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
 import { logger } from "@oh-my-pi/pi-utils";
 import { isRpcTopicsCommand, runRpcTopicsCommand } from "../modes/rpc/rpc-topics";
@@ -271,50 +274,61 @@ async function handleLine(
 	}
 }
 
-/** Environment variables a host uses to request the control socket; removed from omp's own environment once read. */
-export const TOPICS_CONTROL_ENV = ["HERDR_OMP_CONTROL", "HERDR_OMP_CONTROL_TOKEN_FILE"] as const;
+/** Event-bus channel carrying the endpoint to extensions; see {@link offerTopicsControl}. */
+export const TOPICS_CONTROL_CHANNEL = "topics:control";
+/** Extensions emit this to ask for the current endpoint (e.g. after they loaded late). */
+export const TOPICS_CONTROL_REQUEST_CHANNEL = "topics:control:request";
 
-/** A host's request for the control socket, taken out of the environment by {@link takeTopicsControlRequest}. */
-export interface TopicsControlRequest {
-	path: string;
+/** What an extension receives on {@link TOPICS_CONTROL_CHANNEL}: `null` once the socket closed. */
+export interface TopicsControlEndpoint {
+	socketPath: string;
 	token: string;
+	protocol: number;
+	pid: number;
+}
+
+/** The event bus surface the endpoint is offered on (the session's extension bus). */
+export interface TopicsControlBus {
+	emit(channel: string, data: unknown): void;
+	on(channel: string, handler: (data: unknown) => void): () => void;
 }
 
 /**
- * Take the control request out of the environment: read the token file once,
- * delete it, and remove the variables from `process.env`. Call before anything
- * spawns (MCP servers, LSP, tools) so no child can read the file first.
- * Returns undefined when no host asked for a socket or the file is unreadable.
+ * Open the control socket at a fresh random path with a random secret and
+ * offer it on `bus`: once now, again on every {@link TOPICS_CONTROL_REQUEST_CHANNEL},
+ * and `null` when stopped. Returns a stop function, or undefined when it could
+ * not start.
  */
-export function takeTopicsControlRequest(env: NodeJS.ProcessEnv = process.env): TopicsControlRequest | undefined {
-	const socketPath = env.HERDR_OMP_CONTROL?.trim();
-	const tokenFile = env.HERDR_OMP_CONTROL_TOKEN_FILE?.trim();
-	for (const name of TOPICS_CONTROL_ENV) delete env[name];
-	if (!socketPath || !tokenFile) return undefined;
-	try {
-		return { path: socketPath, token: fs.readFileSync(tokenFile, "utf8").trim() };
-	} catch (error) {
-		logger.warn("topics control token file unreadable", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		return undefined;
-	} finally {
-		fs.rmSync(tokenFile, { force: true });
-	}
-}
-
-/** Start the control socket a host requested; returns a stop function, or undefined when it could not start. */
-export async function startRequestedTopicsControl(
-	request: TopicsControlRequest,
+export async function offerTopicsControl(
+	bus: TopicsControlBus,
 	topics: () => Promise<TopicsHost | undefined>,
+	runtimeDir: string = os.tmpdir(),
 ): Promise<(() => void) | undefined> {
+	let dir: string | undefined;
 	try {
-		return await startTopicsControl({ ...request, topics });
+		dir = fs.mkdtempSync(path.join(runtimeDir, "omp-topics-"));
+		fs.chmodSync(dir, 0o700);
+		const endpoint: TopicsControlEndpoint = {
+			socketPath: path.join(dir, "control.sock"),
+			token: crypto.randomBytes(32).toString("base64url"),
+			protocol: TOPICS_CONTROL_PROTOCOL,
+			pid: process.pid,
+		};
+		const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
+		const unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, endpoint));
+		bus.emit(TOPICS_CONTROL_CHANNEL, endpoint);
+		const ownedDir = dir;
+		return () => {
+			unsubscribe();
+			stopSocket();
+			bus.emit(TOPICS_CONTROL_CHANNEL, null);
+			fs.rmSync(ownedDir, { recursive: true, force: true });
+		};
 	} catch (error) {
 		logger.warn("topics control socket not started", {
-			path: request.path,
 			error: error instanceof Error ? error.message : String(error),
 		});
+		if (dir) fs.rmSync(dir, { recursive: true, force: true });
 		return undefined;
 	}
 }

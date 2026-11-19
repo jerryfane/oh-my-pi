@@ -11,7 +11,8 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
 import { ensureSqliteLockShim, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import { bindAgentMesh } from "./irc/mesh";
-import { startRequestedTopicsControl, takeTopicsControlRequest } from "./topics/control";
+import { offerTopicsControl } from "./topics/control";
+import { cfgTopicsEnabled } from "./topics/settings";
 import {
 	APP_NAME,
 	directoryIsMissing,
@@ -1843,8 +1844,6 @@ export async function runRootCommand(
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
 	logger.startTiming();
-	// Before anything spawns (MCP, LSP, tools): read and delete the control secret file first.
-	const topicsControlRequest = takeTopicsControlRequest();
 	startStartupWatchdog();
 	try {
 		// Non-prepaint commands still need a default theme; an existing Composer
@@ -2676,10 +2675,8 @@ export async function runRootCommand(
 				startBackgroundModelDiscovery,
 			} = createdSession;
 			if (isInteractive) session.addDisposer(bindAgentMesh(sessionOptions.cwd ?? getProjectDir(), settingsInstance));
-			if (isInteractive && topicsControlRequest) {
-				const stopTopicsControl = await startRequestedTopicsControl(topicsControlRequest, () =>
-					session.getTopicsHost(),
-				);
+			if (isInteractive && cfgTopicsEnabled.get(settingsInstance)) {
+				const stopTopicsControl = await offerTopicsControl(createdSession.eventBus, () => session.getTopicsHost());
 				if (stopTopicsControl) session.addDisposer(stopTopicsControl);
 			}
 			if (!isInteractive) session.validateRetryFallbackChains();
