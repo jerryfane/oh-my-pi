@@ -11,6 +11,7 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { getModelPricingStatus } from "@oh-my-pi/pi-catalog/models";
 import { ensureSqliteLockShim, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils";
 import { bindAgentMesh } from "./irc/mesh";
+import { startTopicsControlFromEnv } from "./topics/control";
 import {
 	APP_NAME,
 	directoryIsMissing,
@@ -2673,6 +2674,10 @@ export async function runRootCommand(
 				startBackgroundModelDiscovery,
 			} = createdSession;
 			if (isInteractive) session.addDisposer(bindAgentMesh(sessionOptions.cwd ?? getProjectDir(), settingsInstance));
+			if (isInteractive) {
+				const stopTopicsControl = startTopicsControlFromEnv(() => session.getTopicsHost());
+				if (stopTopicsControl) session.addDisposer(stopTopicsControl);
+			}
 			if (!isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();
