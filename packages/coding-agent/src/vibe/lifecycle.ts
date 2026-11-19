@@ -15,13 +15,21 @@ export const VIBE_LIFECYCLE_CUSTOM_TYPE = "vibe-session-lifecycle";
 /** Schema version for persisted Vibe lifecycle events. */
 export const VIBE_LIFECYCLE_VERSION = 1;
 
-export type VibeTombstoneReason = "explicit-kill" | "mode-exit" | "spawn-failed" | "unrecoverable";
+export type VibeTombstoneReason = "explicit-kill" | "mode-exit" | "spawn-failed" | "unrecoverable" | "closed";
+
+/**
+ * Worker scope an event belongs to. Absent = Vibe-mode workers; `"topics"` =
+ * persistent owner-facing topic workers. Each scope's registry reads only its
+ * own events, while id reservation and roster ownership cover both.
+ */
+export type WorkerScopeTag = "topics";
 
 export interface VibeLifecycleBase {
 	version: typeof VIBE_LIFECYCLE_VERSION;
 	id: string;
 	ownerId: string;
 	parentSessionId: string;
+	scope?: WorkerScopeTag;
 }
 
 export interface VibeSpawnLifecycleEvent extends VibeLifecycleBase {
@@ -30,6 +38,8 @@ export interface VibeSpawnLifecycleEvent extends VibeLifecycleBase {
 	agent: string;
 	childSessionFile: string;
 	createdAt: number;
+	/** Owner-facing title (topics only). */
+	title?: string;
 }
 
 export interface VibeTurnLifecycleEvent extends VibeLifecycleBase {
@@ -42,16 +52,24 @@ export interface VibeTombstoneLifecycleEvent extends VibeLifecycleBase {
 	reason: VibeTombstoneReason;
 }
 
+/** Revokes a revocable tombstone: `mode-exit` (Vibe re-entry) or `closed` (topic reopened). */
 export interface VibeTombstoneRevocationEvent extends VibeLifecycleBase {
 	action: "tombstone-revoked";
-	reason: "mode-exit";
+	reason: "mode-exit" | "closed";
+}
+
+/** A topic's owner-facing title changed. */
+export interface VibeRetitleLifecycleEvent extends VibeLifecycleBase {
+	action: "retitled";
+	title: string;
 }
 
 export type VibeLifecycleEvent =
 	| VibeSpawnLifecycleEvent
 	| VibeTurnLifecycleEvent
 	| VibeTombstoneLifecycleEvent
-	| VibeTombstoneRevocationEvent;
+	| VibeTombstoneRevocationEvent
+	| VibeRetitleLifecycleEvent;
 
 function objectRecord(value: unknown): Record<string, unknown> | undefined {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
@@ -64,6 +82,7 @@ const lifecycleBase = {
 	id: "string > 0",
 	ownerId: "string > 0",
 	parentSessionId: "string > 0",
+	"scope?": "'topics'",
 } as const;
 
 const LifecycleEvent = type({
@@ -73,14 +92,16 @@ const LifecycleEvent = type({
 	agent: "string",
 	childSessionFile: "string",
 	createdAt: "number",
+	"title?": "string",
 })
 	.or({ ...lifecycleBase, action: "'turn-started' | 'turn-settled'", turn: "number.integer >= 1" })
 	.or({
 		...lifecycleBase,
 		action: "'tombstone'",
-		reason: "'explicit-kill' | 'mode-exit' | 'spawn-failed' | 'unrecoverable'",
+		reason: "'explicit-kill' | 'mode-exit' | 'spawn-failed' | 'unrecoverable' | 'closed'",
 	})
-	.or({ ...lifecycleBase, action: "'tombstone-revoked'", reason: "'mode-exit'" });
+	.or({ ...lifecycleBase, action: "'tombstone-revoked'", reason: "'mode-exit' | 'closed'" })
+	.or({ ...lifecycleBase, action: "'retitled'", title: "string" });
 
 /** Parse one persisted lifecycle payload; `undefined` for foreign/malformed data. */
 export function parseLifecycleEvent(value: unknown): VibeLifecycleEvent | undefined {
