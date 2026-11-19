@@ -7,18 +7,25 @@
  * - Title, close and reopen persist in the parent session and survive a
  *   restart: a closed topic is restored closed (never terminal) and can be
  *   reopened; Vibe rehydration never adopts topic records.
+ * - Each topic turn carries a board of the owner's other topics (never
+ *   itself); Vibe workers get none. The ids it lists address the topics:
+ *   `history://<id>` reads one, `agent://<id>` messages it.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
+import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -132,6 +139,8 @@ describe("topics registry", () => {
 		await manager.dispose({ timeoutMs: 100 });
 		VibeSessionRegistry.resetGlobalForTests();
 		AgentRegistry.resetGlobalForTests();
+		IrcBus.resetGlobalForTests();
+		InternalUrlRouter.resetForTests();
 		tempDir.removeSync();
 	});
 
@@ -186,5 +195,72 @@ describe("topics registry", () => {
 		await manager.waitForAll();
 		expect(topics2.describe(parent2)[0]).toMatchObject({ state: "idle", turns: 2 });
 		expect(followUp.mock.calls[0]?.[0].message).toBe("status?");
+	});
+
+	it("gives each topic turn a board of the other topics, and vibe workers none", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const first = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		const second = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
+		await spawnSettled(VibeSessionRegistry.global(), parent, { name: "Worker" });
+		const [firstOptions, secondOptions, vibeOptions] = spawnOptions;
+
+		expect(firstOptions?.topicBoard).toBeUndefined();
+		expect(secondOptions?.topicBoard).toContain(`- Diokan term sheet (id: ${first}): idle`);
+		expect(secondOptions?.topicBoard).not.toContain(`(id: ${second})`);
+		expect(secondOptions?.topicBoard).toContain("You are a topic too; you are not listed.");
+		expect(vibeOptions?.topicBoard).toBeUndefined();
+
+		const followUp = vi
+			.spyOn(executorModule, "runSubagentFollowUpTurn")
+			.mockImplementation(async options =>
+				resultFor({ ...options, cwd: tempDir.path(), task: options.message, index: 0 } as ExecutorOptions),
+			);
+		await topics.send(parent, { session: first, message: "status?" });
+		await manager.waitForAll();
+		const board = followUp.mock.calls[0]?.[0].topicBoard;
+		expect(board).toContain(`- Release notes (id: ${second}): idle`);
+		expect(board).not.toContain(`(id: ${first})`);
+	});
+
+	it("lists ids that history:// and agent:// resolve to the topic", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = VibeSessionRegistry.topics();
+		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		expect(formatTopicBoard(topics.describe(parent), "inbox")).toContain(`(id: ${id})`);
+
+		const ref = AgentRegistry.global().get(id)!;
+		const entry = {
+			type: "message",
+			id: "m1",
+			parentId: "init1",
+			timestamp: new Date().toISOString(),
+			message: { role: "user", content: "draft v2 is ready", timestamp: 1 },
+		};
+		fs.appendFileSync(ref.sessionFile!, `${JSON.stringify(entry)}\n`);
+		const history = await InternalUrlRouter.instance().resolve(`history://${id}`);
+		expect(history.content).toContain("draft v2 is ready");
+
+		// Live, the topic's session takes the message the way IRC delivers to any agent.
+		const received: IrcMessage[] = [];
+		AgentRegistry.global().unregister(id, ref);
+		AgentRegistry.global().register({
+			id,
+			displayName: id,
+			kind: "sub",
+			parentId: OWNER,
+			session: {
+				deliverIrcMessage: async (message: IrcMessage) => {
+					received.push(message);
+					return "injected" as const;
+				},
+			} as never,
+			sessionFile: ref.sessionFile,
+			status: "idle",
+		});
+		const owner = { ...parent, agentRegistry: AgentRegistry.global() } as unknown as ToolSession;
+		const sent = await InternalUrlRouter.instance().write(`agent://${id}`, "please add clause 5", { session: owner });
+		expect(sent?.isError).toBeFalsy();
+		expect(received).toMatchObject([{ from: OWNER, to: id, body: "please add clause 5" }]);
 	});
 });

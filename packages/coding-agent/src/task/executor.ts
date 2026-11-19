@@ -467,6 +467,8 @@ export interface ExecutorOptions {
 	 * the previous one was delivered. Absent for a single-prompt assignment.
 	 */
 	steps?: string[];
+	/** Topic board sent ahead of the first prompt (topic workers; see {@link PromptOptions.topicBoard}). */
+	topicBoard?: string;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -2688,9 +2690,11 @@ async function driveSessionToResult(
 		steps?: StepProgress;
 		/** Where what each prompt before the last delivered goes; unset, the reports go nowhere. */
 		stepReports?: StepReportRoute;
+		/** Topic board for the initial prompt; see {@link PromptOptions.topicBoard}. */
+		topicBoard?: string;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore, steps, stepReports } = options;
+	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard } = options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2803,7 +2807,7 @@ async function driveSessionToResult(
 			for (;;) {
 				try {
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
-					else await dispatchPrompt(task, { attribution: "agent", solutionSpace }, "initial prompt");
+					else await dispatchPrompt(task, { attribution: "agent", solutionSpace, topicBoard }, "initial prompt");
 					return;
 				} catch (error) {
 					promptAttempts++;
@@ -3982,6 +3986,8 @@ export interface FollowUpTurnOptions {
 	agent: AgentDefinition;
 	/** The follow-up message; sent as the turn's user prompt (with {@link restore}, only the run's label). */
 	message: string;
+	/** Topic board sent ahead of the follow-up prompt (topic workers; see {@link PromptOptions.topicBoard}). */
+	topicBoard?: string;
 	/**
 	 * Go on with the turn the previous process left unfinished instead of sending
 	 * `message` (`omp --restore`: {@link AgentSession.restoreInterruptedTurn}).
@@ -4197,6 +4203,7 @@ async function driveFollowUpTurn(
 				restore: options.restore,
 				steps: options.steps,
 				stepReports: parentId ? { from: id, to: parentId } : undefined,
+				topicBoard: options.topicBoard,
 				onPromptBusy: async () => {
 					attemptUnsubscribe();
 					logger.debug("Subagent follow-up lost the prompt race to an IRC wake; backing off", { id });
@@ -5539,6 +5546,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				structured,
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
+				topicBoard: options.topicBoard,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left

@@ -485,6 +485,12 @@ export interface PromptOptions {
 	/** Delegator's open-endedness description (task tool `solutionSpace`); replaces the prompt as `auto` thinking classification input. */
 	solutionSpace?: string;
 	/**
+	 * Topic board for this turn, from the topics runtime to a topic worker (see
+	 * `topics/board`): sent ahead of the prompt when it differs from the last
+	 * board in the conversation. The Inbox builds its own from its topics.
+	 */
+	topicBoard?: string;
+	/**
 	 * Called synchronously once this prompt is admitted: idle, at the start of
 	 * #promptWithMessage's own turn setup (before preflight, image
 	 * normalization, or provider dispatch); while streaming, once the message

@@ -251,6 +251,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import { formatTopicBoard, topicBoardMessage } from "../topics/board";
 import type { TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
 import { type AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
@@ -8947,6 +8948,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		};
 	}
 
+	/**
+	 * The topic board to send ahead of this turn, if it changed since the last
+	 * one in the history ({@link topicBoardMessage}). A topic worker's comes with
+	 * its prompt; the Inbox builds its own from its topics.
+	 */
+	async #buildTopicBoardMessage(supplied: string | undefined): Promise<CustomMessage | undefined> {
+		const board = supplied ?? formatTopicBoard((await this.getTopicsHost())?.list() ?? [], "inbox");
+		return topicBoardMessage(board, this.agent.state.messages);
+	}
+
 	#sanitizeGoalTodoText(text: string): string {
 		return escapeXmlText(text)
 			.replace(/\r\n/g, "\\n")
@@ -9914,7 +9925,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		expandedText: string,
 		options?: Pick<
 			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted"
+			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted" | "topicBoard"
 		> & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
@@ -10015,6 +10026,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const vibeModeMessage = this.#buildVibeModeMessage();
 			if (vibeModeMessage) {
 				messages.push(vibeModeMessage);
+			}
+			// After the stable prefix, never in the system prompt: a changed board appends one message here.
+			const topicBoard = await this.#buildTopicBoardMessage(options?.topicBoard);
+			if (topicBoard) {
+				messages.push(topicBoard);
 			}
 			if (options?.prependMessages) {
 				messages.push(...options.prependMessages);

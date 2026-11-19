@@ -45,6 +45,7 @@ import type { ToolSession } from "../tools";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
+import { formatTopicBoard } from "../topics/board";
 
 import {
 	parseLifecycleEvent,
@@ -133,6 +134,8 @@ export interface WorkerScopePolicy {
 	 * nesting a top-level session has (`task.maxRecursionDepth`).
 	 */
 	ownerSpawnDepth: boolean;
+	/** Show each worker the owner's other workers as a topic board ahead of its turns (`topics/board`). */
+	siblingBoard: boolean;
 }
 
 /** Record state change observed by {@link VibeSessionRegistry.onChange} listeners. */
@@ -314,6 +317,7 @@ export class VibeSessionRegistry {
 				scope: "topics",
 				deliverResults: false,
 				ownerSpawnDepth: true,
+				siblingBoard: true,
 			});
 		}
 		return VibeSessionRegistry.#topics;
@@ -328,7 +332,7 @@ export class VibeSessionRegistry {
 	readonly policy: WorkerScopePolicy;
 	readonly #listeners = new Set<(change: WorkerChange) => void>();
 
-	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false }) {
+	constructor(policy: WorkerScopePolicy = { deliverResults: true, ownerSpawnDepth: false, siblingBoard: false }) {
 		this.policy = policy;
 	}
 
@@ -1588,8 +1592,17 @@ export class VibeSessionRegistry {
 					if (record.childSessionFile && !turnStartedPersisted) {
 						throw new ToolError(`Vibe session "${record.id}" changed parent scope before its turn started.`);
 					}
+					const topicBoard = this.policy.siblingBoard
+						? formatTopicBoard(
+								this.describe(session).filter(topic => topic.id !== record.id),
+								"topic",
+							)
+						: undefined;
 					const result = options.first
-						? await runSubprocess(await this.#buildSpawnOptions(session, record, message, signal, onProgress))
+						? await runSubprocess({
+								...(await this.#buildSpawnOptions(session, record, message, signal, onProgress)),
+								topicBoard,
+							})
 						: await runSubagentFollowUpTurn({
 								id: record.id,
 								agent: record.agent,
@@ -1600,6 +1613,7 @@ export class VibeSessionRegistry {
 								eventBus: session.eventBus,
 								subagentEventBus: session.subagentEventBus,
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
+								topicBoard,
 							});
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
