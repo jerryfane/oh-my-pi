@@ -188,12 +188,15 @@ export async function startTopicsControl(options: TopicsControlOptions): Promise
 					state.buffer = state.buffer.slice(newline + 1);
 					newline = state.buffer.indexOf("\n");
 					if (!line) continue;
-					state.queue = state.queue.then(() =>
-						handleLine(socket, state, line, options, () => {
-							unauthenticated--;
-							clearTimeout(state.helloTimer);
-						}),
-					);
+					state.queue = state.queue
+						.then(() =>
+							handleLine(socket, state, line, options, () => {
+								unauthenticated--;
+								clearTimeout(state.helloTimer);
+							}),
+						)
+						// A handler failure must never stall this connection's later commands.
+						.catch(error => logger.warn("topics control: command failed", { error: String(error) }));
 				}
 			},
 			drain(socket) {
@@ -254,12 +257,34 @@ async function handleLine(
 		return;
 	}
 
+	// Any failure (resolving the host included) answers this command; the connection keeps working.
+	try {
+		await runAuthenticated(socket, state, frame.type, id, frame, options);
+	} catch (error) {
+		send(socket, {
+			id,
+			type: "response",
+			command: frame.type,
+			success: false,
+			error: error instanceof Error ? error.message : String(error),
+		});
+	}
+}
+
+async function runAuthenticated(
+	socket: ControlSocket,
+	state: ConnectionState,
+	type: string,
+	id: string | undefined,
+	frame: object,
+	options: TopicsControlOptions,
+): Promise<void> {
 	const topics = await options.topics();
 	if (!topics) {
-		send(socket, { id, type: "response", command: frame.type, success: false, error: "Topics are disabled." });
+		send(socket, { id, type: "response", command: type, success: false, error: "Topics are disabled." });
 		return;
 	}
-	if (frame.type === "subscribe") {
+	if (type === "subscribe") {
 		state.unsubscribe ??= topics.onChange(change => send(socket, { type: "topic_update", change }));
 		send(socket, { id, type: "response", command: "subscribe", success: true });
 		return;
@@ -267,21 +292,11 @@ async function handleLine(
 	// Narrowed to a `topics_*` command below; runRpcTopicsCommand validates each field.
 	const command = frame as RpcCommand;
 	if (!isRpcTopicsCommand(command)) {
-		send(socket, { id, type: "response", command: frame.type, success: false, error: "Unknown command." });
+		send(socket, { id, type: "response", command: type, success: false, error: "Unknown command." });
 		return;
 	}
-	try {
-		const data = await runRpcTopicsCommand(topics, command);
-		send(socket, { id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
-	} catch (error) {
-		send(socket, {
-			id,
-			type: "response",
-			command: command.type,
-			success: false,
-			error: error instanceof Error ? error.message : String(error),
-		});
-	}
+	const data = await runRpcTopicsCommand(topics, command);
+	send(socket, { id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
 }
 
 /**

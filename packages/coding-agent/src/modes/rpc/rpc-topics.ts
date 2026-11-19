@@ -3,7 +3,7 @@
  * command acts on the topic itself; none starts a turn of the main session.
  */
 import type { TopicsHost } from "../../topics/host";
-import type { RpcCommand, RpcResponse, RpcSubagentMessagesResult } from "./rpc-types";
+import type { RpcResponse, RpcSubagentMessagesResult } from "./rpc-types";
 
 /** Owner-facing topics (persistent workers the host talks to directly); part of `RpcCommand`. */
 export type RpcTopicsCommand =
@@ -48,9 +48,19 @@ export type RpcTopicsResponse =
 	| { id?: string; type: "response"; command: "topics_reopen"; success: true }
 	| { id?: string; type: "response"; command: "topics_rename"; success: true };
 
-/** Whether `command` is a `topics_*` command. */
-export function isRpcTopicsCommand(command: RpcCommand): command is RpcTopicsCommand {
-	return command.type.startsWith("topics_");
+const TOPICS_COMMANDS: Record<RpcTopicsCommand["type"], true> = {
+	topics_list: true,
+	topics_new: true,
+	topics_send: true,
+	topics_read: true,
+	topics_close: true,
+	topics_reopen: true,
+	topics_rename: true,
+};
+
+/** Whether `command` is one of the seven `topics_*` commands (a typo like `topics_clsoe` is not). */
+export function isRpcTopicsCommand(command: { type: string }): command is RpcTopicsCommand {
+	return Object.hasOwn(TOPICS_COMMANDS, command.type);
 }
 
 function requireText(value: unknown, field: string): string {

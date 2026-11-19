@@ -1,19 +1,18 @@
 /**
  * Host-facing topics surface: what a host (RPC client, Herdr control socket)
  * may do with the owner's topics. A topic is a persistent worker in the
- * {@link VibeSessionRegistry.topics} scope of the top-level session; the host
- * talks to it directly, without a turn of the main conversation. While a host
- * lives, agents' `agent://<id>` messages to its topics run as topic turns
+ * {@link topicsRegistry} scope of the top-level session; the host talks to it
+ * directly, without a turn of the main conversation. While a host lives,
+ * agents' `agent://<id>` messages to its topics run as topic turns
  * ({@link routeTopicMessage}).
  */
-import { addIrcRoute } from "../irc/routes";
+import { setIrcRoute } from "../irc/routes";
 import { readRpcSubagentTranscript } from "../modes/rpc/rpc-subagents";
 import type { RpcSubagentMessagesResult } from "../modes/rpc/rpc-types";
 import type { ToolSession } from "../tools";
-import { VibeSessionRegistry } from "../vibe/runtime";
 import type { WorkerChange, WorkerSummary } from "../vibe/worker-scope";
 import { cfgTopicsEnabled } from "./settings";
-import { routeTopicMessage } from "./workers";
+import { routeTopicMessage, topicsRegistry } from "./workers";
 
 /** One topic as a host sees it. */
 export type TopicSummary = WorkerSummary;
@@ -41,14 +40,17 @@ export interface TopicsHost {
 	dispose(): void;
 }
 
-/** Bind the topics registry to the top-level session's tool session. */
+/**
+ * Bind the topics registry to the top-level session's tool session. A second
+ * host for the same session replaces the first one's message route.
+ */
 export function createTopicsHost(session: ToolSession): TopicsHost {
-	const registry = VibeSessionRegistry.topics();
+	const registry = topicsRegistry();
 	const ownedBySession = (change: WorkerChange): boolean => {
 		const scope = registry.ownerScope(session);
 		return change.ownerId === scope.ownerId && change.parentSessionId === scope.parentSessionId;
 	};
-	const unroute = addIrcRoute((message, bus) => routeTopicMessage(registry, session, message, bus));
+	const unroute = setIrcRoute(session, (message, bus) => routeTopicMessage(registry, session, message, bus));
 	return {
 		list: () => registry.describe(session),
 		async create({ title, message, name }) {

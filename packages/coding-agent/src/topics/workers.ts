@@ -1,7 +1,7 @@
 /**
- * How the topics registry ({@link VibeSessionRegistry.topics}) treats its
- * workers: the policy it runs them under (sibling board, answers to asks),
- * and how an agent's IRC message to a topic becomes a topic turn.
+ * The topics registry ({@link topicsRegistry}): a {@link VibeSessionRegistry}
+ * of owner-facing workers, the policy it runs them under (sibling board,
+ * answers to asks), and how an agent's IRC message to a topic becomes a topic turn.
  */
 import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -13,7 +13,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import { escapeHarnessTags } from "../session/harness-tags";
 import { buildWakeRelayBody } from "../task/executor";
 import type { ToolSession } from "../tools";
-import type { VibeSessionRegistry } from "../vibe/runtime";
+import { VibeSessionRegistry } from "../vibe/runtime";
 import type { QueuedMessage, SettledWorkerTurn, WorkerScopePolicy, WorkerView } from "../vibe/worker-scope";
 import { formatTopicBoard } from "./board";
 
@@ -67,6 +67,19 @@ export const TOPICS_POLICY: WorkerScopePolicy = {
 	boardFor: siblings => formatTopicBoard(siblings, "topic"),
 	onTurnSettled: answerAskers,
 };
+
+let globalTopics: VibeSessionRegistry | undefined;
+
+/** The process-global registry of owner-facing topic workers, run under {@link TOPICS_POLICY}. */
+export function topicsRegistry(): VibeSessionRegistry {
+	globalTopics ??= new VibeSessionRegistry(TOPICS_POLICY);
+	return globalTopics;
+}
+
+/** Drop the topics registry, as a process restart would. Test-only. */
+export function resetTopicsRegistryForTests(): void {
+	globalTopics = undefined;
+}
 
 /** The live topic `agentId` is, or the nearest one it works for (its spawn ancestry). */
 function topicOf(registry: VibeSessionRegistry, session: ToolSession, agentId: string): WorkerView | undefined {

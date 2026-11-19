@@ -24,6 +24,7 @@ import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
+import { ircRouteCountForTests } from "@oh-my-pi/pi-coding-agent/irc/routes";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -31,6 +32,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard, topicBoardMessage } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
+import { resetTopicsRegistryForTests, topicsRegistry } from "@oh-my-pi/pi-coding-agent/topics/workers";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
@@ -222,6 +224,7 @@ describe("topics registry", () => {
 		for (const host of hosts) host.dispose();
 		await manager.dispose({ timeoutMs: 100 });
 		VibeSessionRegistry.resetGlobalForTests();
+		resetTopicsRegistryForTests();
 		AgentRegistry.resetGlobalForTests();
 		IrcBus.resetGlobalForTests();
 		InternalUrlRouter.resetForTests();
@@ -230,7 +233,7 @@ describe("topics registry", () => {
 
 	it("does not deliver a topic's turn result into the parent, while a vibe worker's still is", async () => {
 		const parent = parentFor(sessionManager);
-		await spawnSettled(VibeSessionRegistry.topics(), parent, { name: "Diokan", title: "Diokan term sheet" });
+		await spawnSettled(topicsRegistry(), parent, { name: "Diokan", title: "Diokan term sheet" });
 		await spawnSettled(VibeSessionRegistry.global(), parent, { name: "Worker" });
 		await manager.drainDeliveries({ timeoutMs: 5_000 });
 
@@ -240,7 +243,7 @@ describe("topics registry", () => {
 
 	it("starts topic workers at the owner's spawn depth, while vibe workers count one level down", async () => {
 		const parent = parentFor(sessionManager);
-		await spawnSettled(VibeSessionRegistry.topics(), parent, { name: "Diokan", title: "Diokan" });
+		await spawnSettled(topicsRegistry(), parent, { name: "Diokan", title: "Diokan" });
 		await spawnSettled(VibeSessionRegistry.global(), parent, { name: "Worker" });
 		const [topicOptions, vibeOptions] = spawnOptions;
 
@@ -251,7 +254,7 @@ describe("topics registry", () => {
 
 	it("persists title and close across a restart and reopens with the conversation", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		await topics.rename(parent, id, "Diokan signing");
 		await topics.close(parent, id);
@@ -260,8 +263,9 @@ describe("topics registry", () => {
 		// Restart: fresh registries over the same parent file.
 		const file = sessionManager.getSessionFile()!;
 		VibeSessionRegistry.resetGlobalForTests();
+		resetTopicsRegistryForTests();
 		const parent2 = parentFor(await SessionManager.open(file));
-		const topics2 = VibeSessionRegistry.topics();
+		const topics2 = topicsRegistry();
 
 		expect(await VibeSessionRegistry.global().rehydrate(parent2)).toBe(0);
 		expect(await topics2.rehydrate(parent2)).toBe(1);
@@ -283,7 +287,7 @@ describe("topics registry", () => {
 
 	it("gives each topic turn a board of the other topics, and vibe workers none", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const first = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const second = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
 		await spawnSettled(VibeSessionRegistry.global(), parent, { name: "Worker" });
@@ -309,7 +313,7 @@ describe("topics registry", () => {
 
 	it("lists ids that history:// resolves to the topic's conversation", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		expect(formatTopicBoard(topics.describe(parent), "inbox")).toContain(`(id: ${id})`);
 
@@ -328,7 +332,7 @@ describe("topics registry", () => {
 
 	it("keeps the board through a working topic's progress and changes it when the turn settles", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const id = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const turn = holdFollowUps();
 		await topics.send(parent, { session: id, message: "draft clause 4" });
@@ -359,7 +363,7 @@ describe("topics registry", () => {
 
 	it("runs an Inbox ask as a topic turn with the sibling board, labelled and counted, and answers the Inbox", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
 		const inbox = registerInbox();
@@ -379,9 +383,30 @@ describe("topics registry", () => {
 		expect(inbox).toMatchObject([{ from: diokan, to: OWNER, body: "Clause 4 is final.", wakeRelay: true }]);
 	});
 
+	it("keeps one message route per session when a second host is created, and one turn per ask", async () => {
+		const parent = parentFor(sessionManager);
+		const topics = topicsRegistry();
+		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
+		registerInbox();
+		const first = hostFor(parent);
+		hostFor(parent);
+		expect(ircRouteCountForTests()).toBe(1);
+		// The first host going away leaves the second one's route in place.
+		first.dispose();
+		expect(ircRouteCountForTests()).toBe(1);
+		const turn = holdFollowUps();
+
+		expect(await ask(OWNER, diokan, "is clause 4 final?")).toMatchObject({ isError: false });
+		const held = await turn(0);
+		expect(topics.describe(parent).find(topic => topic.id === diokan)).toMatchObject({ queued: 0, turns: 2 });
+		held.release();
+		await settled(diokan, 2);
+		expect(executorModule.runSubagentFollowUpTurn).toHaveBeenCalledTimes(1);
+	});
+
 	it("queues an ask to a busy topic for a turn of its own, and a closed topic refuses asks", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
 		registerInbox();
@@ -411,7 +436,7 @@ describe("topics registry", () => {
 
 	it("lets a topic ask another only in a turn its owner started, and routes the answer back to it", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const trip = await spawnSettled(topics, parent, { name: "Trip", title: "Trip planning" });
 		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
@@ -459,7 +484,7 @@ describe("topics registry", () => {
 
 	it("runs an owner message sent during an agent's turn as an owner turn of its own, which may ask", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const trip = await spawnSettled(topics, parent, { name: "Trip", title: "Trip planning" });
 		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		registerInbox();
@@ -498,7 +523,7 @@ describe("topics registry", () => {
 
 	it("never starts a turn with a progress note from a turn another agent's message started", async () => {
 		const parent = parentFor(sessionManager);
-		const topics = VibeSessionRegistry.topics();
+		const topics = topicsRegistry();
 		const diokan = await spawnSettled(topics, parent, { name: "Diokan", title: "Diokan term sheet" });
 		const notes = await spawnSettled(topics, parent, { name: "Notes", title: "Release notes" });
 		const inbox = registerInbox();

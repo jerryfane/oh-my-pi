@@ -45,7 +45,6 @@ import type { ToolSession } from "../tools";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
-import { TOPICS_POLICY } from "../topics/workers";
 
 import {
 	parseLifecycleEvent,
@@ -272,7 +271,6 @@ export class VibeTurnError extends Error {}
  */
 export class VibeSessionRegistry {
 	static #global: VibeSessionRegistry | undefined;
-	static #topics: VibeSessionRegistry | undefined;
 
 	static global(): VibeSessionRegistry {
 		if (!VibeSessionRegistry.#global) {
@@ -281,18 +279,9 @@ export class VibeSessionRegistry {
 		return VibeSessionRegistry.#global;
 	}
 
-	/** Process-global registry of owner-facing topic workers (see {@link TOPICS_POLICY}). */
-	static topics(): VibeSessionRegistry {
-		if (!VibeSessionRegistry.#topics) {
-			VibeSessionRegistry.#topics = new VibeSessionRegistry(TOPICS_POLICY);
-		}
-		return VibeSessionRegistry.#topics;
-	}
-
-	/** Reset the global registries. Test-only. */
+	/** Reset the global registry. Test-only. */
 	static resetGlobalForTests(): void {
 		VibeSessionRegistry.#global = undefined;
-		VibeSessionRegistry.#topics = undefined;
 	}
 
 	readonly policy: WorkerScopePolicy;

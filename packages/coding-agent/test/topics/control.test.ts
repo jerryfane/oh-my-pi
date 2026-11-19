@@ -162,6 +162,43 @@ describe("topics control socket", () => {
 		client.end();
 	});
 
+	it("refuses a mistyped topics command instead of reporting success", async () => {
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		await client.next();
+		client.send({ id: "typo", type: "topics_clsoe", topicId: "Diokan" });
+		expect(await client.next()).toMatchObject({ id: "typo", success: false, error: "Unknown command." });
+		client.end();
+	});
+
+	it("answers a command whose host lookup throws, and keeps serving the connection", async () => {
+		stop?.();
+		let failures = 1;
+		const host = fakeHost(sent);
+		stop = await startTopicsControl({
+			path: socketPath,
+			token: TOKEN,
+			topics: async () => {
+				if (failures-- > 0) throw new Error("restore failed");
+				return host;
+			},
+		});
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		await client.next();
+		client.send({ id: "1", type: "topics_list" });
+		expect(await client.next()).toEqual({
+			id: "1",
+			type: "response",
+			command: "topics_list",
+			success: false,
+			error: "restore failed",
+		});
+		client.send({ id: "2", type: "topics_list" });
+		expect(await client.next()).toMatchObject({ id: "2", success: true, data: { topics: [{ id: "Diokan" }] } });
+		client.end();
+	});
+
 	it("delivers a reply larger than one socket write whole", async () => {
 		const client = await connect(socketPath);
 		client.send({ type: "hello", token: TOKEN });
