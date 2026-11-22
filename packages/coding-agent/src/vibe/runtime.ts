@@ -42,7 +42,12 @@ import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
-import { type FirstTurnOutcome, type TranscriptPreamble, throwIfStale } from "../session/inbox-epoch";
+import {
+	type FirstTurnOutcome,
+	StaleTranscriptError,
+	type TranscriptPreamble,
+	throwIfStale,
+} from "../session/inbox-epoch";
 import { resolveSubagentStartModel } from "../task/subagent-start-model";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -467,15 +472,22 @@ export class VibeSessionRegistry {
 		return { agent, modelOverride: patterns, modelRole: role };
 	}
 
+	/**
+	 * Append `event` to the parent transcript, if it is still the one the worker belongs to: the same session and
+	 * file and, with `transcriptSignal` (a seed's), the same transcript (a `/tree` keeps the file and session but
+	 * ends it). Checked again after every await, right before the append; false when it was not appended.
+	 */
 	async #appendLifecycleEvent(
 		session: VibeParentSession,
 		event: VibeLifecycleEvent,
 		expectedParentSessionFile: string | null,
+		transcriptSignal?: AbortSignal,
 	): Promise<boolean> {
 		if (!expectedParentSessionFile || !session.sessionManager) return false;
 		const matchesCurrentScope = (): boolean => {
 			const currentSessionFile = session.getSessionFile();
 			return (
+				transcriptSignal?.aborted !== true &&
 				session.getSessionId?.() === event.parentSessionId &&
 				(session.getAgentId?.() ?? MAIN_AGENT_ID) === event.ownerId &&
 				currentSessionFile !== null &&
@@ -914,9 +926,10 @@ export class VibeSessionRegistry {
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
 	 * `seed` is built inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn,
-	 * and so does a seed whose transcript is replaced before the child admits the turn. A seed whose transcript was
-	 * already replaced spawns nothing ({@link throwIfStale}): checked before the owner scope is read and
-	 * again before the worker is recorded, so no spawn, title or tombstone reaches the successor transcript.
+	 * and so does a seed whose transcript is replaced before the child admits the turn. A seed whose transcript is
+	 * replaced before the spawn record is written (a `/new`, a `/tree`) spawns nothing ({@link StaleTranscriptError}):
+	 * checked before the owner scope is read, after every await, and right before the record is appended; the
+	 * pending worker is then discarded, with no `spawned` change and no tombstone.
 	 */
 	async spawn(
 		session: ToolSession,
@@ -991,13 +1004,22 @@ export class VibeSessionRegistry {
 						...(args.title ? { title: args.title } : {}),
 					},
 					record.parentSessionFile,
+					args.seed?.signal,
 				);
-				if (!spawnPersisted) throw new ToolError("Vibe parent session changed before the worker could start.");
+				if (!spawnPersisted) {
+					throwIfStale(args.seed?.signal);
+					throw new ToolError("Vibe parent session changed before the worker could start.");
+				}
 			}
 			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true, seed: args.seed });
 			this.#emit(record, "spawned");
 			return { id, jobId };
 		} catch (error) {
+			if (!spawnPersisted && error instanceof StaleTranscriptError) {
+				// Nothing of it was written: the transcript it belonged to ended first.
+				this.#records.delete(key);
+				throw error;
+			}
 			record.killed = true;
 			record.state = "dead";
 			record.lastActivityAt = Date.now();

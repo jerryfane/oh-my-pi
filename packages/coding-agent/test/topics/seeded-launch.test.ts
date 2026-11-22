@@ -44,7 +44,8 @@ import {
 	TOPIC_START_FAILED_TYPE,
 	TOPIC_SUGGESTION_STATE_TYPE,
 } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
-import { resetTopicsRegistryForTests } from "@oh-my-pi/pi-coding-agent/topics/workers";
+import { resetTopicsRegistryForTests, topicsRegistry } from "@oh-my-pi/pi-coding-agent/topics/workers";
+import { VIBE_LIFECYCLE_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/vibe/lifecycle";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
@@ -116,11 +117,13 @@ interface Launch {
 }
 
 /**
- * A child setup step held until `release`: the SDK session's creation, the credential lookup of the child's
- * first prompt (after `session_init` and extension start, before the prompt's last check), or the auto-thinking
- * judge's request (prompt setup, before that check; with `autoThinking`).
+ * A setup step held until `release`: the SDK session's creation, the credential lookup of the child's first
+ * prompt (after `session_init` and extension start, before the prompt's last check), the auto-thinking judge's
+ * request (prompt setup, before that check; with `autoThinking`), the Inbox's credential lookup for the topic's
+ * start model (`preflight`: Accept's seed check, before anything is spawned), or the Inbox journal's first write
+ * (`persist`: the topic's spawn record; the Inbox is then saved to a file).
  */
-type Gate = "creation" | "credentials" | "judge";
+type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist";
 
 /**
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
@@ -211,7 +214,8 @@ async function openLaunch(
 		...(autoThinking ? { defaultThinkingLevel: "auto" as const } : {}),
 	});
 
-	const manager = SessionManager.inMemory(cwd);
+	const manager =
+		gate === "persist" ? SessionManager.create(cwd, path.join(root, "sessions")) : SessionManager.inMemory(cwd);
 	manager.appendMessage({ role: "user", content: "first question", timestamp: 1 });
 	const firstAnswer = manager.appendMessage(createAssistantMessage("first answer"));
 	const excerpt = manager.appendMessage({ role: "user", content: excerptText, timestamp: 2 });
@@ -228,7 +232,7 @@ async function openLaunch(
 		sessionManager: manager,
 		getAgentId: () => "Main",
 		getSessionId: () => manager.getSessionId(),
-		getSessionFile: () => null,
+		getSessionFile: () => manager.getSessionFile() ?? null,
 		getArtifactsDir: () => null,
 		taskDepth: 0,
 		enableLsp: false,
@@ -275,13 +279,39 @@ async function openLaunch(
 		return result;
 	});
 	const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+	let preflightHeld = false;
 	vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
-		if (gate === "credentials" && created) {
+		if ((gate === "credentials" && created) || (gate === "preflight" && !created && !preflightHeld)) {
+			preflightHeld = gate === "preflight";
 			gated.resolve();
 			await held.promise;
 		}
 		return getApiKey(...args);
 	});
+	if (gate === "persist") {
+		// Only a write the topic's spawn makes (its spawn record), not the suggestion's own note.
+		const registry = topicsRegistry();
+		const spawn = registry.spawn.bind(registry);
+		let spawning = false;
+		vi.spyOn(registry, "spawn").mockImplementation(async (...args) => {
+			spawning = true;
+			try {
+				return await spawn(...args);
+			} finally {
+				spawning = false;
+			}
+		});
+		const ensureOnDisk = manager.ensureOnDisk.bind(manager);
+		let persistHeld = false;
+		vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+			if (spawning && !persistHeld) {
+				persistHeld = true;
+				gated.resolve();
+				await held.promise;
+			}
+			await ensureOnDisk();
+		});
+	}
 	return {
 		inbox,
 		manager,
@@ -367,6 +397,56 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 			expect(await childFile(launch, id)).not.toContain(EXCERPT);
 			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
 		});
+	});
+
+	/** Accept `launch`'s excerpt as a suggestion: the refusal's code, or undefined once accepted. */
+	function acceptCode(launch: Launch): { changes: TopicChange[]; code: Promise<string | undefined> } {
+		const changes: TopicChange[] = [];
+		launch.host.onChange(change => changes.push(change));
+		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
+		const code = launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" }).then(
+			() => undefined,
+			(error: unknown) => (error as { code?: string }).code,
+		);
+		return { changes, code };
+	}
+
+	/** `/tree` back to the first answer, which leaves the excerpt off the branch. */
+	async function rewind(launch: Launch): Promise<void> {
+		expect((await launch.inbox.navigateTree(launch.firstAnswer)).cancelled).toBe(false);
+		expect(launch.manager.getBranch().some(entry => entry.id === launch.excerpt)).toBe(false);
+	}
+
+	it("/tree while the spawn record is written: nothing of the topic reaches the branch or the file; Accept is refused (#22 review)", async () => {
+		const launch = await openLaunch("persist");
+		const { changes, code } = acceptCode(launch);
+		await launch.gated;
+		await rewind(launch);
+		launch.release();
+
+		expect(await code).toBe("suggestion_not_found");
+		await Bun.sleep(5);
+		expect(launch.launched).toEqual([]);
+		expect(launch.requests).toEqual([]);
+		expect(changes.filter(change => change.reason === "spawned")).toEqual([]);
+		expect(rows(launch.manager, VIBE_LIFECYCLE_CUSTOM_TYPE)).toEqual([]);
+		await launch.manager.flush();
+		const file = launch.manager.getSessionFile();
+		if (!file) throw new Error("expected the Inbox's session file");
+		expect(fs.readFileSync(file, "utf8")).not.toContain(VIBE_LIFECYCLE_CUSTOM_TYPE);
+	});
+
+	it("/tree while Accept looks up the topic's model: refused as gone from this Inbox, not as too large (#22 review)", async () => {
+		// The model the topic would start on (after the credential fallback) has a 40-token window: the seed would not fit.
+		const launch = await openLaunch("preflight", { contextWindow: 40, unauthenticatedStart: 4_000 });
+		const { changes, code } = acceptCode(launch);
+		await launch.gated;
+		await rewind(launch);
+		launch.release();
+
+		expect(await code).toBe("suggestion_not_found");
+		expect(launch.launched).toEqual([]);
+		expect(changes.filter(change => change.reason === "spawned")).toEqual([]);
 	});
 
 	it("Accept without a replacement: the child admits its seeded prompt, then the topic is linked", async () => {

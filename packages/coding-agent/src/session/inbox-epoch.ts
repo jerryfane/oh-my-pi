@@ -310,24 +310,13 @@ export class BoundPrompt {
 	}
 
 	/**
-	 * The last check before dispatch of `messages` (the final batch, its notices included, with the bare prompt):
-	 * false when the transcript was replaced (nothing is sent). Else the preamble, fitted to the model the request
-	 * goes to, joins the prompt in place, so the prompt keeps its identity (turn observation, queued-message
+	 * The last check before dispatch of `messages` (the batch as it will be sent, its notices included, with the bare
+	 * prompt): false when the transcript was replaced (nothing is sent). Else the preamble, fitted to the model the
+	 * request goes to, joins the prompt in place, so the prompt keeps its identity (turn observation, queued-message
 	 * bookkeeping), with its cached token estimate and conversion invalidated; then the prompt is reported admitted.
 	 * When even the shortest preamble does not fit, the prompt is refused ({@link PreambleTooLargeError}).
-	 * `deliver` is told whether the batch was admitted, so the notices it carries are marked delivered only then.
 	 */
-	admit(messages: AgentMessage[], deliver?: (admitted: boolean) => void): boolean {
-		let admitted = false;
-		try {
-			admitted = this.#admit(messages);
-			return admitted;
-		} finally {
-			deliver?.(admitted);
-		}
-	}
-
-	#admit(messages: AgentMessage[]): boolean {
+	admit(messages: AgentMessage[]): boolean {
 		if (this.#signal.aborted) return false;
 		if (this.#preamble) {
 			const { model, settings } = this.#session;

@@ -278,9 +278,9 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 * cancels the summary request, the seed and the child's launch, whose first prompt is admitted only while the
 	 * epoch is live (the child saves and sends nothing of it otherwise).
 	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused; one replaced while
-	 * its seed's room is checked is refused before anything is spawned, and the spawn itself refuses a replaced
-	 * transcript before it writes a thing. One whose seed fits no model its child can use even at its floor is
-	 * refused before it is spawned (`seed_too_large`).
+	 * its start model is looked up is refused before its seed is sized or anything is spawned, and the spawn itself
+	 * refuses a replaced transcript up to the moment it writes. One whose seed fits no model its child can use even at
+	 * its floor is refused before it is spawned (`seed_too_large`).
 	 */
 	const spawnTopic = async (args: {
 		title: string;
@@ -293,8 +293,10 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const seed = args.seed;
 		const signal = seed?.admission.epoch.signal;
 		if (seed) {
-			requireSeedRoom(session, await registry.workerStartModel(session, TOPIC_CLI), topicSeedFloor(seed));
+			const start = await registry.workerStartModel(session, TOPIC_CLI);
+			// A replaced transcript wins over the size of a seed copied from it.
 			throwIfStale(signal);
+			requireSeedRoom(session, start, topicSeedFloor(seed));
 		}
 		const firstTurn = Promise.withResolvers<FirstTurnOutcome>();
 		if (!seed) firstTurn.resolve({ kind: "started" });

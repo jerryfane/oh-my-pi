@@ -1186,10 +1186,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
-	/**
-	 * Rows that arrived while a run was live, drawn and saved once it ends or the next prompt starts: rows kept
-	 * out of context, and {@link recordWithoutTurn}'s rows, which the model sees from its next turn on.
-	 */
+	/** Rows that arrived while a run was live (kept out of context, or {@link recordWithoutTurn}'s, seen from the next
+	 *  turn on); drawn and saved once it ends or the next prompt starts. */
 	#pendingExcludedRows: CustomMessage[] = [];
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
 	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { signal?: AbortSignal }>();
@@ -10224,7 +10222,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
-			const deliverNotices = bound && this.#tools.holdNoticeDelivery(); // Delivered only if `admit` takes the batch.
+			// A bound batch can be refused: it is admitted with its notices previewed, whose deltas are consumed only then.
+			const notices = bound && this.#tools.previewNotices(message, baseXdevCatalogDelivered, previewXdevMountNotice);
+			if (notices && !bound?.admit(messages.toSpliced(xdevMountNoticeIndex, 0, ...notices.all))) return false;
+			notices?.commit();
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,
@@ -10255,8 +10256,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					...(skillNotice ? [skillNotice] : []),
 				);
 			}
-			// The batch is final and synchronous to dispatch: a replaced transcript drops a bound prompt; else admitted.
-			if (bound && !bound.admit(messages, deliverNotices)) return false;
+			if (notices) messages.splice(xdevMountNoticeIndex, 0, ...notices.delivered); // Their takes above built none.
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);
