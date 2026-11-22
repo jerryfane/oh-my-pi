@@ -196,7 +196,21 @@ export function messageText(entry: SessionEntry): { role: "user" | "assistant"; 
  * current branch, after its latest `/clear`). Build it once per branch read; listing, accept and create share it.
  */
 export function eligibleMessageIds(branch: readonly SessionEntry[]): Set<string> {
-	return new Set(branch.filter(entry => messageText(entry) !== undefined).map(entry => entry.id));
+	const ids = new Set<string>();
+	for (const entry of branch) if (hasMessageText(entry)) ids.add(entry.id);
+	return ids;
+}
+
+const NONBLANK = /\S/;
+
+/** Whether {@link messageText} has text for `entry` (a user or assistant message with nonblank text), without building it. */
+function hasMessageText(entry: SessionEntry): boolean {
+	if (entry.type !== "message") return false;
+	const message = entry.message;
+	if (message.role !== "user" && message.role !== "assistant") return false;
+	const content = message.content;
+	if (typeof content === "string") return NONBLANK.test(content);
+	return content.some(block => block.type === "text" && NONBLANK.test(block.text));
 }
 
 /** Check that every id in `ids` is in `eligible` ({@link eligibleMessageIds}); throws `invalid_message_ids` otherwise. */

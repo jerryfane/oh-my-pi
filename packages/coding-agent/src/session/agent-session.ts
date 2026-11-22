@@ -1193,7 +1193,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
 	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { signal?: AbortSignal }>();
 	/** The open transcript's epoch, for work bound to it (see {@link InboxEpochs}). */
-	readonly #epochs = new InboxEpochs();
+	readonly #epochs = new InboxEpochs(() => this.#dropStaleQueuedMessages());
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -10028,7 +10028,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const setupAbort = new AbortController();
 		this.#promptSetupAbortController = setupAbort;
 		try {
-			options?.onPromptAdmitted?.();
+			// A transcript-bound prompt is admitted at its last transcript check, right before dispatch.
+			if (!options?.transcriptSignal) options?.onPromptAdmitted?.();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			// Auto-prewalk: return from the previous task's handoff before the usage preflight checks the model,
 			// then judge this task alongside the rest of setup; the decision is applied right before dispatch.
@@ -10231,6 +10232,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt.
 			if (options?.transcriptSignal?.aborted) return false;
+			if (options?.transcriptSignal) options.onPromptAdmitted?.();
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,
@@ -11402,7 +11404,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Bound to its transcript: a replacement drops the whole batch from the queues at once, and from wherever
 		// it is held (an IRC wake parked it) when that puts it back or the agent dequeues it.
 		const batch = [...prependMessages, ...(descriptionNotice ? [descriptionNotice] : []), normalizedAppMessage];
-		if (transcriptSignal) this.#epochs.bindQueued(batch, transcriptSignal, () => this.#dropStaleQueuedMessages());
+		if (transcriptSignal) this.#epochs.bindQueued(batch, transcriptSignal);
 		onPromptQueued?.(batch);
 		onPromptAdmitted?.();
 		this.#scheduleIdleQueueDrain();

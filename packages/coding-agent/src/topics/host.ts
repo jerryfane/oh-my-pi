@@ -227,7 +227,8 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	/**
 	 * Spawn a topic; with `seed`, the chosen messages of `seed.entries` are prepended to its first turn. The seed
 	 * is built inside that turn (its failure fails the turn), under the admitted transcript's epoch: aborted, it
-	 * cancels the summary request, the seed and the first turn, which is admitted only while the epoch is live.
+	 * cancels the summary request, the seed and the child's launch, whose first prompt is admitted only while the
+	 * epoch is live (the child saves and sends nothing of it otherwise).
 	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused.
 	 */
 	const spawnTopic = async (args: {
@@ -262,7 +263,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 								throwIfStale(signal);
 								return text;
 							},
-							dispatch: () => throwIfStale(signal),
+							signal,
 							firstTurn: firstTurn.resolve,
 						},
 					}
@@ -305,38 +306,49 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 * Accept `suggestion` of the admitted transcript: spawn its topic and return its id at once; the accepted
 	 * state and the note follow once its first turn is admitted. Until then the accept is pending in memory (a
 	 * repeat joins it); if the first turn is cancelled or fails, the suggestion stays open and the topic is ended.
-	 * `entries` is the branch its eligibility was checked on; `settle` ends the pending accept once it is linked or not.
+	 * `entries` is the branch its eligibility was checked on. The pending accept is registered before anything
+	 * starts and forgotten by this same owner, once the spawn failed or the topic is linked or not.
 	 */
-	const accept = async (
+	const accept = (
 		admission: Admission,
 		suggestion: TopicSuggestion,
 		by: string,
 		entries: readonly SessionEntry[],
-		settle: () => void,
 	): Promise<string> => {
-		const started = await spawnTopic({
-			title: suggestion.title,
-			message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
-			seed: {
-				admission,
-				entries: [...entries],
-				messageIds: suggestion.messageIds,
-				reason: suggestion.reason,
-			},
-		}).catch(translateStale(suggestion.id));
-		const topicId = started.id;
-		void afterAdmission(admission, started, async () => {
-			await commitState(admission, { id: suggestion.id, state: "accepted", topicId, by, atMs: Date.now() });
-			await noteContinued(admission, {
-				topicId,
-				title: suggestion.title,
-				suggestionId: suggestion.id,
-				messageIds: [...suggestion.messageIds],
-			});
-		})
-			.catch(() => {})
-			.finally(settle);
-		return topicId;
+		const topic = Promise.withResolvers<string>();
+		const operation: InFlight<string> = { epochId: admission.epoch.id, promise: topic.promise };
+		accepting.set(suggestion.id, operation);
+		void (async () => {
+			try {
+				const started = await spawnTopic({
+					title: suggestion.title,
+					message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
+					seed: {
+						admission,
+						entries: [...entries],
+						messageIds: suggestion.messageIds,
+						reason: suggestion.reason,
+					},
+				}).catch(translateStale(suggestion.id));
+				const topicId = started.id;
+				topic.resolve(topicId);
+				await afterAdmission(admission, started, async () => {
+					await commitState(admission, { id: suggestion.id, state: "accepted", topicId, by, atMs: Date.now() });
+					await noteContinued(admission, {
+						topicId,
+						title: suggestion.title,
+						suggestionId: suggestion.id,
+						messageIds: [...suggestion.messageIds],
+					});
+				});
+			} catch (error) {
+				// The spawn failed (the caller is refused); a link that failed after it was logged by `afterAdmission`.
+				topic.reject(error);
+			} finally {
+				settleInFlight(accepting, suggestion.id, operation);
+			}
+		})();
+		return topic.promise;
 	};
 
 	return {
@@ -456,19 +468,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 					`Suggestion ${suggestionId} names messages this conversation no longer has (cleared).`,
 				);
 			}
-			// `settle` runs only after `accept` first awaits, so `running` is set by then.
-			const settle = () => settleInFlight(accepting, suggestionId, running);
-			const running: InFlight<string> = {
-				epochId: admission.epoch.id,
-				promise: accept(admission, suggestion, by, entries, settle),
-			};
-			accepting.set(suggestionId, running);
-			try {
-				return { topicId: await running.promise, alreadyAccepted: false };
-			} catch (error) {
-				settle();
-				throw error;
-			}
+			return { topicId: await accept(admission, suggestion, by, entries), alreadyAccepted: false };
 		},
 		async dismissSuggestion({ suggestionId, by }) {
 			const admission = admit();

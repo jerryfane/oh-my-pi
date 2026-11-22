@@ -66,14 +66,15 @@ import type {
 } from "./worker-scope";
 
 /**
- * A first-turn seed: built inside the turn; `dispatch` runs where the turn dispatches and throws to cancel it.
- * `firstTurn` reports, exactly once and on every exit, whether the child admitted the first prompt into its own
- * session (`admitted`) or the turn ended before that (`refused`: a failed seed or setup, a cancelled job, a
- * refused launch).
+ * A first-turn seed: built inside the turn, from the transcript `signal` is bound to. The child's launch is bound
+ * to it too ({@link ExecutorOptions.launchSignal}): aborted before the child admitted its first prompt, the launch
+ * is cancelled and nothing of it is saved or sent. `firstTurn` reports, exactly once and on every exit, whether the
+ * child admitted the first prompt into its own session (`admitted`) or the turn ended before that (`refused`: a
+ * failed seed or setup, a cancelled job or launch).
  */
 export interface VibeSeed {
+	signal: AbortSignal;
 	build(): Promise<string>;
-	dispatch(): void;
 	firstTurn(outcome: "admitted" | "refused"): void;
 }
 
@@ -892,7 +893,7 @@ export class VibeSessionRegistry {
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
 	 * `seed` is built inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn,
-	 * and so does a seed whose `dispatch` refuses the turn.
+	 * and so does a seed whose transcript is replaced before the child admits the turn.
 	 */
 	async spawn(
 		session: ToolSession,
@@ -1669,13 +1670,12 @@ export class VibeSessionRegistry {
 								onProgress,
 							)
 						: undefined;
-					// At dispatch: the seed's owner may still cancel the first turn before anything runs.
-					options.seed?.dispatch();
 					const result = spawnOptions
 						? await runSubprocess({
 								...spawnOptions,
 								topicBoard,
 								onFirstPromptAdmitted: () => reportFirstTurn("admitted"),
+								launchSignal: options.seed?.signal,
 							})
 						: await runSubagentFollowUpTurn({
 								id: record.id,

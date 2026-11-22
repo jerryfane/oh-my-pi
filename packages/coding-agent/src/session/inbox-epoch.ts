@@ -36,6 +36,13 @@ export class InboxEpochs {
 	/** Queued messages bound to an epoch's signal, by message. */
 	readonly #boundMessages = new WeakMap<object, AbortSignal>();
 
+	readonly #onEnd: () => void;
+
+	/** `onEnd` runs once each time an epoch ends, after its signal aborted: one sweep of what was bound to it. */
+	constructor(onEnd: () => void) {
+		this.#onEnd = onEnd;
+	}
+
 	/** The current epoch; throws {@link StaleTranscriptError} at once while a replacement runs. */
 	capture(): InboxEpoch {
 		const current = this.#current;
@@ -45,8 +52,11 @@ export class InboxEpochs {
 
 	/** A replacement begins: abort the current epoch (synchronously) and leave none. */
 	end(): void {
-		this.#current?.controller.abort(new StaleTranscriptError());
+		const ended = this.#current;
+		if (!ended) return;
 		this.#current = undefined;
+		ended.controller.abort(new StaleTranscriptError());
+		this.#onEnd();
 	}
 
 	/** The replacement settled: start a new epoch unless one is current (never revives an ended one). */
@@ -54,10 +64,9 @@ export class InboxEpochs {
 		this.#current ??= { id: this.#nextId++, controller: new AbortController() };
 	}
 
-	/** Bind `messages` (one queued batch) to `signal`; `onAbort` runs when it aborts. */
-	bindQueued(messages: readonly object[], signal: AbortSignal, onAbort: () => void): void {
+	/** Bind `messages` (one queued batch) to `signal`, its epoch's: once that ends, {@link isLive} is false for them. */
+	bindQueued(messages: readonly object[], signal: AbortSignal): void {
 		for (const message of messages) this.#boundMessages.set(message, signal);
-		signal.addEventListener("abort", onAbort, { once: true });
 	}
 
 	/** Whether a queued `message` may still be delivered: unbound, or its transcript was not replaced. */

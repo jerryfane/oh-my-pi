@@ -471,6 +471,11 @@ export interface ExecutorOptions {
 	topicBoard?: string;
 	/** Called once the child session admits the first prompt (see {@link PromptOptions.onPromptAdmitted}). */
 	onFirstPromptAdmitted?: () => void;
+	/**
+	 * The parent transcript this launch is bound to (its epoch signal): until the child admits its first prompt,
+	 * its abort cancels the run, and nothing of the launch (`session_init`, the prompt) is saved or sent after it.
+	 */
+	launchSignal?: AbortSignal;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -2696,9 +2701,12 @@ async function driveSessionToResult(
 		topicBoard?: string;
 		/** Called once the session admits the initial prompt. */
 		onFirstPromptAdmitted?: () => void;
+		/** The initial prompt's transcript signal (see {@link PromptOptions.transcriptSignal}). */
+		launchSignal?: AbortSignal;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted } = options;
+	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted, launchSignal } =
+		options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2814,7 +2822,13 @@ async function driveSessionToResult(
 					else
 						await dispatchPrompt(
 							task,
-							{ attribution: "agent", solutionSpace, topicBoard, onPromptAdmitted: onFirstPromptAdmitted },
+							{
+								attribution: "agent",
+								solutionSpace,
+								topicBoard,
+								onPromptAdmitted: onFirstPromptAdmitted,
+								transcriptSignal: launchSignal,
+							},
 							"initial prompt",
 						);
 					return;
@@ -4686,7 +4700,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 	let firstChatDispatchAt: number | undefined;
 
 	// Check if already aborted
-	if (signal?.aborted) {
+	if (signal?.aborted || options.launchSignal?.aborted) {
 		return {
 			index,
 			id,
@@ -4839,6 +4853,12 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		softRequestBudgetNotice,
 		maxRuntimeMs,
 		completionProbe,
+	});
+	// Bound to the parent's transcript until the child admits its first prompt: its replacement cancels the launch.
+	const launchBound = new AbortController();
+	options.launchSignal?.addEventListener("abort", () => monitor.requestAbort("signal"), {
+		once: true,
+		signal: launchBound.signal,
 	});
 	const progress = monitor.progress;
 	let unsubscribe: (() => void) | null = null;
@@ -5456,6 +5476,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					? enabledSubagentTools.filter(name => name !== "write")
 					: enabledSubagentTools;
 
+			checkAbort();
 			session.sessionManager.appendSessionInit({
 				// Blocks as sent; the session appends a newer session_init whenever a model call's base changes.
 				systemPrompt: session.agent.state.systemPrompt,
@@ -5556,7 +5577,11 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
 				topicBoard: options.topicBoard,
-				onFirstPromptAdmitted: options.onFirstPromptAdmitted,
+				onFirstPromptAdmitted: () => {
+					launchBound.abort();
+					options.onFirstPromptAdmitted?.();
+				},
+				launchSignal: options.launchSignal,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
@@ -5759,6 +5784,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 		AgentRegistry.global().setHistory(id, { outputPath: result.outputPath });
 		return result;
 	} finally {
+		launchBound.abort();
 		// The result is published: messages held during the run get their own
 		// turns, unless the caller still has work to finish first.
 		if (releaseIrcWakes && options.deferIrcWakeRelease) options.deferIrcWakeRelease(releaseIrcWakes);
