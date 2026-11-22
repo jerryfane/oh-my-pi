@@ -879,11 +879,11 @@ export class VibeSessionRegistry {
 
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
-	 * `seed` is awaited before that turn starts and put ahead of `prompt`; a rejected seed fails that turn.
+	 * `seed` is started inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn.
 	 */
 	async spawn(
 		session: ToolSession,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: Promise<string> },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: () => Promise<string> },
 	): Promise<VibeSpawnOutcome> {
 		const scope = this.ownerScope(session);
 		return this.#withTerminationLock(scope, () => this.#spawnLocked(session, scope, args));
@@ -892,7 +892,7 @@ export class VibeSessionRegistry {
 	async #spawnLocked(
 		session: ToolSession,
 		scope: VibeOwnerScope,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: Promise<string> },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: () => Promise<string> },
 	): Promise<VibeSpawnOutcome> {
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
@@ -1581,7 +1581,7 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManagerApi,
 		record: VibeRecord,
 		message: string,
-		options: { first: boolean; batch?: readonly QueuedMessage[]; seed?: Promise<string> },
+		options: { first: boolean; batch?: readonly QueuedMessage[]; seed?: () => Promise<string> },
 	): string {
 		const turnIndex = record.turnCount + 1;
 		const starters = (options.batch ?? []).filter(entry => entry.from !== undefined && !entry.note);
@@ -1620,8 +1620,8 @@ export class VibeSessionRegistry {
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
 			async ({ jobId: ownJobId, signal }) => {
 				try {
-					// Inside the failure boundary: a seed that fails settles the worker like a failed turn.
-					const seed = await options.seed;
+					// Started here, inside the failure boundary: a seed that fails settles the worker like a failed turn.
+					const seed = await options.seed?.();
 					record.state = "running";
 					record.turnCount = turnIndex;
 					record.lastActivityAt = Date.now();

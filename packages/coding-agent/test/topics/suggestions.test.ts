@@ -37,7 +37,8 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
-import { InboxChangedError, type InboxMessage, type TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
+import { InboxBinding } from "@oh-my-pi/pi-coding-agent/topics/binding";
+import type { InboxMessage, TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
 	foldSuggestions,
@@ -83,6 +84,13 @@ async function codeOf(run: () => unknown): Promise<string | undefined> {
 	throw new Error("expected a refusal");
 }
 
+/** One macrotask turn: rejections still unowned after it are reported as unhandled. */
+function macrotask(): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	setImmediate(resolve);
+	return promise;
+}
+
 describe("topic suggestions", () => {
 	let tempDir: TempDir;
 	let manager: AsyncJobManager;
@@ -94,8 +102,16 @@ describe("topic suggestions", () => {
 	let turnPending: boolean;
 	/** The open Inbox session. */
 	let inboxSm: SessionManager;
+	/** Counts the sessions the Inbox adopted, as the real Inbox does: a reopened session is a new transcript. */
+	let inboxEpoch: number;
 	/** Awaited by every state write before it saves; a rejection fails the write. */
 	let stateWrite: (() => Promise<void>) | undefined;
+
+	/** Open `next` in the Inbox: a `/new`, a fork, or a reopen of an earlier session. */
+	function switchInbox(next: SessionManager): void {
+		inboxSm = next;
+		inboxEpoch++;
+	}
 
 	function parent(): ToolSession {
 		return {
@@ -117,22 +133,37 @@ describe("topic suggestions", () => {
 	 * a state write awaits `stateWrite` first and, like the real one, adds nothing when it fails.
 	 */
 	function inbox(): TopicsInbox {
+		const identity = () => ({
+			sessionId: inboxSm.getSessionId(),
+			sessionFile: inboxSm.getSessionFile(),
+			sessionEpoch: inboxEpoch,
+			transcriptEpoch: 0,
+		});
 		return {
-			sessionId: () => inboxSm.getSessionId(),
-			branch: () => inboxSm.getBranch(),
-			entries: () => inboxSm.getEntriesView(),
-			appendState: async (sessionId, customType, data) => {
-				if (inboxSm.getSessionId() !== sessionId) throw new InboxChangedError();
+			bind: () => new InboxBinding(identity),
+			branch: binding => {
+				binding.assertCurrent();
+				return inboxSm.getBranch();
+			},
+			entries: binding => {
+				binding.assertCurrent();
+				return inboxSm.getEntriesView();
+			},
+			appendState: async (binding, customType, data, check) => {
+				binding.assertCurrent();
 				await stateWrite?.();
+				binding.assertCurrent();
+				check?.();
 				inboxSm.appendCustomEntry(customType, data);
 			},
-			appendNote: async (sessionId, { customType, content, details }) => {
-				if (inboxSm.getSessionId() !== sessionId) return false;
+			appendNote: async (binding, { customType, content, details }) => {
+				if (!binding.isCurrent) return false;
 				inboxSm.appendCustomMessageEntry(customType, content, true, details, "agent");
 				return true;
 			},
-			queueTurn: async message => {
-				queuedTurns.push(message);
+			queueTurn: async (binding, _customType, render) => {
+				binding.assertCurrent();
+				queuedTurns.push(render());
 				turnPending = true;
 				return { queued: false };
 			},
@@ -203,6 +234,7 @@ describe("topic suggestions", () => {
 		manager = new AsyncJobManager({});
 		sm = SessionManager.create(tempDir.path(), tempDir.path());
 		inboxSm = sm;
+		inboxEpoch = 0;
 		stateWrite = undefined;
 		user("hello");
 		await sm.ensureOnDisk();
@@ -591,7 +623,7 @@ describe("topic suggestions", () => {
 		// `/new` lands while the topic is being started.
 		vi.spyOn(registry, "spawn").mockImplementation(async (...args) => {
 			const spawned = await spawn(...args);
-			inboxSm = next;
+			switchInbox(next);
 			return spawned;
 		});
 
@@ -610,20 +642,91 @@ describe("topic suggestions", () => {
 		expect(changes.some(change => change.reason === "suggestion-accepted")).toBe(false);
 	});
 
-	it("settles a topic whose seed fails instead of leaving it starting", async () => {
-		const registry = topicsRegistry();
-		const { id, jobId } = await registry.spawn(parent(), {
-			cli: "good",
-			name: "Seedless",
-			prompt: "go",
-			title: "Seedless",
-			seed: Promise.reject(new Error("seed failed")),
-		});
-		await manager.getJob(jobId)?.promise.catch(() => {});
-		const topic = registry.describe(parent()).find(entry => entry.id === id);
-		expect(topic?.state).not.toBe("starting");
-		expect(topic?.turnStartedAt).toBeUndefined();
-		expect(firstTurns).toEqual([]);
+	it("settles a topic whose seed fails, never leaving the rejection unhandled, even while the spawn write waits", async () => {
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => unhandled.push(reason);
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			const registry = topicsRegistry();
+			// The parent write of the spawn waits; the seed fails meanwhile.
+			const write = Promise.withResolvers<void>();
+			const ensureOnDisk = sm.ensureOnDisk.bind(sm);
+			vi.spyOn(sm, "ensureOnDisk").mockImplementation(async () => {
+				await write.promise;
+				await ensureOnDisk();
+			});
+			const seed = vi.fn(() => Promise.reject(new Error("seed failed")));
+			const spawning = registry.spawn(parent(), { cli: "good", name: "Seedless", prompt: "go", title: "Seedless", seed });
+			// Two macrotask turns: anything rejected and unowned by now is reported as unhandled.
+			await macrotask();
+			await macrotask();
+			expect(seed).not.toHaveBeenCalled();
+			write.resolve();
+			const { id, jobId } = await spawning;
+			await manager.getJob(jobId)?.promise.catch(() => {});
+			await macrotask();
+			const topic = registry.describe(parent()).find(entry => entry.id === id);
+			expect(seed).toHaveBeenCalledTimes(1);
+			expect(topic?.state).not.toBe("starting");
+			expect(topic?.turnStartedAt).toBeUndefined();
+			expect(firstTurns).toEqual([]);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
+	});
+
+	/** A fork of `sm`: a new session holding a copy of its suggestion entries. */
+	function forkOfInbox(): SessionManager {
+		const fork = SessionManager.create(tempDir.path(), tempDir.path());
+		for (const entry of sm.getEntries()) {
+			if (entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE) {
+				fork.appendCustomMessageEntry(entry.customType, entry.content, true, entry.details, "agent");
+			}
+		}
+		return fork;
+	}
+
+	function acceptedStates(journal: SessionManager): unknown[] {
+		return journal
+			.getEntries()
+			.filter(entry => entry.type === "custom" && entry.customType === TOPIC_SUGGESTION_STATE_TYPE);
+	}
+
+	it("refuses a retried accept in a fork after the accepted state failed to save, writing nothing there", async () => {
+		const host = hostWith();
+		const ask = user("Plan the offsite");
+		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
+		stateWrite = () => Promise.reject(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
+		await expect(host.acceptSuggestion({ suggestionId: id, by: "owner" })).rejects.toThrow("ENOSPC");
+		expect(acceptedStates(sm)).toEqual([]);
+
+		stateWrite = undefined;
+		const fork = forkOfInbox();
+		switchInbox(fork);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
+		expect(acceptedStates(fork)).toEqual([]);
+		expect(acceptedStates(sm)).toEqual([]);
+	});
+
+	it("refuses a retried accept after /new and a reopen of the original Inbox: no false success", async () => {
+		const host = hostWith();
+		const ask = user("Book the venue");
+		const { id } = host.suggest({ title: "Venue", reason: "r", messageIds: [ask] });
+		const write = Promise.withResolvers<void>();
+		stateWrite = () => write.promise;
+		const accepting = host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await Bun.sleep(0);
+		// `/new` completes while the accepted state is being saved, then the original Inbox is reopened.
+		switchInbox(SessionManager.create(tempDir.path(), tempDir.path()));
+		write.resolve();
+		expect(await codeOf(() => accepting)).toBe("suggestion_not_found");
+		stateWrite = undefined;
+		switchInbox(sm);
+
+		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
+		expect(acceptedStates(sm)).toEqual([]);
 	});
 
 	it("queues one Organise turn naming the Inbox messages, and refuses another while it is pending", async () => {

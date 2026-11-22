@@ -636,6 +636,14 @@ const cfgWorkspacePromptInputs = combine({
 	autoqaConsent: cfgDevAutoqaConsent,
 });
 
+/**
+ * Whether the transcript saves `message` (custom/hook rows): one-run instructions never return from persisted
+ * history, so prewalk nudges (consumed once) and Vibe context (rebuilt only while active) are not saved.
+ */
+function isJournaledCustomMessage(message: AgentMessage): boolean {
+	return !isPrewalkPlanNudge(message) && !(message.role === "custom" && message.customType === VIBE_MODE_CONTEXT_MESSAGE_TYPE);
+}
+
 const PLAN_MODE_REMINDER_MAX = 3;
 const POST_PROMPT_DRAIN_TIMEOUT_MS = 5_000;
 const AGENT_START_POLICY_MAX_ATTEMPTS = 3;
@@ -1856,6 +1864,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async recordWithoutTurn(message: CustomMessage): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
+		// Decided at admission with the journal's own rule: a row it never saves would never settle.
+		if (!isJournaledCustomMessage(message)) {
+			throw new Error(`A "${message.customType}" message is never saved in the session, so it cannot be recorded.`);
+		}
 		const recorded = Promise.withResolvers<string>();
 		this.#recordedRowWaiters.set(message, recorded);
 		this.#pendingExcludedRows.push(message);
@@ -4764,9 +4776,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return;
 		}
 		if (message.role === "hookMessage" || message.role === "custom") {
-			// One-run instructions must not return from persisted history: prewalk
-			// nudges are consumed once, and Vibe context is rebuilt only while active.
-			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
+			// One-run instructions must not return from persisted history (see isJournaledCustomMessage).
+			if (isJournaledCustomMessage(message)) {
 				const entryId = this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
@@ -7364,7 +7375,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#dropPendingExcludedRows();
 		// Rows already handed to the event pipeline that its detached handlers will never save.
 		const disposed = new Error("The session was disposed before the row was recorded.");
-		for (const row of [...this.#recordedRowWaiters.keys()]) this.#settleRecordedRow(row, disposed);
+		for (const row of this.#recordedRowWaiters.keys()) this.#settleRecordedRow(row, disposed);
 		// beginDispose() drained the rest; this catches registrations made during teardown.
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];
