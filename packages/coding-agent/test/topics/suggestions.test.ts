@@ -205,7 +205,7 @@ describe("topic suggestions", () => {
 		const { task, launchPreamble } = await firstTurnOf(topicId);
 		expect(launchPreamble).toBeDefined();
 		expect(task).not.toContain("<inbox-history>");
-		return launchPreamble!;
+		return launchPreamble!.text;
 	}
 
 	/** The first turn of `topicId`, once it ran. */
@@ -436,8 +436,8 @@ describe("topic suggestions", () => {
 			messageIds: [ask, output],
 			summarize: async () => "unused",
 		});
-		expect(seed).toContain("what is in the file?");
-		expect(seed).not.toContain("TOOL-OUTPUT-BODY");
+		expect(seed.text).toContain("what is in the file?");
+		expect(seed.text).not.toContain("TOOL-OUTPUT-BODY");
 	});
 
 	it("starts the topic without the older messages when their summary fails", async () => {
@@ -768,13 +768,13 @@ describe("topic suggestions", () => {
 
 
 	it("leaves the suggestion open and links nothing when the first turn fails before dispatch, outside the seed (#12 review)", async () => {
-		// The spawn resolves the worker's model; building its first turn's options then fails, after the
-		// seed, before dispatch: the job records the failure and fulfils its promise.
+		// Sizing the seed and the spawn each resolve the worker's model; building its first turn's options then
+		// fails, after the seed, before dispatch: the job records the failure and fulfils its promise.
 		let modelReads = 0;
 		const failing = {
 			...parent(),
 			getActiveModelString: () => {
-				if (modelReads++ > 0) throw new Error("no active model");
+				if (modelReads++ > 1) throw new Error("no active model");
 				return undefined;
 			},
 		} as unknown as ToolSession;

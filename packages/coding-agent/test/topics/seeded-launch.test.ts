@@ -31,9 +31,13 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
+import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import { sessionInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
-import { TOPIC_CONTINUED_TYPE, TOPIC_SUGGESTION_STATE_TYPE } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
+import {
+	TOPIC_CONTINUED_TYPE,
+	TOPIC_START_FAILED_TYPE,
+	TOPIC_SUGGESTION_STATE_TYPE,
+} from "@oh-my-pi/pi-coding-agent/topics/suggestions";
 import { resetTopicsRegistryForTests } from "@oh-my-pi/pi-coding-agent/topics/workers";
 import { __resetDirsFromEnvForTests, removeWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
@@ -115,11 +119,16 @@ type Gate = "creation" | "credentials" | "judge";
 /**
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
  * `autoThinking`, the child's model reasons and its thinking level is `auto`: its first prompt is classified by
- * the judge role, a second mock model whose requests are recorded at the provider boundary.
+ * the judge role, a second mock model whose requests are recorded at the provider boundary. The main model (the
+ * Inbox's and the child's) has a `contextWindow`-token window (default 200,000).
  */
 async function openLaunch(
 	gate: Gate = "creation",
-	{ excerptText = EXCERPT, autoThinking = false }: { excerptText?: string; autoThinking?: boolean } = {},
+	{
+		excerptText = EXCERPT,
+		autoThinking = false,
+		contextWindow,
+	}: { excerptText?: string; autoThinking?: boolean; contextWindow?: number } = {},
 ): Promise<Launch> {
 	const cwd = path.join(root, "home", "work");
 	const authStorage = createInMemoryAuthStorage();
@@ -129,6 +138,7 @@ async function openLaunch(
 	const gated = Promise.withResolvers<void>();
 	const held = Promise.withResolvers<void>();
 	const mock = createMockModel({
+		contextWindow,
 		reasoning: autoThinking,
 		handler: context => {
 			requests.push(JSON.stringify(context.messages));
@@ -389,5 +399,114 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 			expect(await childFile(launch, id)).not.toContain(MARKER);
 			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
 		});
+	});
+});
+
+describe("a seed sized to the models the topic's child can use (#19 review)", () => {
+	/** One valid Inbox message, about 78k characters: far beyond the windows below. */
+	const BIG = `${EXCERPT} ${"the quarterly numbers look fine ".repeat(2_400)}`;
+
+	it("too large for the model, the seed is shortened: the topic starts, and only then is the suggestion accepted", async () => {
+		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 12_000 });
+		const isLinked = linked(launch);
+		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
+		const { topicId } = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+		await launch.gated;
+		launch.release();
+		await settled(launch, topicId);
+		await isLinked;
+
+		// The first request has the start of the message once, cut to fit, with a marker that says so.
+		const first = launch.requests[0]!;
+		expect(first.split(EXCERPT)).toHaveLength(2);
+		expect(first).toMatch(/\[truncated: \d+ characters\]/);
+		expect(first.length).toBeLessThan(BIG.length);
+		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toHaveLength(1);
+		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toHaveLength(1);
+		expect(rows(launch.manager, TOPIC_START_FAILED_TYPE)).toEqual([]);
+	});
+
+	it("a 4,000-token model only: the child cannot fit even the shortest seed; nothing is sent, the topic ends, the Inbox and the host are told once, the suggestion stays open", async () => {
+		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 4_000 });
+		const changes: TopicChange[] = [];
+		const reported = Promise.withResolvers<{ noted: number; live: boolean }>();
+		launch.host.onChange(change => {
+			changes.push(change);
+			if (change.reason !== "start-failed") return;
+			const topic = launch.host.list().find(entry => entry.id === change.id);
+			reported.resolve({
+				noted: rows(launch.manager, TOPIC_START_FAILED_TYPE).length,
+				live: topic !== undefined && topic.state !== "dead",
+			});
+		});
+		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
+		const accepted = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+		expect(accepted.alreadyAccepted).toBe(false);
+		await launch.gated;
+		launch.release();
+		await settled(launch, accepted.topicId);
+
+		// Sent once the topic ended and the note was written.
+		expect(await reported.promise).toEqual({ noted: 1, live: false });
+		const spawned = changes.find(change => change.id === accepted.topicId && change.reason === "spawned");
+		if (!spawned) throw new Error("expected the topic's spawn change");
+		const failures = changes.filter(change => change.reason === "start-failed");
+		expect(failures).toEqual([
+			{
+				id: accepted.topicId,
+				ownerId: spawned.ownerId,
+				parentSessionId: spawned.parentSessionId,
+				reason: "start-failed",
+				suggestionId: suggestion.id,
+				code: "seed_too_large",
+				tokens: expect.any(Number),
+				limit: expect.any(Number),
+			},
+		]);
+		const failure = failures[0] as { tokens: number; limit: number };
+		expect(failure.tokens).toBeGreaterThan(failure.limit);
+		expect(launch.requests).toEqual([]);
+		expect(await childFile(launch, accepted.topicId)).not.toContain(EXCERPT);
+		const [note] = rows(launch.manager, TOPIC_START_FAILED_TYPE) as Array<{ display: boolean; content: string }>;
+		expect(note).toMatchObject({
+			display: true,
+			content: `Topic "Diokan" could not start: the copied history is too large for the available models (${failure.tokens} tokens, limit ${failure.limit}). The suggestion is open again.`,
+			details: {
+				topicId: accepted.topicId,
+				title: "Diokan",
+				suggestionId: suggestion.id,
+				code: "seed_too_large",
+				tokens: failure.tokens,
+				limit: failure.limit,
+			},
+		});
+		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
+		expect(launch.host.suggestions().map(open => open.id)).toEqual([suggestion.id]);
+		// A repeat Accept starts a new topic: the first was never accepted.
+		const retry = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+		expect(retry.alreadyAccepted).toBe(false);
+		expect(retry.topicId).not.toBe(accepted.topicId);
+		await settled(launch, retry.topicId);
+	});
+
+	it("too large for every model even at its shortest: Accept and Create are refused at once (seed_too_large); nothing is saved or spawned", async () => {
+		const launch = await openLaunch("creation", { contextWindow: 80 });
+		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
+		const tooLarge = { code: "seed_too_large" };
+		for (let attempt = 0; attempt < 2; attempt++) {
+			const accepting = launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+			await expect(accepting).rejects.toMatchObject(tooLarge);
+		}
+		await expect(
+			launch.host.create({ title: "Deal", message: "go", seedMessageIds: [launch.excerpt] }),
+		).rejects.toMatchObject({ code: "seed_too_large" });
+
+		expect(launch.launched).toEqual([]);
+		expect(launch.host.list()).toEqual([]);
+		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
+		expect(rows(launch.manager, TOPIC_START_FAILED_TYPE)).toEqual([]);
+		expect(launch.host.suggestions().map(open => open.id)).toEqual([suggestion.id]);
 	});
 });

@@ -53,6 +53,7 @@ import type { SystemPromptSources } from "@oh-my-pi/pi-tui/status-line/context-u
 import type { ToolSession } from "../tools";
 import type { XdevState } from "../tools/xdev";
 import type { CodexAutoRedeemCoordinator } from "./codex-auto-reset";
+import type { TranscriptPreamble } from "./inbox-epoch";
 import type { SettingsGatedToolDelta, SystemPromptRebuilder } from "./session-tools";
 import type { AdvisorToolFactory } from "./session-advisors";
 import type { CostGateApi } from "./cost-gate";
@@ -521,9 +522,9 @@ export interface PromptOptions {
 	 * Text put ahead of a {@link transcriptSignal}-bound prompt, in the same message, only when it is admitted (its
 	 * last transcript check, right before dispatch). Nothing that runs before that sees it: command and template
 	 * expansion, mentions, keyword notices, preludes, file mentions, `before_agent_start` hooks, auto-thinking,
-	 * chillax, prewalk and auto-parallel all read the prompt without it.
+	 * chillax, prewalk and auto-parallel all read the prompt without it. Shortened to fit the request when needed.
 	 */
-	transcriptPreamble?: string;
+	transcriptPreamble?: TranscriptPreamble;
 	/**
 	 * Called synchronously when this prompt is pushed onto the steer or
 	 * follow-up queue, just before {@link onPromptAdmitted}, with the messages it

@@ -42,6 +42,7 @@ import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
+import type { TranscriptPreamble } from "../session/inbox-epoch";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
@@ -75,7 +76,7 @@ import type {
  */
 export interface VibeSeed {
 	signal: AbortSignal;
-	build(): Promise<string>;
+	build(): Promise<TranscriptPreamble>;
 	firstTurn(outcome: "admitted" | "refused"): void;
 }
 
@@ -425,6 +426,12 @@ export class VibeSessionRegistry {
 			released.resolve();
 			if (this.#terminationTails.get(key) === tail) this.#terminationTails.delete(key);
 		}
+	}
+
+	/** The model patterns a new `cli` worker of `session` starts on (as its spawn resolves them). */
+	workerModelPatterns(session: VibeParentSession, cli: VibeCli): string[] {
+		const { modelOverride } = this.#resolveWorker(session, cli);
+		return modelOverride === undefined ? [] : [modelOverride].flat();
 	}
 
 	#resolveWorker(session: VibeParentSession, cli: VibeCli): ResolvedVibeWorker {

@@ -4,7 +4,8 @@
  * chosen messages copied verbatim (user and assistant text only; tool calls and
  * results never), the older ones condensed into one summary by one small-model
  * call, and the suggestion's reason. A failed summary never stops the topic: the
- * older messages are cut and a line says how many.
+ * older messages are cut and a line says how many. A seed too large for the
+ * topic's first request is shortened to fit ({@link TopicSeed}).
  */
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
@@ -16,7 +17,7 @@ import { escapeHarnessTags } from "../session/harness-tags";
 import { journalCompletion } from "../session/model-usage-journal";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
-import { StaleTranscriptError, throwIfStale } from "../session/inbox-epoch";
+import { StaleTranscriptError, throwIfStale, type TranscriptPreamble } from "../session/inbox-epoch";
 import { messageText } from "./suggestions";
 
 /** Chosen messages copied verbatim; older ones are summarised. */
@@ -40,6 +41,8 @@ export type SeedSummarizer = (transcript: string, origin: SeedOrigin) => Promise
 interface SeedMessage {
 	role: "user" | "assistant";
 	text: string;
+	/** Characters cut from the end of the message's text so the seed fits its request. */
+	cut?: number;
 }
 
 /** `<` of a tag of the seed's own block (`inbox-history`, `message`), opening or closing. */
@@ -55,20 +58,25 @@ function seedText(text: string): string {
 
 function transcriptOf(messages: readonly SeedMessage[]): string {
 	return messages
-		.map(message => `<message role="${message.role}">\n${seedText(message.text)}\n</message>`)
+		.map(message => {
+			const cut = message.cut ? `${message.text ? "\n" : ""}[truncated: ${message.cut} characters]` : "";
+			return `<message role="${message.role}">\n${seedText(message.text)}${cut}\n</message>`;
+		})
 		.join("\n\n");
 }
 
-/**
- * The seed text for the messages `messageIds` names in `entries` (file order;
- * ids that name no user or assistant text message are skipped).
- */
-export async function buildTopicSeed(args: {
+/** The chosen messages of a seed, file order: `older` ones are summarised, `recent` ones copied verbatim. */
+interface SeedSelection {
+	reason: string;
+	older: SeedMessage[];
+	recent: SeedMessage[];
+}
+
+function selectSeed(args: {
 	entries: readonly SessionEntry[];
 	messageIds: readonly string[];
 	reason?: string;
-	summarize: (transcript: string) => Promise<string | undefined>;
-}): Promise<string> {
+}): SeedSelection {
 	const wanted = new Set(args.messageIds);
 	const messages: SeedMessage[] = [];
 	for (const entry of args.entries) {
@@ -77,27 +85,148 @@ export async function buildTopicSeed(args: {
 		if (message) messages.push(message);
 	}
 	const older = messages.slice(0, Math.max(0, messages.length - SEED_VERBATIM_MESSAGES));
-	const recent = messages.slice(older.length);
+	return { reason: args.reason?.trim() ?? "", older, recent: messages.slice(older.length) };
+}
+
+/** What one form of a seed holds, and what it leaves out. */
+interface SeedForm {
+	summary?: string;
+	/** Older messages whose summary failed. */
+	unsummarised: number;
+	/** Messages left out so the seed fits its request (oldest first; the older ones with a dropped summary). */
+	omitted: number;
+	recent: SeedMessage[];
+}
+
+function renderSeed(selection: SeedSelection, form: SeedForm): string {
+	const header = prompt
+		.render(seedTemplate, {
+			reason: selection.reason ? seedText(selection.reason) : "",
+			summary: form.summary ? seedText(form.summary) : "",
+			older: selection.older.length,
+			unsummarised: form.unsummarised,
+			omitted: form.omitted,
+		})
+		.trim();
+	const transcript = transcriptOf(form.recent);
+	return `<inbox-history>\n${header}${transcript ? `\n\n${transcript}` : ""}\n</inbox-history>`;
+}
+
+/**
+ * The shortest form of a seed: the summary dropped, every message left out but the newest, and its text cut
+ * entirely (`summarised`: whether the full seed has a summary).
+ */
+function shortestForm(selection: SeedSelection, unsummarised: number, summarised: boolean): SeedForm {
+	const newest = selection.recent.at(-1);
+	return {
+		unsummarised,
+		omitted: Math.max(0, selection.recent.length - 1) + (summarised ? selection.older.length : 0),
+		recent: newest ? [{ ...newest, text: "", cut: newest.text.length }] : [],
+	};
+}
+
+/**
+ * The shortest seed a topic can start with from the messages `messageIds` names in `entries`: what the first
+ * request needs at least, before any summary is made.
+ */
+export function shortestTopicSeed(args: {
+	entries: readonly SessionEntry[];
+	messageIds: readonly string[];
+	reason?: string;
+}): string {
+	const selection = selectSeed(args);
+	return renderSeed(selection, shortestForm(selection, 0, selection.older.length > 0));
+}
+
+/** A form's text and size, as a request counts it. */
+interface Measured {
+	text: string;
+	tokens: number;
+}
+
+/**
+ * A topic's seed: its full text, and shorter forms for a request it does not fit. Shortening leaves out the
+ * oldest verbatim messages first (the newest stays), then the summary of the older ones, then cuts the newest
+ * message's text; a line says how many messages were left out and the cut says how many characters.
+ */
+export class TopicSeed implements TranscriptPreamble {
+	readonly text: string;
+	/** Set when the topic's first prompt was refused for size: that request with the shortest seed, and its limit. */
+	refusal: { tokens: number; limit: number } | undefined;
+	readonly #selection: SeedSelection;
+	readonly #full: SeedForm;
+
+	constructor(selection: SeedSelection, summary: string | undefined) {
+		this.#selection = selection;
+		const unsummarised = selection.older.length > 0 && !summary ? selection.older.length : 0;
+		this.#full = { summary, unsummarised, omitted: 0, recent: selection.recent };
+		this.text = renderSeed(selection, this.#full);
+	}
+
+	fit(maxTokens: number, count: (text: string) => number): { text: string; tokens: number } {
+		const measure = (form: SeedForm): Measured => {
+			const text = renderSeed(this.#selection, form);
+			return { text, tokens: count(text) };
+		};
+		/** The first of `forms(lo..hi)` (each shorter than the one before) that fits, by bisection. */
+		const firstFitting = (lo: number, hi: number, form: (index: number) => SeedForm): Measured | undefined => {
+			let found: Measured | undefined;
+			while (lo <= hi) {
+				const mid = Math.floor((lo + hi) / 2);
+				const measured = measure(form(mid));
+				if (measured.tokens <= maxTokens) {
+					found = measured;
+					hi = mid - 1;
+				} else {
+					lo = mid + 1;
+				}
+			}
+			return found;
+		};
+		const full = this.#full;
+		const recent = full.recent;
+		const last = Math.max(0, recent.length - 1);
+		const kept = firstFitting(0, last, left => ({ ...full, omitted: left, recent: recent.slice(left) }));
+		if (kept) return kept;
+		const shortest = shortestForm(this.#selection, full.unsummarised, full.summary !== undefined);
+		const newest = recent.at(-1);
+		const withoutSummary: SeedForm = { ...shortest, recent: newest ? [newest] : [] };
+		const length = newest?.text.length ?? 0;
+		const cut = firstFitting(0, length, cut => ({
+			...withoutSummary,
+			recent: newest ? [{ ...newest, text: newest.text.slice(0, length - cut), cut }] : [],
+		}));
+		return cut ?? measure(shortest);
+	}
+
+	refused(tokens: number, limit: number): void {
+		this.refusal = { tokens, limit };
+	}
+}
+
+/**
+ * The seed for the messages `messageIds` names in `entries` (file order;
+ * ids that name no user or assistant text message are skipped).
+ */
+export async function buildTopicSeed(args: {
+	entries: readonly SessionEntry[];
+	messageIds: readonly string[];
+	reason?: string;
+	summarize: (transcript: string) => Promise<string | undefined>;
+}): Promise<TopicSeed> {
+	const selection = selectSeed(args);
 	let summary: string | undefined;
-	if (older.length > 0) {
+	if (selection.older.length > 0) {
 		try {
-			summary = (await args.summarize(transcriptOf(older).slice(-SUMMARY_INPUT_MAX_CHARS)))?.trim() || undefined;
+			summary =
+				(await args.summarize(transcriptOf(selection.older).slice(-SUMMARY_INPUT_MAX_CHARS)))?.trim() || undefined;
 		} catch (error) {
 			// A replaced transcript cancels the seed; it is not a failed summary to fall back from.
 			if (error instanceof StaleTranscriptError) throw error;
 			logger.warn("topics: seed summary failed", { error: error instanceof Error ? error.message : String(error) });
 		}
 	}
-	const header = prompt
-		.render(seedTemplate, {
-			reason: args.reason?.trim() ? seedText(args.reason.trim()) : "",
-			summary: summary ? seedText(summary) : "",
-			older: older.length,
-			unsummarised: older.length > 0 && !summary ? older.length : 0,
-		})
-		.trim();
-	const transcript = transcriptOf(recent);
-	return `<inbox-history>\n${header}${transcript ? `\n\n${transcript}` : ""}\n</inbox-history>`;
+	return new TopicSeed(selection, summary);
 }
 
 /**

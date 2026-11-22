@@ -8,6 +8,7 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
+import { computeNonMessageTokens } from "@oh-my-pi/pi-tui/status-line/context-usage";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import { type InboxEpoch, StaleTranscriptError } from "../session/inbox-epoch";
@@ -56,6 +57,8 @@ export interface TopicsInbox {
 	): Promise<{ queued: boolean }>;
 	/** Whether the turn {@link queueTurn} queued for `customType` is still waiting, queued or running. */
 	turnPending(customType: string): boolean;
+	/** Tokens a request of the Inbox spends on its system prompt and tools (none known: 0). */
+	requestOverheadTokens?(): number;
 }
 
 /** The entries after the latest reset boundary of `branch` (all of it when there is none). */
@@ -83,6 +86,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 		capture: () => session.captureInboxEpoch(),
 		branch: () => afterLatestReset(manager.getBranch()),
 		entries: () => manager.getEntriesView(),
+		requestOverheadTokens: () => computeNonMessageTokens(session, session.agent.tokenizer, session.settings.revision),
 		async appendState(epoch, customType, data) {
 			await session.appendEntriesAtomically(() => {
 				manager.appendCustomEntry(customType, data);

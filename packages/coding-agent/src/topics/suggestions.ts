@@ -18,6 +18,8 @@ export const TOPIC_SUGGESTION_TYPE = "topic-suggestion";
 export const TOPIC_SUGGESTION_STATE_TYPE = "topic-suggestion-state";
 /** `customType` of the visible "Continued in topic" note (`details` = {@link TopicContinuedDetails}). */
 export const TOPIC_CONTINUED_TYPE = "topic-continued";
+/** `customType` of the visible note that a seeded topic could not start (`details` = {@link TopicStartFailedDetails}). */
+export const TOPIC_START_FAILED_TYPE = "topic-start-failed";
 /** `customType` of the hidden Organise instruction that starts one Inbox turn. */
 export const TOPIC_ORGANISE_TYPE = "topic-organise";
 
@@ -27,7 +29,8 @@ export type TopicsErrorCode =
 	| "already_accepted"
 	| "invalid_message_ids"
 	| "organise_running"
-	| "topics_disabled";
+	| "topics_disabled"
+	| "seed_too_large";
 
 /** A refusal with a {@link TopicsErrorCode}; the message stays the human-readable `error`. */
 export class TopicsError extends Error {
@@ -70,6 +73,20 @@ export interface TopicContinuedDetails {
 	title: string;
 	suggestionId: string | null;
 	messageIds: string[];
+}
+
+/**
+ * `details` of a {@link TOPIC_START_FAILED_TYPE} note: a seeded topic that could not start, because even its
+ * shortest seed left its first request (`tokens`) over its model's limit (`limit`). The topic was ended; an
+ * accepted suggestion (`suggestionId`) stays open.
+ */
+export interface TopicStartFailedDetails {
+	topicId: string;
+	title: string;
+	suggestionId: string | null;
+	code: "seed_too_large";
+	tokens: number;
+	limit: number;
 }
 
 /** A suggestion with its latest state. */
