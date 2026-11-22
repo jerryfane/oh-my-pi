@@ -334,6 +334,19 @@ export interface TopicsControlBus {
 	on(channel: string, handler: (data: unknown) => void): () => void;
 }
 
+/** Run every step in order, even after one throws; then rethrow the first failure. */
+function runEach(steps: ReadonlyArray<() => void>): void {
+	const failures: unknown[] = [];
+	for (const step of steps) {
+		try {
+			step();
+		} catch (error) {
+			failures.push(error);
+		}
+	}
+	if (failures.length > 0) throw failures[0];
+}
+
 /** Set only by {@link offerTopicsControl}; nothing on the event bus can change it. */
 let currentEndpoint: TopicsControlEndpoint | undefined;
 
@@ -429,13 +442,17 @@ export async function offerTopicsControl(
 			const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
 			// Replaced once subscribed; until then `stop` (as rollback) has nothing to unsubscribe.
 			let unsubscribe = (): void => {};
-			stop = () => {
-				unsubscribe();
-				stopSocket();
-				if (currentEndpoint === endpoint) currentEndpoint = undefined;
-				bus.emit(TOPICS_CONTROL_CHANNEL, changed);
-				fs.rmSync(ownedDir, { recursive: true, force: true });
-			};
+			// Every step runs even when an earlier one throws (a bus callback): the first failure is rethrown after.
+			stop = () =>
+				runEach([
+					() => unsubscribe(),
+					stopSocket,
+					() => {
+						if (currentEndpoint === endpoint) currentEndpoint = undefined;
+					},
+					() => bus.emit(TOPICS_CONTROL_CHANNEL, changed),
+					() => fs.rmSync(ownedDir, { recursive: true, force: true }),
+				]);
 			currentEndpoint = endpoint;
 			unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, changed));
 			bus.emit(TOPICS_CONTROL_CHANNEL, changed);
