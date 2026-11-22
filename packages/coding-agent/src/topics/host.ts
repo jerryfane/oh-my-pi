@@ -86,7 +86,7 @@ export interface TopicsHost {
 	suggest(args: { title: string; reason: string; messageIds: string[] }): TopicSuggestion;
 	/** Start the suggested topic, seeded with all of the suggestion's messages; returns before the seed is ready. */
 	acceptSuggestion(args: { suggestionId: string; by: string }): Promise<{ topicId: string; alreadyAccepted: boolean }>;
-	dismissSuggestion(args: { suggestionId: string; by: string }): { alreadyDismissed: boolean };
+	dismissSuggestion(args: { suggestionId: string; by: string }): Promise<{ alreadyDismissed: boolean }>;
 	/** Queue one Inbox turn that reviews the history and suggests topics. */
 	organise(args: { by: string }): { queued: boolean };
 	/** Restore persisted topics of the current session (startup, session switch). */
@@ -130,16 +130,21 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	const unsaved: Array<{ sessionId: string; suggestion: TopicSuggestion }> = [];
 	/** Accepts whose topic is being created, by suggestion id. */
 	const accepting = new Map<string, Promise<string>>();
+	/** Suggestions whose entry did not reach the session file: an in-memory copy may exist, a reload drops it. */
+	const lost = new Set<string>();
 
 	const folded = (box: TopicsInbox) => {
 		const sessionId = box.sessionId();
-		return foldSuggestions(
+		const all = foldSuggestions(
 			box.entries(),
 			unsaved.filter(entry => entry.sessionId === sessionId).map(entry => entry.suggestion),
 		);
+		for (const id of lost) all.delete(id);
+		return all;
 	};
-	const appendState = (box: TopicsInbox, data: TopicSuggestionStateData): void => {
-		box.appendState(TOPIC_SUGGESTION_STATE_TYPE, data);
+	/** Save a state change, then announce it; a failed write rejects and announces nothing. */
+	const appendState = async (box: TopicsInbox, data: TopicSuggestionStateData): Promise<void> => {
+		await box.appendState(TOPIC_SUGGESTION_STATE_TYPE, data);
 		emitSuggestion(data.id, data.state === "accepted" ? "suggestion-accepted" : "suggestion-dismissed");
 	};
 
@@ -270,8 +275,10 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 					details: suggestion,
 				})
 				.then(saved => {
+					// A suggestion that did not reach the session file is forgotten, never announced.
 					unsaved.splice(unsaved.indexOf(pending), 1);
 					if (saved) emitSuggestion(suggestion.id, "suggested");
+					else lost.add(suggestion.id);
 				});
 			return suggestion;
 		},
@@ -292,13 +299,13 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			accepting.set(suggestionId, started);
 			try {
 				const topicId = await started;
-				appendState(box, { id: suggestionId, state: "accepted", topicId, by, atMs: Date.now() });
+				await appendState(box, { id: suggestionId, state: "accepted", topicId, by, atMs: Date.now() });
 				return { topicId, alreadyAccepted: false };
 			} finally {
 				accepting.delete(suggestionId);
 			}
 		},
-		dismissSuggestion({ suggestionId, by }) {
+		async dismissSuggestion({ suggestionId, by }) {
 			const box = requireInbox(inbox);
 			const suggestion = folded(box).get(suggestionId);
 			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
@@ -306,7 +313,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				throw new TopicsError("already_accepted", `Suggestion ${suggestionId} was already accepted.`);
 			}
 			if (suggestion.state === "dismissed") return { alreadyDismissed: true };
-			appendState(box, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
+			await appendState(box, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
 			return { alreadyDismissed: false };
 		},
 		organise({ by }) {

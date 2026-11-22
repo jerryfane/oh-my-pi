@@ -1176,8 +1176,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Messages queued to be included with the next user prompt as context ("asides"). */
 	#pendingNextTurnMessages: CustomMessage[] = [];
-	/** Rows kept out of context that arrived while a run was live; drawn and saved once it ends or the next prompt starts. */
+	/**
+	 * Rows that arrived while a run was live, drawn and saved once it ends or the next prompt starts: rows kept
+	 * out of context, and {@link recordWithoutTurn}'s rows, which the model sees from its next turn on.
+	 */
 	#pendingExcludedRows: CustomMessage[] = [];
+	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
+	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<void>>();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -1791,7 +1796,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	/** Draw and save the rows kept out of context that a live run queued (see {@link #pendingExcludedRows}). */
+	/** Draw and save the rows a live run queued (see {@link #pendingExcludedRows}). */
 	#flushExcludedRows(): void {
 		if (this.#pendingExcludedRows.length === 0) return;
 		const connected = this.#unsubscribeAgent !== undefined;
@@ -1817,9 +1822,42 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				row.details,
 				row.attribution,
 				row.timestamp,
-				true,
+				row.excludeFromContext,
 			);
+			this.#settleRecordedRow(row);
 		}
+	}
+
+	/** Settle the {@link recordWithoutTurn} caller of `row`, if any: recorded, or dropped with `error`. */
+	#settleRecordedRow(row: AgentMessage, error?: Error): void {
+		const waiter = this.#recordedRowWaiters.get(row);
+		if (!waiter) return;
+		this.#recordedRowWaiters.delete(row);
+		if (error) waiter.reject(error);
+		else waiter.resolve();
+	}
+
+	/** Drop the queued rows with the transcript they were sent to (a transition, disposal). */
+	#dropPendingExcludedRows(): void {
+		const dropped = new Error("The session's transcript changed before the row was recorded.");
+		for (const row of this.#pendingExcludedRows.splice(0)) this.#settleRecordedRow(row, dropped);
+	}
+
+	/**
+	 * Record `message` in the transcript and the model's context without starting or interrupting a turn:
+	 * now while no run is live, else at the run's boundary (it ends, the next prompt starts, a transition
+	 * saves it), with the rows a live run keeps out of context. It is drawn and saved like any recorded
+	 * custom message, and never steers a turn. Resolves once the entry is on disk; rejects when the session
+	 * is disposed or a transition drops the row first, or when the session file cannot be written.
+	 */
+	async recordWithoutTurn(message: CustomMessage): Promise<void> {
+		if (this.#isDisposed) throw new Error("The session is disposed.");
+		const recorded = Promise.withResolvers<void>();
+		this.#recordedRowWaiters.set(message, recorded);
+		this.#pendingExcludedRows.push(message);
+		if (!this.isStreaming) this.#flushExcludedRows();
+		await recorded.promise;
+		await this.sessionManager.flush();
 	}
 
 	/** Re-validates a #sessionGeneration snapshot captured before an aside/SDK call's await.
@@ -4713,6 +4751,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
 				this.#ttsr.releaseDeferredReservationFromDetails(message.details);
 			}
+			this.#settleRecordedRow(message, new Error("The session's transcript changed before the row was recorded."));
 			return;
 		}
 		if (message.role === "hookMessage" || message.role === "custom") {
@@ -4735,6 +4774,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
 				this.#ttsr.markInjectedFromDetails(message.details);
 			}
+			this.#settleRecordedRow(message);
 			return;
 		}
 		// A refused turn stays out of the transcript (#persistSessionMessageIfMissing
@@ -7312,6 +7352,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// settles inside it still reaches subscribers (issue #18450); detach now
 		// so events past the deadline are neither forwarded nor persisted.
 		this.#disconnectFromAgent();
+		this.#dropPendingExcludedRows();
 		// beginDispose() drained the rest; this catches registrations made during teardown.
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];
@@ -7475,7 +7516,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// its record instead of landing here (mirrors newSession()).
 		this.#sessionGeneration++;
 		this.#pendingNextTurnMessages = [];
-		this.#pendingExcludedRows = [];
+		this.#dropPendingExcludedRows();
 		this.#experimentalContextNotesReminder = undefined;
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		// Reset the session_stop continuation chain: the queued continuation
@@ -12854,7 +12895,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#memory.rekeyForCurrentSessionId();
 			await this.#memory.resetContextForNewTranscript();
 			this.#pendingNextTurnMessages = [];
-			this.#pendingExcludedRows = [];
+			this.#dropPendingExcludedRows();
 			// The abort above may have skipped the loop's final aside poll (issue: stranded
 			// asides survive an aborted turn by design so a resumed session can still see
 			// them); discard here so they cannot leak into the new session's transcript via
@@ -14620,7 +14661,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
 		this.#sessionGenerationSettled = generationSettled.promise;
 		this.#pendingNextTurnMessages = [];
-		this.#pendingExcludedRows = [];
+		this.#dropPendingExcludedRows();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
@@ -15044,7 +15085,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		// Clear pending messages (bound to old session state)
 		this.#pendingNextTurnMessages = [];
-		this.#pendingExcludedRows = [];
+		this.#dropPendingExcludedRows();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#queuedMessageDrainBlocked = false;
 		this.#usagePreflightReadyForNextModelCall = false;
@@ -15172,7 +15213,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#assertIdleForSnapshot("branch /btw");
 
 		this.#pendingNextTurnMessages = [];
-		this.#pendingExcludedRows = [];
+		this.#dropPendingExcludedRows();
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#releaseQueuedTtsrReservations();
 		this.agent.replaceQueues([], []);

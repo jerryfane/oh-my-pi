@@ -11,7 +11,7 @@
  *   behind the running turn without interrupting it; a second Organise while
  *   one is queued or running is refused with `organise_running`.
  */
-import { afterEach, describe, expect, it } from "bun:test";
+import { afterEach, describe, expect, it, vi } from "bun:test";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Context, Message } from "@oh-my-pi/pi-ai";
@@ -199,11 +199,11 @@ describe("Inbox notes", () => {
 	function indexOf(manager: SessionManager, predicate: (entry: SessionEntry) => boolean): number {
 		return manager.getEntries().findIndex(predicate);
 	}
-	const isAnswer = (entry: SessionEntry): boolean =>
-		entry.type === "message" && entry.message.role === "assistant" && textOf(entry.message) === "the answer";
+	const isQuestion = (entry: SessionEntry): boolean =>
+		entry.type === "message" && entry.message.role === "user" && textOf(entry.message) === "a question";
 	const isNote = (entry: SessionEntry): boolean => entry.type === "custom_message" && entry.customType === "note-race";
 
-	it("holds a note appended while a turn is starting until that turn ends, and never steers it", async () => {
+	it("records a note appended while a turn is starting at that prompt's boundary, never as a steer", async () => {
 		const inbox = await openInbox(() => ({ content: ["the answer"] }));
 		const box = sessionInbox(inbox.session);
 		const turn = inbox.session.prompt("a question");
@@ -212,10 +212,91 @@ describe("Inbox notes", () => {
 		await turn;
 		await inbox.session.waitForIdle();
 
+		// One request, the note in it as history ahead of the question: a steer lands after the question.
 		expect(inbox.requests).toHaveLength(1);
-		expect(inbox.requests[0]!.map(textOf).join("\n")).not.toContain("NOTE-TEXT");
-		expect(indexOf(inbox.manager, isAnswer)).toBeGreaterThan(-1);
-		expect(indexOf(inbox.manager, isNote)).toBeGreaterThan(indexOf(inbox.manager, isAnswer));
+		const sent = inbox.requests[0]!.map(textOf).join("\n");
+		expect(sent.indexOf("NOTE-TEXT")).toBeGreaterThan(-1);
+		expect(sent.indexOf("NOTE-TEXT")).toBeLessThan(sent.indexOf("a question"));
+		expect(indexOf(inbox.manager, isNote)).toBeGreaterThan(-1);
+		expect(indexOf(inbox.manager, isNote)).toBeLessThan(indexOf(inbox.manager, isQuestion));
+	});
+
+	it("records a note queued behind a wake that fails before streaming at that failure", async () => {
+		const inbox = await openInbox(() => ({ content: ["unused"] }));
+		const box = sessionInbox(inbox.session);
+		const setup = Promise.withResolvers<void>();
+		const failWake = Promise.withResolvers<never>();
+		const prompt = vi.spyOn(inbox.session.agent, "prompt").mockImplementationOnce(() => {
+			setup.resolve();
+			return failWake.promise;
+		});
+		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
+		await setup.promise;
+		expect(inbox.session.isStreaming).toBe(true);
+		const saved = box.appendNote({ customType: "note-race", content: "NOTE-TEXT", details: {} });
+		failWake.reject(new Error("wake setup failed"));
+
+		expect(await saved).toBe(true);
+		expect(notesOf(inbox.manager, "note-race")).toMatchObject([{ display: true, content: "NOTE-TEXT" }]);
+		prompt.mockRestore();
+	});
+
+	it("rejects a queued note when the session is disposed before its run settles", async () => {
+		const inbox = await openInbox(() => ({ content: ["unused"] }));
+		const box = sessionInbox(inbox.session);
+		const setup = Promise.withResolvers<void>();
+		// A wake whose setup never settles, not even on abort: the dispose drain gives up on it.
+		vi.spyOn(inbox.session.agent, "prompt").mockImplementationOnce(() => {
+			setup.resolve();
+			return new Promise<never>(() => {});
+		});
+		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
+		await setup.promise;
+		const saved = box.appendNote({ customType: "note-race", content: "NOTE-TEXT", details: {} });
+		await inbox.session.dispose({ drainTimeoutMs: 10 });
+		sessions.splice(sessions.indexOf(inbox.session), 1);
+
+		expect(await saved).toBe(false);
+		expect(notesOf(inbox.manager, "note-race")).toEqual([]);
+	});
+
+	it("publishes a note recorded while idle as message_start and message_end", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }));
+		const events: string[] = [];
+		inbox.session.subscribe(event => {
+			if ((event.type === "message_start" || event.type === "message_end") && event.message.role === "custom") {
+				events.push(`${event.type}:${event.message.customType}`);
+			}
+		});
+		expect(await sessionInbox(inbox.session).appendNote({ customType: "note-live", content: "x", details: {} })).toBe(
+			true,
+		);
+		expect(events).toEqual(["message_start:note-live", "message_end:note-live"]);
+	});
+
+	it("fails the note and never announces the suggestion when the session file cannot be written", async () => {
+		let ask = "";
+		const inbox = await openInbox(
+			() => ({ content: ["ok"] }),
+			manager => {
+				ask = manager.appendMessage({ role: "user", content: "Let's plan the offsite", timestamp: 1 });
+			},
+		);
+		// What a latched disk failure does: every later flush rethrows it.
+		vi.spyOn(inbox.manager, "flush").mockRejectedValue(new Error("disk full"));
+		const record = vi.spyOn(inbox.session, "recordWithoutTurn");
+		const changes: string[] = [];
+		inbox.host.onChange(change => changes.push(change.reason));
+
+		expect(await sessionInbox(inbox.session).appendNote({ customType: "note-fail", content: "x", details: {} })).toBe(
+			false,
+		);
+		const suggestion = inbox.host.suggest({ title: "Offsite", reason: "Its own project.", messageIds: [ask] });
+		await expect(record.mock.results[1]!.value).rejects.toThrow("disk full");
+		// The host settles the suggestion in the continuation of that rejected write.
+		await Bun.sleep(0);
+		expect(changes).not.toContain("suggested");
+		expect(inbox.host.suggestions().map(open => open.id)).not.toContain(suggestion.id);
 	});
 });
 

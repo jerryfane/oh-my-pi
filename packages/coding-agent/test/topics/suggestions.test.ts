@@ -114,7 +114,7 @@ describe("topic suggestions", () => {
 			sessionId: () => sm.getSessionId(),
 			branch: () => sm.getBranch(),
 			entries: () => sm.getEntriesView(),
-			appendState: (customType, data) => {
+			appendState: async (customType, data) => {
 				sm.appendCustomEntry(customType, data);
 			},
 			appendNote: async ({ customType, content, details }) => {
@@ -277,8 +277,8 @@ describe("topic suggestions", () => {
 		const { id } = host.suggest({ title: "Offsite", reason: "Its own project.", messageIds: [ask] });
 		await Bun.sleep(0);
 
-		expect(host.dismissSuggestion({ suggestionId: id, by: "owner" })).toEqual({ alreadyDismissed: false });
-		expect(host.dismissSuggestion({ suggestionId: id, by: "owner" })).toEqual({ alreadyDismissed: true });
+		expect(await host.dismissSuggestion({ suggestionId: id, by: "owner" })).toEqual({ alreadyDismissed: false });
+		expect(await host.dismissSuggestion({ suggestionId: id, by: "owner" })).toEqual({ alreadyDismissed: true });
 		expect(host.suggestions()).toEqual([]);
 
 		const accepted = await host.acceptSuggestion({ suggestionId: id, by: "guest Anna" });
@@ -480,7 +480,7 @@ describe("topic suggestions", () => {
 		const open = host.suggest({ title: "Open one", reason: "r1", messageIds: [ask] });
 		const dismissed = host.suggest({ title: "Dismissed one", reason: "r2", messageIds: [ask] });
 		const accepted = host.suggest({ title: "Accepted one", reason: "r3", messageIds: [ask] });
-		host.dismissSuggestion({ suggestionId: dismissed.id, by: "owner" });
+		await host.dismissSuggestion({ suggestionId: dismissed.id, by: "owner" });
 		await host.acceptSuggestion({ suggestionId: accepted.id, by: "owner" });
 
 		expect(await runRpcTopicsCommand(host, { type: "topics_list" })).toEqual({
@@ -497,7 +497,7 @@ describe("topic suggestions", () => {
 		await host.acceptSuggestion({ suggestionId: accepted.id, by: "owner" });
 		for (let n = 1; n <= 12; n++) {
 			const { id } = host.suggest({ title: `Dropped ${n}`, reason: "r", messageIds: [ask] });
-			host.dismissSuggestion({ suggestionId: id, by: "owner" });
+			await host.dismissSuggestion({ suggestionId: id, by: "owner" });
 		}
 
 		const board = formatTopicBoard(host.list(), "inbox", host.suggestionBoard())!;
@@ -525,7 +525,7 @@ describe("topic suggestions", () => {
 		const first = host.suggest({ title: "One", reason: "r", messageIds: [ask] });
 		const second = host.suggest({ title: "Two", reason: "r", messageIds: [ask] });
 		await Bun.sleep(0);
-		host.dismissSuggestion({ suggestionId: second.id, by: "owner" });
+		await host.dismissSuggestion({ suggestionId: second.id, by: "owner" });
 		await host.acceptSuggestion({ suggestionId: first.id, by: "owner" });
 
 		const reasons = changes

@@ -5,7 +5,6 @@
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
-import type { CustomMessage } from "../session/messages";
 import type { SessionEntry } from "../session/session-entries";
 
 /** A custom message for the Inbox. */
@@ -22,13 +21,14 @@ export interface TopicsInbox {
 	branch(): readonly SessionEntry[];
 	/** Every entry of the session file, in file order. */
 	entries(): readonly SessionEntry[];
-	/** Append a hidden custom entry now; the model never sees it. */
-	appendState(customType: string, data: unknown): void;
+	/** Append a hidden custom entry; resolves once it is on disk, rejects when the write fails. */
+	appendState(customType: string, data: unknown): Promise<void>;
 	/**
-	 * Save a visible custom message that the model sees from its next turn on:
-	 * at once while the Inbox is idle, else once its running turn ends, so it
-	 * never lands inside a turn. It never starts or interrupts a turn. Resolves
-	 * true once saved; false when dropped (the session closed or switched first).
+	 * Record a visible custom message that the model sees from its next turn on
+	 * ({@link AgentSession.recordWithoutTurn}): now while the Inbox is idle, else
+	 * at its running turn's boundary. It never starts or interrupts a turn.
+	 * Resolves true once it is on disk; false when it was dropped (the session
+	 * was disposed or its transcript replaced first) or could not be written.
 	 */
 	appendNote(message: InboxMessage): Promise<boolean>;
 	/**
@@ -41,12 +41,6 @@ export interface TopicsInbox {
 	turnPending(customType: string): boolean;
 }
 
-interface PendingNote {
-	sessionId: string;
-	message: InboxMessage;
-	settle(saved: boolean): void;
-}
-
 interface QueuedTurn {
 	/** The prompt call has not settled yet. */
 	dispatching: boolean;
@@ -57,97 +51,35 @@ interface QueuedTurn {
 
 /** The Inbox surface of a top-level {@link AgentSession}. */
 export function sessionInbox(session: AgentSession): TopicsInbox {
-	const notes: PendingNote[] = [];
-	let flushing = false;
 	const turns = new Map<string, QueuedTurn>();
-	// An admitted submission is a prompt in setup or running: a note waits for it, so it never lands in a turn.
-	const busy = (): boolean => session.isStreaming || session.isSessionTransitioning || session.hasAdmittedSubmission;
-
-	/** The next session event of any kind. */
-	const nextEvent = (): Promise<void> => {
-		const { promise, resolve } = Promise.withResolvers<void>();
-		const unsubscribe = session.subscribe(() => {
-			unsubscribe();
-			resolve();
-		});
-		return promise;
-	};
-
-	/** Wait until no turn, prompt or session transition holds the Inbox. */
-	const untilIdle = async (): Promise<void> => {
-		while (!session.isDisposed && busy()) {
-			if (session.isSessionTransitioning) await session.waitForSessionTransition();
-			else if (session.hasAdmittedSubmission) await session.waitForAdmittedSubmissions();
-			else if (session.agent.state.isStreaming) await session.waitForIdle();
-			// A turn in setup that no submission admitted (a wake, an auto-continue): wait for it to go live.
-			else await nextEvent();
-		}
-	};
-
-	/**
-	 * Save every queued note once the Inbox is idle. The idle check and the
-	 * appends run in one synchronous step, so no turn can start in between and
-	 * take a note as a steer; `flushing` clears in that same step, so a caller
-	 * woken by its note's promise starts the next flush itself.
-	 */
-	const flushNotes = async (): Promise<void> => {
-		while (true) {
-			if (!session.isDisposed && busy()) {
-				await untilIdle();
-				continue;
-			}
-			const current = session.isDisposed ? undefined : session.sessionManager.getSessionId();
-			for (const note of notes.splice(0)) {
-				if (note.sessionId !== current) {
-					logger.warn("topics: dropped an Inbox note of a session no longer open", {
-						customType: note.message.customType,
-					});
-					note.settle(false);
-					continue;
-				}
-				const record: CustomMessage = {
-					role: "custom",
-					customType: note.message.customType,
-					content: note.message.content,
-					display: true,
-					details: note.message.details,
-					attribution: "agent",
-					timestamp: Date.now(),
-				};
-				// Like an idle custom message with no turn: in the model's context from the next turn, and saved.
-				session.agent.appendMessage(record);
-				session.sessionManager.appendCustomMessageEntry(
-					record.customType,
-					record.content,
-					record.display,
-					record.details,
-					record.attribution,
-					record.timestamp,
-				);
-				note.settle(true);
-			}
-			if (notes.length === 0) {
-				flushing = false;
-				return;
-			}
-		}
-	};
 
 	return {
 		sessionId: () => session.sessionManager.getSessionId(),
 		branch: () => session.sessionManager.getBranch(),
 		entries: () => session.sessionManager.getEntriesView(),
-		appendState(customType, data) {
+		async appendState(customType, data) {
 			session.sessionManager.appendCustomEntry(customType, data);
+			await session.sessionManager.flush();
 		},
-		appendNote(message) {
-			const { promise, resolve } = Promise.withResolvers<boolean>();
-			notes.push({ sessionId: session.sessionManager.getSessionId(), message, settle: resolve });
-			if (!flushing) {
-				flushing = true;
-				void flushNotes();
+		async appendNote({ customType, content, details }) {
+			try {
+				await session.recordWithoutTurn({
+					role: "custom",
+					customType,
+					content,
+					display: true,
+					details,
+					attribution: "agent",
+					timestamp: Date.now(),
+				});
+				return true;
+			} catch (error) {
+				logger.warn("topics: Inbox note not saved", {
+					customType,
+					error: error instanceof Error ? error.message : String(error),
+				});
+				return false;
 			}
-			return promise;
 		},
 		queueTurn({ customType, content, details }) {
 			const queued = session.isStreaming;
