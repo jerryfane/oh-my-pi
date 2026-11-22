@@ -371,24 +371,48 @@ async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
 	}
 }
 
+/** `sizeof(sockaddr_un.sun_path)`, NUL terminator included. */
+const SUN_PATH_BYTES = process.platform === "darwin" ? 104 : 108;
+
 /**
  * Open the control socket at a fresh random path with a random secret, after
  * removing what crashed runs left behind ({@link removeStaleControlDirs}). The
  * endpoint is published to {@link currentTopicsControl}; `bus` only hears that
  * it changed: now, on every {@link TOPICS_CONTROL_REQUEST_CHANNEL}, and when
- * stopped. Returns a stop function, or undefined when it could not start.
+ * stopped. A socket path that cannot fit a Unix socket address is refused
+ * before anything is created. Never rejects: every failure is logged and told
+ * to the user once (`notify`); topics keep working without host control.
+ * Returns a stop function, or undefined when it could not start.
  */
 export async function offerTopicsControl(
 	bus: TopicsControlBus,
 	topics: () => Promise<TopicsHost | undefined>,
 	/** `$XDG_RUNTIME_DIR` (user-private, cleared at logout) when set, else the temp dir. */
 	runtimeDir: string = process.env.XDG_RUNTIME_DIR || os.tmpdir(),
+	/** Shows the user a notice that host control is unavailable, and why. */
+	notify?: (message: string) => void,
 ): Promise<(() => void) | undefined> {
+	const unavailable = (reason: string): undefined => {
+		const message = `Topics host control unavailable: ${reason}`;
+		logger.error(message);
+		notify?.(message);
+		return undefined;
+	};
 	let dir: string | undefined;
 	const changed: TopicsControlChanged = { changed: true };
 	try {
-		await removeStaleControlDirs(runtimeDir);
-		dir = fs.mkdtempSync(path.join(runtimeDir, "omp-topics-"));
+		// Absolute once: the published path and the cleanup on stop must not depend on the cwd.
+		const root = path.resolve(runtimeDir);
+		if (process.platform !== "win32") {
+			const bytes = Buffer.byteLength(path.join(root, "omp-topics-XXXXXX", "control.sock")) + 1;
+			if (bytes > SUN_PATH_BYTES) {
+				return unavailable(
+					`socket path would be ${bytes} bytes (limit ${SUN_PATH_BYTES}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`,
+				);
+			}
+		}
+		await removeStaleControlDirs(root);
+		dir = fs.mkdtempSync(path.join(root, "omp-topics-"));
 		fs.chmodSync(dir, 0o700);
 		const endpoint: TopicsControlEndpoint = {
 			socketPath: path.join(dir, "control.sock"),
@@ -409,11 +433,12 @@ export async function offerTopicsControl(
 			fs.rmSync(ownedDir, { recursive: true, force: true });
 		};
 	} catch (error) {
-		logger.warn("topics control socket not started", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		if (dir) fs.rmSync(dir, { recursive: true, force: true });
-		return undefined;
+		try {
+			if (dir) fs.rmSync(dir, { recursive: true, force: true });
+		} catch (cleanupError) {
+			logger.warn("topics control: cleanup after a failed start failed", { error: String(cleanupError) });
+		}
+		return unavailable(`${error instanceof Error ? error.message : String(error)}. Topics still work in omp.`);
 	}
 }
 
@@ -422,8 +447,10 @@ export async function offerSessionTopicsControl(
 	session: { getTopicsHost(): Promise<TopicsHost | undefined>; addDisposer(dispose: () => void): void },
 	bus: TopicsControlBus,
 	settings: Settings,
+	/** Shows the user a startup notice (host control unavailable). */
+	notify?: (message: string) => void,
 ): Promise<void> {
 	if (!cfgTopicsEnabled.get(settings)) return;
-	const stop = await offerTopicsControl(bus, () => session.getTopicsHost());
+	const stop = await offerTopicsControl(bus, () => session.getTopicsHost(), undefined, notify);
 	if (stop) session.addDisposer(stop);
 }

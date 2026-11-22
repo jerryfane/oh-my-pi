@@ -2674,7 +2674,11 @@ export async function runRootCommand(
 				startBackgroundModelDiscovery,
 			} = createdSession;
 			if (isInteractive) session.addDisposer(bindAgentMesh(sessionOptions.cwd ?? getProjectDir(), settingsInstance));
-			if (isInteractive) await offerSessionTopicsControl(session, createdSession.eventBus, settingsInstance);
+			if (isInteractive) {
+				await offerSessionTopicsControl(session, createdSession.eventBus, settingsInstance, message =>
+					notifs.push({ kind: "error", message }),
+				);
+			}
 			if (!isInteractive) session.validateRetryFallbackChains();
 
 			const sessionToolNames = session.getAllToolNames();
