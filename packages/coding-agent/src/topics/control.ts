@@ -212,7 +212,13 @@ export async function startTopicsControl(options: TopicsControlOptions): Promise
 		},
 	});
 	// Inside the host's 0700 directory the brief default-mode window is unreachable; tighten anyway.
-	fs.chmodSync(options.path, 0o600);
+	try {
+		fs.chmodSync(options.path, 0o600);
+	} catch (error) {
+		// Bound already: never leave a listener behind for a start that failed.
+		server.stop(true);
+		throw error;
+	}
 	return () => {
 		server.stop(true);
 		try {
@@ -340,6 +346,11 @@ export function currentTopicsControl(): TopicsControlEndpoint | undefined {
 	return currentEndpoint;
 }
 
+/** Name prefix of a control directory; `mkdtemp` appends six random characters. */
+const CONTROL_DIR_PREFIX = "omp-topics-";
+/** Basename of the socket inside a control directory. */
+const CONTROL_SOCKET_NAME = "control.sock";
+
 /**
  * Remove control directories that crashed runs left in `runtimeDir`: our own
  * `omp-topics-*` directories whose `control.sock` refuses connections. One
@@ -356,9 +367,9 @@ async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
 		return;
 	}
 	for (const name of names) {
-		if (!name.startsWith("omp-topics-")) continue;
+		if (!name.startsWith(CONTROL_DIR_PREFIX)) continue;
 		const dir = path.join(runtimeDir, name);
-		const socketPath = path.join(dir, "control.sock");
+		const socketPath = path.join(dir, CONTROL_SOCKET_NAME);
 		try {
 			const dirStat = fs.lstatSync(dir);
 			if (!dirStat.isDirectory() || dirStat.uid !== uid) continue;
@@ -392,54 +403,65 @@ export async function offerTopicsControl(
 	/** Shows the user a notice that host control is unavailable, and why. */
 	notify?: (message: string) => void,
 ): Promise<(() => void) | undefined> {
-	const unavailable = (reason: string): undefined => {
-		const message = `Topics host control unavailable: ${reason}`;
-		logger.error(message);
-		notify?.(message);
-		return undefined;
-	};
+	let reason: string;
 	let dir: string | undefined;
+	/** Set once the listener is bound: the returned stop, and the rollback of a later failure. */
+	let stop: (() => void) | undefined;
 	const changed: TopicsControlChanged = { changed: true };
 	try {
-		// Absolute once: the published path and the cleanup on stop must not depend on the cwd.
-		const root = path.resolve(runtimeDir);
-		if (process.platform !== "win32") {
-			const bytes = Buffer.byteLength(path.join(root, "omp-topics-XXXXXX", "control.sock")) + 1;
-			if (bytes > SUN_PATH_BYTES) {
-				return unavailable(
-					`socket path would be ${bytes} bytes (limit ${SUN_PATH_BYTES}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`,
-				);
-			}
-		}
-		await removeStaleControlDirs(root);
-		dir = fs.mkdtempSync(path.join(root, "omp-topics-"));
-		fs.chmodSync(dir, 0o700);
-		const endpoint: TopicsControlEndpoint = {
-			socketPath: path.join(dir, "control.sock"),
-			token: crypto.randomBytes(32).toString("base64url"),
-			protocol: TOPICS_CONTROL_PROTOCOL,
-			pid: process.pid,
-		};
-		const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
-		currentEndpoint = endpoint;
-		const unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, changed));
-		bus.emit(TOPICS_CONTROL_CHANNEL, changed);
-		const ownedDir = dir;
-		return () => {
-			unsubscribe();
-			stopSocket();
-			if (currentEndpoint === endpoint) currentEndpoint = undefined;
+		// The one host-visible path for the check, the bind, the published endpoint and the cleanup:
+		// absolute, and free of symlinks and process-relative aliases (`/proc/self/cwd`).
+		const root = fs.realpathSync(runtimeDir);
+		const bytes = Buffer.byteLength(path.join(root, `${CONTROL_DIR_PREFIX}XXXXXX`, CONTROL_SOCKET_NAME)) + 1;
+		if (process.platform !== "win32" && bytes > SUN_PATH_BYTES) {
+			reason = `socket path would be ${bytes} bytes (limit ${SUN_PATH_BYTES}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`;
+		} else {
+			await removeStaleControlDirs(root);
+			const ownedDir = fs.mkdtempSync(path.join(root, CONTROL_DIR_PREFIX));
+			dir = ownedDir;
+			fs.chmodSync(ownedDir, 0o700);
+			const endpoint: TopicsControlEndpoint = {
+				socketPath: path.join(ownedDir, CONTROL_SOCKET_NAME),
+				token: crypto.randomBytes(32).toString("base64url"),
+				protocol: TOPICS_CONTROL_PROTOCOL,
+				pid: process.pid,
+			};
+			const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
+			// Replaced once subscribed; until then `stop` (as rollback) has nothing to unsubscribe.
+			let unsubscribe = (): void => {};
+			stop = () => {
+				unsubscribe();
+				stopSocket();
+				if (currentEndpoint === endpoint) currentEndpoint = undefined;
+				bus.emit(TOPICS_CONTROL_CHANNEL, changed);
+				fs.rmSync(ownedDir, { recursive: true, force: true });
+			};
+			currentEndpoint = endpoint;
+			unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, changed));
 			bus.emit(TOPICS_CONTROL_CHANNEL, changed);
-			fs.rmSync(ownedDir, { recursive: true, force: true });
-		};
+			return stop;
+		}
 	} catch (error) {
 		try {
-			if (dir) fs.rmSync(dir, { recursive: true, force: true });
+			try {
+				// A bound listener stops before its directory goes.
+				stop?.();
+			} finally {
+				if (dir) fs.rmSync(dir, { recursive: true, force: true });
+			}
 		} catch (cleanupError) {
 			logger.warn("topics control: cleanup after a failed start failed", { error: String(cleanupError) });
 		}
-		return unavailable(`${error instanceof Error ? error.message : String(error)}. Topics still work in omp.`);
+		reason = `${error instanceof Error ? error.message : String(error)}. Topics still work in omp.`;
 	}
+	const message = `Topics host control unavailable: ${reason}`;
+	logger.error(message);
+	try {
+		notify?.(message);
+	} catch (error) {
+		logger.warn("topics control: the startup notice could not be shown", { error: String(error) });
+	}
+	return undefined;
 }
 
 /** With `topics.enabled`, offer the control endpoint for `session`'s lifetime (interactive sessions). */
