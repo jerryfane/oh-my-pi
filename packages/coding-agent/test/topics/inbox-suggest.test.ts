@@ -25,7 +25,7 @@ import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
 import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
-import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { convertToLlm, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { CustomMessageEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
@@ -39,6 +39,7 @@ import { TopicSuggestTool } from "@oh-my-pi/pi-coding-agent/topics/suggest-tool"
 import { TOPIC_ORGANISE_TYPE, TOPIC_SUGGESTION_TYPE, TopicsError } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
 import { resetTopicsRegistryForTests } from "@oh-my-pi/pi-coding-agent/topics/workers";
 import { TempDir } from "@oh-my-pi/pi-utils";
+import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const OWNER = "Main";
@@ -314,6 +315,109 @@ describe("Inbox notes", () => {
 	});
 });
 
+describe("Parked batches and first-turn admission (#12 review)", () => {
+	function conversation(manager: SessionManager): void {
+		manager.appendMessage({ role: "user", content: "first question", timestamp: 1 });
+		manager.appendMessage(createAssistantMessage("first answer"));
+		manager.appendMessage({ role: "user", content: "second question", timestamp: 2 });
+		manager.appendMessage(createAssistantMessage("second answer"));
+	}
+
+	function rows(manager: SessionManager, customType: string): unknown[] {
+		return manager.getEntries().filter(entry => "customType" in entry && entry.customType === customType);
+	}
+
+	it("drops an Organise an IRC wake parked when /tree replaces the transcript: the wake never puts it back", async () => {
+		const arrived = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const woke = Promise.withResolvers<void>();
+		const wakeRelease = Promise.withResolvers<void>();
+		const inbox = await openInbox(async context => {
+			const text = lastText(context);
+			if (text === "long question") {
+				arrived.resolve();
+				await release.promise;
+				return { content: ["the full answer"] };
+			}
+			if (text.includes("ping")) {
+				woke.resolve();
+				await wakeRelease.promise;
+				return { content: ["pong"] };
+			}
+			return { content: [text.includes(ORGANISE_MARK) ? "organised" : "ok"] };
+		}, conversation);
+		const firstAnswer = inbox.manager
+			.getEntries()
+			.find(entry => entry.type === "message" && textOf(entry.message as Message) === "first answer")!;
+		const running = inbox.session.prompt("long question");
+		await arrived.promise;
+		expect(await inbox.host.organise({ by: "owner" })).toEqual({ queued: true });
+		// The user stops the turn: the queued Organise is held for an explicit resume.
+		await inbox.session.abort({ reason: USER_INTERRUPT_LABEL });
+		release.resolve();
+		await running.catch(() => {});
+		await inbox.session.waitForIdle();
+		expect(inbox.session.agent.peekFollowUpQueue()).toHaveLength(1);
+		// An IRC wake parks the held follow-up outside the agent queue for its own turn.
+		await inbox.session.deliverIrcMessage({
+			id: "m1",
+			from: "peer",
+			to: "me",
+			body: "ping",
+			ts: Date.now(),
+		} as IrcMessage);
+		await woke.promise;
+		expect(inbox.session.agent.peekFollowUpQueue()).toHaveLength(0);
+		// /tree replaces the transcript while the Organise is parked; the wake then ends and restores its batch.
+		const navigating = inbox.session.navigateTree(firstAnswer.id);
+		wakeRelease.resolve();
+		expect((await navigating).cancelled).toBe(false);
+		await inbox.session.waitForIdle();
+		expect(inbox.session.agent.peekFollowUpQueue()).toHaveLength(0);
+		await inbox.session.prompt("next question");
+		await inbox.session.waitForIdle();
+
+		expect(inbox.requests.some(request => request.map(textOf).join("\n").includes(ORGANISE_MARK))).toBe(false);
+		expect(rows(inbox.manager, TOPIC_ORGANISE_TYPE)).toEqual([]);
+	});
+
+	it("releases an aborted Organise's slot and its wait at abort, not when the prompt ahead of it settles", async () => {
+		const inbox = await openInbox(context => ({
+			content: [lastText(context).includes(ORGANISE_MARK) ? "organised" : "ok"],
+		}));
+		const box = sessionInbox(inbox.session);
+		// An earlier prompt is held in setup, before its run opens: the Organise turn waits for it.
+		const gate = Promise.withResolvers<void>();
+		const agentPrompt = inbox.session.agent.prompt.bind(inbox.session.agent) as (...args: unknown[]) => Promise<void>;
+		vi.spyOn(inbox.session.agent, "prompt").mockImplementationOnce((async (...args: unknown[]) => {
+			await gate.promise;
+			return agentPrompt(...args);
+		}) as typeof inbox.session.agent.prompt);
+		const question = inbox.session.prompt("a question").catch(() => false);
+		await Bun.sleep(0);
+		expect(inbox.session.hasAdmittedSubmission).toBe(true);
+		const organised = box
+			.queueTurn(box.capture(), TOPIC_ORGANISE_TYPE, () => ({ content: ORGANISE_MARK, details: { by: "owner" } }))
+			.then(
+				result => result,
+				(error: Error) => error,
+			);
+		expect(box.turnPending(TOPIC_ORGANISE_TYPE)).toBe(true);
+		const replaced = inbox.session.newSession();
+		// Settled at abort, while the prompt ahead of it is still held.
+		const outcome = await Promise.race([organised, Bun.sleep(500).then(() => "still waiting")]);
+		const pending = box.turnPending(TOPIC_ORGANISE_TYPE);
+		gate.resolve();
+		await replaced;
+		await question;
+		await inbox.session.waitForIdle();
+
+		expect(outcome).toBeInstanceOf(StaleTranscriptError);
+		expect(pending).toBe(false);
+		expect(inbox.requests.some(request => request.map(textOf).join("\n").includes(ORGANISE_MARK))).toBe(false);
+	});
+});
+
 describe("Inbox epochs: bound work is aborted when the transcript is replaced (#11 review)", () => {
 	function conversation(manager: SessionManager): void {
 		manager.appendMessage({ role: "user", content: "OLD-INBOX-EXCERPT first question", timestamp: 1 });
@@ -418,20 +522,23 @@ describe("Inbox epochs: bound work is aborted when the transcript is replaced (#
 		);
 		await inbox.manager.ensureOnDisk();
 		await inbox.manager.flush();
-		const firstTurns = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => ({
-			index: options.index,
-			id: options.id,
-			agent: options.agent.name,
-			agentSource: options.agent.source,
-			task: options.task,
-			exitCode: 0,
-			output: "done",
-			stderr: "",
-			truncated: false,
-			durationMs: 1,
-			tokens: 0,
-			requests: 0,
-		}));
+		const firstTurns = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			options.onFirstPromptAdmitted?.();
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				exitCode: 0,
+				output: "done",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 0,
+				requests: 0,
+			};
+		});
 		const suggested = Promise.withResolvers<void>();
 		inbox.host.onChange(change => {
 			if (change.reason === "suggested") suggested.resolve();
@@ -731,20 +838,23 @@ describe("Inbox generation checked at the point of effect (#8 review)", () => {
 			summarize,
 		);
 		await inbox.manager.ensureOnDisk();
-		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async (options: ExecutorOptions) => ({
-			index: options.index,
-			id: options.id,
-			agent: options.agent.name,
-			agentSource: options.agent.source,
-			task: options.task,
-			exitCode: 0,
-			output: "done",
-			stderr: "",
-			truncated: false,
-			durationMs: 1,
-			tokens: 0,
-			requests: 0,
-		}));
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async (options: ExecutorOptions) => {
+			options.onFirstPromptAdmitted?.();
+			return {
+				index: options.index,
+				id: options.id,
+				agent: options.agent.name,
+				agentSource: options.agent.source,
+				task: options.task,
+				exitCode: 0,
+				output: "done",
+				stderr: "",
+				truncated: false,
+				durationMs: 1,
+				tokens: 0,
+				requests: 0,
+			};
+		});
 		// Hold the spawn's durable write (its lifecycle entry) until /new has completed.
 		const flushed = Promise.withResolvers<void>();
 		const release = Promise.withResolvers<void>();
