@@ -2,9 +2,11 @@
  * Local control socket for the owner's topics of an interactive session.
  *
  * A host that runs omp in a terminal pane (Herdr) cannot use stdio RPC. When
- * topics are enabled, omp opens its own socket at a fresh random path inside
- * an owner-only (0700) directory under `$XDG_RUNTIME_DIR` (else the temp
- * dir), with a random per-launch secret held only in memory: never in a file,
+ * topics are enabled, omp opens its own socket at a fresh random path: inside
+ * a fresh owner-only (0700) directory under `$XDG_RUNTIME_DIR` (else the temp
+ * dir), or in the shared native relocation directory when that path does not
+ * fit a Unix socket address ({@link ipcEndpoint}). A random per-launch secret
+ * is held only in memory: never in a file,
  * an environment variable or a command line. In-process extensions read the
  * endpoint from {@link currentTopicsControl} (exported from the package root,
  * so `pi.pi.currentTopicsControl()`), prompted by a payload-free change signal
@@ -29,7 +31,7 @@ import * as crypto from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import type { Socket, UnixSocketListener } from "bun";
+import { type IpcConnection, IpcServer, ipcEndpoint } from "@oh-my-pi/pi-natives";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
 import { isRpcTopicsCommand, runRpcTopicsCommand, TOPICS_DISABLED, topicsFailure } from "../modes/rpc/rpc-topics";
@@ -43,7 +45,7 @@ export const TOPICS_CONTROL_PROTOCOL = 1;
 export const MIN_TOKEN_LENGTH = 32;
 /** One request larger than this closes the connection. */
 const MAX_REQUEST_BYTES = 1024 * 1024;
-/** Unsent reply bytes beyond this close a client that stopped reading. */
+/** Reply bytes queued past the native write high-water mark beyond this close a client that stopped reading. */
 const MAX_PENDING_OUTPUT_BYTES = 64 * 1024 * 1024;
 const DEFAULT_HELLO_TIMEOUT_MS = 5_000;
 const MAX_UNAUTHENTICATED_CONNECTIONS = 8;
@@ -57,55 +59,22 @@ export interface TopicsControlOptions {
 	helloTimeoutMs?: number;
 }
 
-interface ConnectionState {
-	buffer: string;
+interface ControlClient {
+	connection: IpcConnection;
 	authenticated: boolean;
 	unsubscribe?: () => void;
 	/** Serializes this connection's commands so replies keep request order. */
 	queue: Promise<void>;
-	/** Bytes the kernel did not accept yet; flushed on drain. */
-	pending: Buffer[];
-	pendingBytes: number;
+	/** Bytes sent since the native write queue passed its high-water mark; reset once it drains. */
+	backlogBytes: number;
 	helloTimer?: NodeJS.Timeout;
 	closed: boolean;
 }
-
-type ControlSocket = Socket<ConnectionState>;
 
 function constantTimeEqual(a: string, b: string): boolean {
 	const left = Buffer.from(a);
 	const right = Buffer.from(b);
 	return left.length === right.length && crypto.timingSafeEqual(left, right);
-}
-
-/** Write what the socket accepts now, keep the rest for drain; close a client that stops reading. */
-function flush(socket: ControlSocket): void {
-	const state = socket.data;
-	while (state.pending.length > 0) {
-		const chunk = state.pending[0];
-		const written = socket.write(chunk);
-		if (written < 0) return;
-		state.pendingBytes -= written;
-		if (written < chunk.length) {
-			state.pending[0] = chunk.subarray(written);
-			return;
-		}
-		state.pending.shift();
-	}
-}
-
-function send(socket: ControlSocket, frame: object): void {
-	const state = socket.data;
-	if (state.closed) return;
-	const bytes = Buffer.from(`${JSON.stringify(frame)}\n`);
-	state.pending.push(bytes);
-	state.pendingBytes += bytes.length;
-	if (state.pendingBytes > MAX_PENDING_OUTPUT_BYTES) {
-		logger.warn("topics control: closing a client that stopped reading");
-		socket.end();
-		return;
-	}
-	flush(socket);
 }
 
 /** Whether a server accepts connections on `socketPath`; a dead socket left by a crash refuses them. */
@@ -120,117 +89,114 @@ async function socketAnswers(socketPath: string): Promise<boolean> {
 }
 
 /**
- * Remove a socket left by a crashed run: only a socket that refuses connections
- * is removed; anything else at the path (a live server, a regular file) is kept
- * and startup fails.
+ * Start the control socket at `options.path` (an {@link ipcEndpoint}); returns a stop function. The native
+ * listener makes the socket owner-only (0600), drops peers of another user, refuses a path a live server
+ * answers on (`EADDRINUSE`) and replaces a dead socket a crashed run left.
  */
-async function clearStaleSocket(socketPath: string): Promise<void> {
-	let stat: fs.Stats;
-	try {
-		stat = fs.lstatSync(socketPath);
-	} catch {
-		return;
-	}
-	if (!stat.isSocket()) throw new Error(`Topics control path exists and is not a socket: ${socketPath}`);
-	if (await socketAnswers(socketPath)) throw new Error(`Topics control socket is in use: ${socketPath}`);
-	fs.rmSync(socketPath, { force: true });
-}
-
-/** Start the control socket; returns a stop function. */
 export async function startTopicsControl(options: TopicsControlOptions): Promise<() => void> {
 	if (options.token.length < MIN_TOKEN_LENGTH) {
 		throw new Error(`Topics control token must be at least ${MIN_TOKEN_LENGTH} characters.`);
 	}
-	await clearStaleSocket(options.path);
 	const helloTimeoutMs = options.helloTimeoutMs ?? DEFAULT_HELLO_TIMEOUT_MS;
 	let unauthenticated = 0;
-	const release = (state: ConnectionState): void => {
-		if (state.closed) return;
-		state.closed = true;
-		clearTimeout(state.helloTimer);
-		if (!state.authenticated) unauthenticated--;
-		state.unsubscribe?.();
+	let stopped = false;
+	const clients = new Set<ControlClient>();
+	const release = (client: ControlClient): void => {
+		if (client.closed) return;
+		client.closed = true;
+		clients.delete(client);
+		clearTimeout(client.helloTimer);
+		if (!client.authenticated) unauthenticated--;
+		client.unsubscribe?.();
 	};
-	const server: UnixSocketListener<ConnectionState> = Bun.listen<ConnectionState>({
-		unix: options.path,
-		socket: {
-			open(socket) {
-				const state: ConnectionState = {
-					buffer: "",
-					authenticated: false,
-					queue: Promise.resolve(),
-					pending: [],
-					pendingBytes: 0,
-					closed: false,
-				};
-				socket.data = state;
-				if (unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS) {
-					state.closed = true;
-					socket.end();
-					return;
-				}
-				unauthenticated++;
-				state.helloTimer = setTimeout(() => {
-					if (!state.authenticated) socket.end();
-				}, helloTimeoutMs);
-			},
-			data(socket, chunk) {
-				const state = socket.data;
-				if (state.closed) return;
-				state.buffer += chunk.toString("utf8");
-				if (state.buffer.length > MAX_REQUEST_BYTES) {
-					socket.end();
-					return;
-				}
-				let newline = state.buffer.indexOf("\n");
-				while (newline >= 0) {
-					const line = state.buffer.slice(0, newline).trim();
-					state.buffer = state.buffer.slice(newline + 1);
-					newline = state.buffer.indexOf("\n");
-					if (!line) continue;
-					state.queue = state.queue
+	const server = await IpcServer.listen(
+		options.path,
+		// A line longer than one request closes that connection natively.
+		{ framing: "lines", maxFrameBytes: MAX_REQUEST_BYTES },
+		connection => {
+			if (stopped || unauthenticated >= MAX_UNAUTHENTICATED_CONNECTIONS) {
+				connection.destroy();
+				return;
+			}
+			unauthenticated++;
+			const client: ControlClient = {
+				connection,
+				authenticated: false,
+				queue: Promise.resolve(),
+				backlogBytes: 0,
+				closed: false,
+			};
+			clients.add(client);
+			// Also bounds a refused client that keeps its end open after our `end()`.
+			client.helloTimer = setTimeout(() => {
+				if (!client.authenticated) connection.destroy();
+			}, helloTimeoutMs);
+			connection.start(
+				received => {
+					const line = received.trim();
+					if (!line || client.closed) return;
+					client.queue = client.queue
 						.then(() =>
-							handleLine(socket, state, line, options, () => {
+							handleLine(client, line, options, () => {
 								unauthenticated--;
-								clearTimeout(state.helloTimer);
+								clearTimeout(client.helloTimer);
 							}),
 						)
 						// A handler failure must never stall this connection's later commands.
 						.catch(error => logger.warn("topics control: command failed", { error: String(error) }));
-				}
-			},
-			drain(socket) {
-				flush(socket);
-			},
-			close(socket) {
-				if (socket.data) release(socket.data);
-			},
-			error(socket, error) {
-				logger.debug("topics control connection error", { error: error.message });
-				if (socket.data) release(socket.data);
-			},
+				},
+				reason => {
+					if (reason) logger.debug("topics control connection closed", { reason });
+					release(client);
+				},
+			);
 		},
-	});
-	// Inside the host's 0700 directory the brief default-mode window is unreachable; tighten anyway.
-	fs.chmodSync(options.path, 0o600);
+	);
+	// The socket and the native listener's bind lock; a pipe (Windows) leaves nothing on disk.
+	const files = process.platform === "win32" ? [] : [options.path, `${options.path}.bind.lock`];
 	return () => {
-		server.stop(true);
-		try {
-			fs.rmSync(options.path, { force: true });
-		} catch (error) {
-			logger.warn("topics control: failed to remove socket", { error: String(error) });
+		if (stopped) return;
+		stopped = true;
+		for (const client of clients) client.connection.destroy();
+		// Unlinked now, so no client can reach the path while `close` finishes; `close` only unlinks
+		// a socket that is still its own inode.
+		for (const file of files) {
+			try {
+				fs.rmSync(file, { force: true });
+			} catch (error) {
+				logger.warn("topics control: failed to remove socket", { error: String(error) });
+			}
 		}
+		server.close().catch(error => logger.warn("topics control: failed to close", { error: String(error) }));
 	};
 }
 
+/** Send one frame; close a client that stopped reading. */
+function send(client: ControlClient, frame: object): void {
+	if (client.closed) return;
+	const line = JSON.stringify(frame);
+	if (client.connection.send(line)) return;
+	const draining = client.backlogBytes > 0;
+	client.backlogBytes += Buffer.byteLength(line) + 1;
+	if (client.backlogBytes > MAX_PENDING_OUTPUT_BYTES) {
+		logger.warn("topics control: closing a client that stopped reading");
+		client.connection.destroy();
+		return;
+	}
+	if (!draining) {
+		void client.connection.drained().then(() => {
+			client.backlogBytes = 0;
+		});
+	}
+}
+
 async function handleLine(
-	socket: ControlSocket,
-	state: ConnectionState,
+	client: ControlClient,
 	line: string,
 	options: TopicsControlOptions,
 	onAuthenticated: () => void,
 ): Promise<void> {
-	if (state.closed) return;
+	if (client.closed) return;
 	let frame: unknown;
 	try {
 		frame = JSON.parse(line);
@@ -238,36 +204,35 @@ async function handleLine(
 		frame = undefined;
 	}
 	if (typeof frame !== "object" || frame === null || !("type" in frame) || typeof frame.type !== "string") {
-		send(socket, { type: "error", error: "Frame must be a JSON object with a string `type`." });
-		if (!state.authenticated) socket.end();
+		send(client, { type: "error", error: "Frame must be a JSON object with a string `type`." });
+		if (!client.authenticated) client.connection.end();
 		return;
 	}
 	const id = "id" in frame && typeof frame.id === "string" ? frame.id : undefined;
 
-	if (!state.authenticated) {
+	if (!client.authenticated) {
 		const token = "token" in frame && typeof frame.token === "string" ? frame.token : "";
 		if (frame.type !== "hello" || !constantTimeEqual(token, options.token)) {
-			send(socket, { type: "error", error: "Unauthorized." });
-			socket.end();
+			send(client, { type: "error", error: "Unauthorized." });
+			client.connection.end();
 			return;
 		}
-		state.authenticated = true;
+		client.authenticated = true;
 		onAuthenticated();
-		send(socket, { type: "hello", protocol: TOPICS_CONTROL_PROTOCOL, pid: process.pid });
+		send(client, { type: "hello", protocol: TOPICS_CONTROL_PROTOCOL, pid: process.pid });
 		return;
 	}
 
 	// Any failure (resolving the host included) answers this command; the connection keeps working.
 	try {
-		await runAuthenticated(socket, state, frame.type, id, frame, options);
+		await runAuthenticated(client, frame.type, id, frame, options);
 	} catch (error) {
-		send(socket, { id, type: "response", command: frame.type, success: false, ...topicsFailure(error) });
+		send(client, { id, type: "response", command: frame.type, success: false, ...topicsFailure(error) });
 	}
 }
 
 async function runAuthenticated(
-	socket: ControlSocket,
-	state: ConnectionState,
+	client: ControlClient,
 	type: string,
 	id: string | undefined,
 	frame: object,
@@ -275,7 +240,7 @@ async function runAuthenticated(
 ): Promise<void> {
 	const topics = await options.topics();
 	if (!topics) {
-		send(socket, {
+		send(client, {
 			id,
 			type: "response",
 			command: type,
@@ -286,18 +251,18 @@ async function runAuthenticated(
 		return;
 	}
 	if (type === "subscribe") {
-		state.unsubscribe ??= topics.onChange(change => send(socket, { type: "topic_update", change }));
-		send(socket, { id, type: "response", command: "subscribe", success: true });
+		client.unsubscribe ??= topics.onChange(change => send(client, { type: "topic_update", change }));
+		send(client, { id, type: "response", command: "subscribe", success: true });
 		return;
 	}
 	// Narrowed to a `topics_*` command below; runRpcTopicsCommand validates each field.
 	const command = frame as RpcCommand;
 	if (!isRpcTopicsCommand(command)) {
-		send(socket, { id, type: "response", command: type, success: false, error: "Unknown command." });
+		send(client, { id, type: "response", command: type, success: false, error: "Unknown command." });
 		return;
 	}
 	const data = await runRpcTopicsCommand(topics, command);
-	send(socket, { id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
+	send(client, { id, type: "response", command: command.type, success: true, ...(data ? { data } : {}) });
 }
 
 /**
@@ -340,9 +305,11 @@ export function currentTopicsControl(): TopicsControlEndpoint | undefined {
 	return currentEndpoint;
 }
 
-/** Directory name prefix of a control directory; `mkdtemp` appends six characters. */
+/** Directory name prefix of a control directory; a random suffix follows. */
 const CONTROL_DIR_PREFIX = "omp-topics-";
-const CONTROL_SOCKET_NAME = "control.sock";
+/** {@link ipcEndpoint} name of the socket: `<dir>/control.sock` unless relocated. */
+const CONTROL_ENDPOINT_NAME = "control";
+const CONTROL_SOCKET_NAME = `${CONTROL_ENDPOINT_NAME}.sock`;
 
 /**
  * Remove control directories that crashed runs left in `runtimeDir`: our own
@@ -375,71 +342,21 @@ async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
 	}
 }
 
-/** Usable bytes of a Unix socket path (`sun_path` minus its NUL): 104 on macOS, 108 elsewhere. */
-export const SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
-/** Root of the short private fallback directory (`<root>/omp-<uid>`). */
-const DEFAULT_FALLBACK_ROOT = "/tmp";
-
-/** The longest control socket path under `root`: the `mkdtemp` suffix is six bytes. */
-function worstCaseSocketPath(root: string): string {
-	return path.join(root, `${CONTROL_DIR_PREFIX}XXXXXX`, CONTROL_SOCKET_NAME);
-}
-
-function fitsSocketPath(root: string, limit: number): boolean {
-	return Buffer.byteLength(worstCaseSocketPath(root)) <= limit;
-}
-
 /**
- * The short private directory `<fallbackRoot>/omp-<uid>`, created 0700. An existing one is used only when it
- * is a real directory (not a symlink), owned by this user and closed to everyone else: on a shared `/tmp`
- * anything else may be another user's trap. Returns the reason it is refused instead.
+ * Create the fresh control directory `dir` owner-only. `mkdir`'s mode is masked by the umask (a restrictive
+ * one leaves no owner access at all), so the mode is set explicitly and then verified.
  */
-function privateFallbackDir(fallbackRoot: string, uid: number): { dir: string } | { refused: string } {
-	const dir = path.join(fallbackRoot, `omp-${uid}`);
-	try {
-		fs.mkdirSync(dir, { mode: 0o700 });
-	} catch (error) {
-		if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
-			return { refused: `could not be created (${error instanceof Error ? error.message : String(error)})` };
-		}
-	}
+function createPrivateDir(dir: string): void {
+	fs.mkdirSync(dir, { mode: 0o700 });
+	fs.chmodSync(dir, 0o700);
 	const stat = fs.lstatSync(dir);
-	if (stat.isSymbolicLink() || !stat.isDirectory()) return { refused: "is not a real directory" };
-	if (stat.uid !== uid) return { refused: `is owned by uid ${stat.uid}, not ${uid}` };
-	if ((stat.mode & 0o077) !== 0) return { refused: `has mode ${(stat.mode & 0o777).toString(8)}, not 700` };
-	return { dir };
-}
-
-/**
- * Where control directories go: `runtimeDir` when its socket paths fit the platform limit, else the short
- * private fallback. Unix only: Windows (no uid) keeps `runtimeDir`. Returns why neither works instead.
- */
-function controlRoot(
-	runtimeDir: string,
-	fallbackRoot: string,
-	limit: number,
-): { root: string } | { unavailable: string } {
 	const uid = process.getuid?.();
-	if (uid === undefined || fitsSocketPath(runtimeDir, limit)) return { root: runtimeDir };
-	const tooLong = `${worstCaseSocketPath(runtimeDir)} is ${Buffer.byteLength(worstCaseSocketPath(runtimeDir))} bytes, over the ${limit}-byte limit for Unix socket paths`;
-	const fallback = privateFallbackDir(fallbackRoot, uid);
-	if ("refused" in fallback) {
-		return { unavailable: `${tooLong}, and the fallback ${path.join(fallbackRoot, `omp-${uid}`)} ${fallback.refused}` };
+	if (!stat.isDirectory() || (uid !== undefined && stat.uid !== uid) || (stat.mode & 0o777) !== 0o700) {
+		throw new Error(`${dir} is not an owner-only directory of this user (mode ${(stat.mode & 0o777).toString(8)})`);
 	}
-	if (!fitsSocketPath(fallback.dir, limit)) {
-		const length = Buffer.byteLength(worstCaseSocketPath(fallback.dir));
-		return {
-			unavailable: `${tooLong}, and the fallback ${worstCaseSocketPath(fallback.dir)} is ${length} bytes too`,
-		};
-	}
-	return { root: fallback.dir };
 }
 
 export interface OfferTopicsControlOptions {
-	/** Root of the short private fallback directory for a runtime dir whose socket paths are too long. */
-	fallbackRoot?: string;
-	/** Usable socket path bytes; default the platform's ({@link SOCKET_PATH_MAX_BYTES}). */
-	maxSocketPathBytes?: number;
 	/** Tell the user, once, that the control socket is unavailable and why. */
 	notify?: (message: string) => void;
 }
@@ -447,10 +364,14 @@ export interface OfferTopicsControlOptions {
 /**
  * Open the control socket at a fresh random path with a random secret, after
  * removing what crashed runs left behind ({@link removeStaleControlDirs}). The
- * endpoint is published to {@link currentTopicsControl}; `bus` only hears that
- * it changed: now, on every {@link TOPICS_CONTROL_REQUEST_CHANNEL}, and when
- * stopped. A runtime dir whose socket paths exceed the Unix limit falls back
- * to a short private dir; when neither works, the user is told. Returns a stop
+ * endpoint is `ipcEndpoint(<runtimeDir>/omp-topics-<random>, "control")`: the
+ * socket inside a fresh owner-only directory, or, when that path does not fit
+ * a Unix socket address, a unique socket in the native private relocation
+ * directory (whose placement and checks the native listener owns). It is
+ * published to {@link currentTopicsControl}; `bus` only hears that it
+ * changed: now, on every {@link TOPICS_CONTROL_REQUEST_CHANNEL}, and when
+ * stopped. Never rejects: any failure is logged and told to the user once
+ * (`notify`), and the session runs without host control. Returns a stop
  * function, or undefined when it could not start.
  */
 export async function offerTopicsControl(
@@ -460,47 +381,48 @@ export async function offerTopicsControl(
 	runtimeDir: string = process.env.XDG_RUNTIME_DIR || os.tmpdir(),
 	options: OfferTopicsControlOptions = {},
 ): Promise<(() => void) | undefined> {
-	const placed = controlRoot(
-		runtimeDir,
-		options.fallbackRoot ?? DEFAULT_FALLBACK_ROOT,
-		options.maxSocketPathBytes ?? SOCKET_PATH_MAX_BYTES,
-	);
-	if ("unavailable" in placed) {
-		const message = `Topics control socket unavailable: ${placed.unavailable}. Topics still work in omp; only a host's (Herdr's) control of them is off.`;
-		logger.error(message);
-		options.notify?.(message);
-		return undefined;
-	}
-	const root = placed.root;
-	let dir: string | undefined;
+	const dir = path.join(runtimeDir, `${CONTROL_DIR_PREFIX}${crypto.randomBytes(9).toString("base64url")}`);
+	let socketPath: string | undefined;
+	let createdDir = false;
 	const changed: TopicsControlChanged = { changed: true };
 	try {
-		await removeStaleControlDirs(root);
-		dir = fs.mkdtempSync(path.join(root, CONTROL_DIR_PREFIX));
-		fs.chmodSync(dir, 0o700);
+		socketPath = ipcEndpoint(dir, CONTROL_ENDPOINT_NAME);
+		// Relocated (or a Windows pipe): nothing of ours to create next to the endpoint.
+		const ownsDir = path.dirname(socketPath) === dir;
+		await removeStaleControlDirs(runtimeDir);
+		if (ownsDir) {
+			createdDir = true;
+			createPrivateDir(dir);
+		}
 		const endpoint: TopicsControlEndpoint = {
-			socketPath: path.join(dir, CONTROL_SOCKET_NAME),
+			socketPath,
 			token: crypto.randomBytes(32).toString("base64url"),
 			protocol: TOPICS_CONTROL_PROTOCOL,
 			pid: process.pid,
 		};
-		const stopSocket = await startTopicsControl({ path: endpoint.socketPath, token: endpoint.token, topics });
+		const stopSocket = await startTopicsControl({ path: socketPath, token: endpoint.token, topics });
 		currentEndpoint = endpoint;
 		const unsubscribe = bus.on(TOPICS_CONTROL_REQUEST_CHANNEL, () => bus.emit(TOPICS_CONTROL_CHANNEL, changed));
 		bus.emit(TOPICS_CONTROL_CHANNEL, changed);
-		const ownedDir = dir;
 		return () => {
 			unsubscribe();
 			stopSocket();
 			if (currentEndpoint === endpoint) currentEndpoint = undefined;
 			bus.emit(TOPICS_CONTROL_CHANNEL, changed);
-			fs.rmSync(ownedDir, { recursive: true, force: true });
+			if (ownsDir) fs.rmSync(dir, { recursive: true, force: true });
 		};
 	} catch (error) {
-		logger.warn("topics control socket not started", {
-			error: error instanceof Error ? error.message : String(error),
-		});
-		if (dir) fs.rmSync(dir, { recursive: true, force: true });
+		const where = socketPath ?? dir;
+		const message = `Topics control socket unavailable at ${where}: ${error instanceof Error ? error.message : String(error)}. Topics still work in omp; only a host's (Herdr's) control of them is off.`;
+		logger.error(message);
+		options.notify?.(message);
+		try {
+			if (createdDir) fs.rmSync(dir, { recursive: true, force: true });
+			// A failed listen may leave the native bind lock next to the (unique) endpoint.
+			if (socketPath && process.platform !== "win32") fs.rmSync(`${socketPath}.bind.lock`, { force: true });
+		} catch (cleanupError) {
+			logger.warn("topics control: cleanup after a failed start failed", { error: String(cleanupError) });
+		}
 		return undefined;
 	}
 }
@@ -510,7 +432,7 @@ export async function offerSessionTopicsControl(
 	session: { getTopicsHost(): Promise<TopicsHost | undefined>; addDisposer(dispose: () => void): void },
 	bus: TopicsControlBus,
 	settings: Settings,
-	/** Shows the user a startup notice (the control socket could not be placed). */
+	/** Shows the user a startup notice (the control socket could not be opened). */
 	notify?: (message: string) => void,
 ): Promise<void> {
 	if (!cfgTopicsEnabled.get(settings)) return;

@@ -4,16 +4,17 @@
  * Extensions read the endpoint from omp's own state, never from the event
  * bus, which only says that it changed; startup clears what crashed runs left.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
 	currentTopicsControl,
 	MIN_TOKEN_LENGTH,
+	offerSessionTopicsControl,
 	offerTopicsControl,
-	SOCKET_PATH_MAX_BYTES,
 	startTopicsControl,
 	TOPICS_CONTROL_CHANNEL,
 	TOPICS_CONTROL_PROTOCOL,
@@ -233,7 +234,11 @@ describe("topics control socket", () => {
 			},
 		};
 		let enabled = true;
-		stop = await startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => (enabled ? host : undefined) });
+		stop = await startTopicsControl({
+			path: socketPath,
+			token: TOKEN,
+			topics: async () => (enabled ? host : undefined),
+		});
 		const client = await connect(socketPath);
 		client.send({ type: "hello", token: TOKEN });
 		await client.next();
@@ -245,7 +250,12 @@ describe("topics control socket", () => {
 		};
 		for (const [id, frame] of Object.entries(frames)) {
 			client.send({ id, ...frame });
-			expect(await client.next()).toMatchObject({ id, success: false, code: refusals[id], error: expect.any(String) });
+			expect(await client.next()).toMatchObject({
+				id,
+				success: false,
+				code: refusals[id],
+				error: expect.any(String),
+			});
 		}
 		client.send({ id: "plain", type: "topics_send", topicId: "Diokan", message: "" });
 		const plain = await client.next();
@@ -285,7 +295,7 @@ describe("topics control socket", () => {
 	it("refuses to take over a socket another server is still answering on", async () => {
 		await expect(
 			startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => undefined }),
-		).rejects.toThrow("in use");
+		).rejects.toMatchObject({ code: "EADDRINUSE" });
 	});
 
 	it("replaces a dead socket left by a crashed run", async () => {
@@ -448,108 +458,187 @@ describe("topics control endpoint for extensions", () => {
 	});
 });
 
-describe("topics control socket path length", () => {
-	let tempDir: TempDir;
+// Unix only: Windows endpoints are named pipes, with neither a path limit nor a uid.
+describe.skipIf(process.getuid === undefined)("topics control socket placement", () => {
+	let root: string;
 	let stop: (() => void) | undefined;
-	const uid = process.getuid!();
+	/** The native relocation directory for socket paths that do not fit `sun_path`. */
+	const relocationDir = () => `/tmp/omp-${process.getuid!()}`;
 
 	beforeEach(() => {
-		tempDir = TempDir.createSync("@omp-topics-path-");
+		// Not derived from TMPDIR: every socket path under this root fits even macOS's 104-byte limit.
+		root = fs.mkdtempSync("/tmp/omp-tc-");
 	});
 
 	afterEach(() => {
 		stop?.();
 		stop = undefined;
-		tempDir.removeSync();
+		fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	/** A runtime dir whose control socket paths exceed the platform limit. */
+	/** A runtime dir whose control socket path cannot fit any platform's `sun_path` (at most 108 bytes). */
 	function longRuntimeDir(): string {
-		const dir = path.join(tempDir.path(), "runtime", "x".repeat(SOCKET_PATH_MAX_BYTES));
-		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		const dir = path.join(root, "x".repeat(120));
+		fs.mkdirSync(dir, { mode: 0o700 });
 		return dir;
 	}
 
-	/** The fallback root: short, inside the test's temp dir instead of the real /tmp. */
-	function fallbackRoot(): string {
-		const root = path.join(tempDir.path(), "fb");
-		fs.mkdirSync(root, { recursive: true });
-		return root;
-	}
-
-	it("falls back to a private <root>/omp-<uid> dir when the runtime dir's socket path is too long, and answers there", async () => {
+	async function launch(runtimeDir: string): Promise<{ stop?: () => void; notices: string[] }> {
 		const notices: string[] = [];
-		const root = fallbackRoot();
-		stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), longRuntimeDir(), {
-			fallbackRoot: root,
+		const stopped = await offerTopicsControl(new EventBus(), async () => fakeHost([]), runtimeDir, {
 			notify: message => notices.push(message),
 		});
-		const endpoint = currentTopicsControl();
-		expect(stop).toBeDefined();
-		expect(notices).toEqual([]);
-		const privateDir = path.join(root, `omp-${uid}`);
-		expect(path.dirname(path.dirname(endpoint!.socketPath))).toBe(privateDir);
-		expect(fs.lstatSync(privateDir).mode & 0o777).toBe(0o700);
-		expect(Buffer.byteLength(endpoint!.socketPath)).toBeLessThanOrEqual(SOCKET_PATH_MAX_BYTES);
-		const client = await connect(endpoint!.socketPath);
-		client.send({ type: "hello", token: endpoint!.token });
-		expect(await client.next()).toMatchObject({ type: "hello", protocol: TOPICS_CONTROL_PROTOCOL });
-		client.end();
-	});
-
-	it("keeps a short runtime dir and never creates the fallback", async () => {
-		const runtime = path.join(tempDir.path(), "rt");
-		fs.mkdirSync(runtime, { mode: 0o700 });
-		const root = fallbackRoot();
-		stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), runtime, { fallbackRoot: root });
-		expect(path.dirname(path.dirname(currentTopicsControl()!.socketPath))).toBe(runtime);
-		expect(fs.existsSync(path.join(root, `omp-${uid}`))).toBe(false);
-	});
-
-	const unsafeFallbacks: Array<[string, (dir: string) => void]> = [
-		[
-			"a symlink",
-			dir => {
-				const target = path.join(path.dirname(dir), "elsewhere");
-				fs.mkdirSync(target, { mode: 0o700 });
-				fs.symlinkSync(target, dir);
-			},
-		],
-		[
-			"open to others (mode 755)",
-			dir => {
-				fs.mkdirSync(dir);
-				fs.chmodSync(dir, 0o755);
-			},
-		],
-	];
-	// Only root can hand the directory to another user.
-	if (uid === 0) {
-		unsafeFallbacks.push([
-			"owned by another user",
-			dir => {
-				fs.mkdirSync(dir, { mode: 0o700 });
-				fs.chownSync(dir, 1, 1);
-			},
-		]);
+		return { stop: stopped, notices };
 	}
-	for (const [label, make] of unsafeFallbacks) {
-		it(`refuses a fallback dir that is ${label}: no socket, and the user is told why`, async () => {
-			const root = fallbackRoot();
-			make(path.join(root, `omp-${uid}`));
-			const notices: string[] = [];
-			const runtime = longRuntimeDir();
-			stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), runtime, {
-				fallbackRoot: root,
-				notify: message => notices.push(message),
-			});
-			expect(stop).toBeUndefined();
+
+	/** Herdr's handshake: one newline-terminated JSON hello carrying the token, answered by the protocol. */
+	async function expectHelloAnswered(endpoint: TopicsControlEndpoint): Promise<void> {
+		const client = await connect(endpoint.socketPath);
+		client.send({ type: "hello", token: endpoint.token });
+		expect(await client.next()).toEqual({ type: "hello", protocol: TOPICS_CONTROL_PROTOCOL, pid: process.pid });
+		client.end();
+	}
+
+	/** Never silent: either a working endpoint in an owner-usable dir and no notice, or no endpoint and one notice. */
+	async function expectWorksOrOneNotice(result: { stop?: () => void; notices: string[] }): Promise<void> {
+		if (!result.stop) {
 			expect(currentTopicsControl()).toBeUndefined();
+			expect(result.notices).toHaveLength(1);
+			return;
+		}
+		expect(result.notices).toEqual([]);
+		const endpoint = currentTopicsControl()!;
+		expect(fs.lstatSync(path.dirname(endpoint.socketPath)).mode & 0o777).toBe(0o700);
+		await expectHelloAnswered(endpoint);
+	}
+
+	it("keeps the socket in a fresh private dir under a short runtime dir", async () => {
+		const result = await launch(root);
+		stop = result.stop;
+		expect(result.notices).toEqual([]);
+		const endpoint = currentTopicsControl()!;
+		expect(path.basename(endpoint.socketPath)).toBe("control.sock");
+		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root);
+		expect(fs.lstatSync(path.dirname(endpoint.socketPath)).mode & 0o777).toBe(0o700);
+		await expectHelloAnswered(endpoint);
+	});
+
+	it("relocates a long runtime dir's socket to the shared native dir, answers a hello there, and removes it on stop", async () => {
+		const runtime = longRuntimeDir();
+		const result = await launch(runtime);
+		stop = result.stop;
+		expect(result.notices).toEqual([]);
+		const endpoint = currentTopicsControl()!;
+		expect(endpoint.socketPath).toMatch(new RegExp(`^${relocationDir()}/[0-9a-f]{16}\\.sock$`));
+		expect(fs.lstatSync(endpoint.socketPath).mode & 0o777).toBe(0o600);
+		await expectHelloAnswered(endpoint);
+		// Topics creates nothing in the runtime dir it could not use.
+		expect(fs.readdirSync(runtime)).toEqual([]);
+
+		stop?.();
+		stop = undefined;
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(fs.existsSync(endpoint.socketPath)).toBe(false);
+		expect(fs.existsSync(`${endpoint.socketPath}.bind.lock`)).toBe(false);
+	});
+
+	it("gives every relocated launch its own endpoint", async () => {
+		const runtime = longRuntimeDir();
+		const first = await launch(runtime);
+		const firstPath = currentTopicsControl()!.socketPath;
+		const second = await launch(runtime);
+		try {
+			expect(currentTopicsControl()!.socketPath).not.toBe(firstPath);
+		} finally {
+			second.stop?.();
+			first.stop?.();
+		}
+	});
+
+	it("turns a placement error into one notice and no endpoint, and never rejects startup", async () => {
+		const lstat = spyOn(fs, "lstatSync").mockImplementation(() => {
+			throw Object.assign(new Error("EIO: injected lstat failure"), { code: "EIO" });
+		});
+		try {
+			const result = await launch(root);
+			stop = result.stop;
+			expect(result.stop).toBeUndefined();
+			expect(currentTopicsControl()).toBeUndefined();
+			expect(result.notices).toHaveLength(1);
+			expect(result.notices[0]).toContain("injected lstat failure");
+
+			// The interactive startup path resolves too, with the same single notice and nothing to dispose.
+			const notices: string[] = [];
+			const disposers: Array<() => void> = [];
+			const previous = process.env.XDG_RUNTIME_DIR;
+			process.env.XDG_RUNTIME_DIR = root;
+			try {
+				await offerSessionTopicsControl(
+					{ getTopicsHost: async () => fakeHost([]), addDisposer: dispose => disposers.push(dispose) },
+					new EventBus(),
+					Settings.isolated({ "topics.enabled": true }),
+					message => notices.push(message),
+				);
+			} finally {
+				if (previous === undefined) delete process.env.XDG_RUNTIME_DIR;
+				else process.env.XDG_RUNTIME_DIR = previous;
+			}
 			expect(notices).toHaveLength(1);
-			expect(notices[0]).toContain(runtime);
-			expect(notices[0]).toContain(`${SOCKET_PATH_MAX_BYTES}-byte limit`);
-			expect(notices[0]).toContain(path.join(root, `omp-${uid}`));
-			expect(fs.readdirSync(runtime)).toEqual([]);
+			expect(disposers).toEqual([]);
+		} finally {
+			lstat.mockRestore();
+		}
+		// Nothing half-made is left behind.
+		expect(fs.readdirSync(root)).toEqual([]);
+	});
+
+	it("turns a listen error into one notice", async () => {
+		// A runtime "dir" that is a regular file: the control dir cannot be created in it.
+		const file = path.join(root, "not-a-dir");
+		fs.writeFileSync(file, "");
+		const result = await launch(file);
+		expect(result.stop).toBeUndefined();
+		expect(result.notices).toHaveLength(1);
+		expect(result.notices[0]).toContain(file);
+	});
+
+	for (const [label, runtimeDir] of [
+		["a short", () => root],
+		["a long (relocated)", longRuntimeDir],
+	] as const) {
+		it(`under umask 0700, ${label} runtime dir works or tells the user once, and so does the next normal launch`, async () => {
+			const runtime = runtimeDir();
+			const previous = process.umask(0o700);
+			let restrictive: { stop?: () => void; notices: string[] };
+			try {
+				restrictive = await launch(runtime);
+			} finally {
+				process.umask(previous);
+			}
+			try {
+				await expectWorksOrOneNotice(restrictive);
+			} finally {
+				restrictive.stop?.();
+			}
+			const normal = await launch(runtime);
+			stop = normal.stop;
+			await expectWorksOrOneNotice(normal);
 		});
 	}
+
+	it("repairs a relocation dir that a restrictive umask left without owner access", async () => {
+		const dir = relocationDir();
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		// What `mkdir(dir, 0o700)` creates under umask 0700; it is still private, so it used to pass as usable.
+		fs.chmodSync(dir, 0o000);
+		try {
+			const result = await launch(longRuntimeDir());
+			stop = result.stop;
+			await expectWorksOrOneNotice(result);
+			// Never left unusable for this user's next launch (or another omp's socket).
+			if (result.stop) expect(fs.lstatSync(dir).mode & 0o777).toBe(0o700);
+		} finally {
+			if (fs.lstatSync(dir).uid === process.getuid!()) fs.chmodSync(dir, 0o700);
+		}
+	});
 });

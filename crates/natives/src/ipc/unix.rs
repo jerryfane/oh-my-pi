@@ -290,7 +290,9 @@ fn ensure_private_dir(dir: &Path, euid: u32) -> Result<(), IpcError> {
 			format!("{} is not a directory owned by uid {euid}", dir.display()),
 		));
 	}
-	if meta.mode() & 0o077 != 0 {
+	// Exactly 0700: also repairs a dir a restrictive umask left without owner
+	// access, which would otherwise pass as private and fail every bind.
+	if meta.mode() & 0o777 != 0o700 {
 		fs::set_permissions(dir, Permissions::from_mode(0o700))
 			.map_err(|error| IpcError::io(&error, &format!("chmod {}", dir.display())))?;
 	}
@@ -352,5 +354,24 @@ impl Stream {
 			return Err(io::Error::last_os_error());
 		}
 		Ok(WriteFinish::HalfClosed)
+	}
+}
+
+#[cfg(test)]
+mod tests {
+	use super::*;
+
+	#[test]
+	fn ensure_private_dir_repairs_a_dir_without_owner_access() {
+		let dir = std::env::temp_dir().join(format!("omp-ipc-private-{}", std::process::id()));
+		let _ = fs::remove_dir(&dir);
+		// What `mkdir(0700)` yields under umask 0700.
+		DirBuilder::new().mode(0o000).create(&dir).unwrap();
+		fs::set_permissions(&dir, Permissions::from_mode(0o000)).unwrap();
+		let result = ensure_private_dir(&dir, euid());
+		let mode = fs::symlink_metadata(&dir).unwrap().mode() & 0o777;
+		fs::remove_dir(&dir).unwrap();
+		assert!(result.is_ok());
+		assert_eq!(mode, 0o700);
 	}
 }

@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed `IpcServer.listen` accepting a `/tmp/omp-<euid>` relocation directory left without owner access by a restrictive umask (every bind then failed); it is now repaired to mode 0700.
+
 ## [19.0.0] - 2026-11-18
 
 ### Added
