@@ -336,15 +336,17 @@ export interface TopicsControlBus {
 
 /** Run every step in order, even after one throws; then rethrow the first failure. */
 function runEach(steps: ReadonlyArray<() => void>): void {
-	const failures: unknown[] = [];
+	let failed = false;
+	let first: unknown;
 	for (const step of steps) {
 		try {
 			step();
 		} catch (error) {
-			failures.push(error);
+			if (!failed) first = error;
+			failed = true;
 		}
 	}
-	if (failures.length > 0) throw failures[0];
+	if (failed) throw first;
 }
 
 /** Set only by {@link offerTopicsControl}; nothing on the event bus can change it. */
@@ -460,12 +462,9 @@ export async function offerTopicsControl(
 		}
 	} catch (error) {
 		try {
-			try {
-				// A bound listener stops before its directory goes.
-				stop?.();
-			} finally {
-				if (dir) fs.rmSync(dir, { recursive: true, force: true });
-			}
+			// Once bound, the disposer is the directory's one cleanup owner (it stops the listener first).
+			if (stop) stop();
+			else if (dir) fs.rmSync(dir, { recursive: true, force: true });
 		} catch (cleanupError) {
 			logger.warn("topics control: cleanup after a failed start failed", { error: String(cleanupError) });
 		}

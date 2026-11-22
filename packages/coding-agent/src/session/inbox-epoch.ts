@@ -9,6 +9,9 @@
  * and stops wherever it finds it aborted.
  */
 
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import type { UserMessage } from "@oh-my-pi/pi-ai";
+
 /** Work bound to a transcript that was replaced, or captured while a replacement runs. */
 export class StaleTranscriptError extends Error {
 	constructor() {
@@ -71,4 +74,37 @@ export class InboxEpochs {
 
 	/** Whether a queued `message` may still be delivered: unbound, or its transcript was not replaced. */
 	readonly isLive = (message: object): boolean => this.#boundMessages.get(message)?.aborted !== true;
+}
+
+/**
+ * Admit a transcript-bound prompt at its last check before dispatch: put `transcriptPreamble` ahead of the prompt's
+ * text, in the prompt itself (`message`, or its prepared form, the last user message of `messages`), then report the
+ * admission. Only here does the preamble join the prompt: no setup step before it reads the preamble.
+ */
+export function admitBoundPrompt(
+	messages: AgentMessage[],
+	message: AgentMessage,
+	options: { transcriptPreamble?: string; onPromptAdmitted?: () => void },
+): void {
+	const preamble = options.transcriptPreamble;
+	if (preamble) {
+		const index = messages.includes(message)
+			? messages.indexOf(message)
+			: messages.findLastIndex(m => m.role === "user");
+		const prompt = messages[index];
+		if (prompt?.role !== "user") throw new Error("A transcript-bound prompt with a preamble must be a user message.");
+		// In place: the prompt keeps its identity (turn observation, queued-message bookkeeping).
+		prompt.content = withPreamble(prompt.content, preamble);
+	}
+	options.onPromptAdmitted?.();
+}
+
+/** `content` with `preamble` ahead of its text, joined to its first text block as one text. */
+function withPreamble(content: UserMessage["content"], preamble: string): UserMessage["content"] {
+	if (typeof content === "string") return `${preamble}\n\n${content}`;
+	const first = content.findIndex(block => block.type === "text");
+	if (first < 0) return [{ type: "text", text: preamble }, ...content];
+	return content.map((block, index) =>
+		index === first && block.type === "text" ? { ...block, text: `${preamble}\n\n${block.text}` } : block,
+	);
 }

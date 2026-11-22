@@ -339,6 +339,7 @@ import type {
 	ModelCycleResult,
 	Prewalk,
 	PromptOptions,
+	PromptSetupOptions,
 	ResetSessionContextResult,
 	ResolvedRoleModel,
 	RestoredQueuedMessage,
@@ -527,7 +528,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
-import { type InboxEpoch, InboxEpochs, StaleTranscriptError, throwIfStale } from "./inbox-epoch";
+import { admitBoundPrompt, type InboxEpoch, InboxEpochs, StaleTranscriptError, throwIfStale } from "./inbox-epoch";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -9997,17 +9998,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async #promptWithMessage(
 		message: AgentMessage,
 		expandedText: string,
-		options?: Pick<
-			PromptOptions,
-			"toolChoice" | "images" | "skipCompactionCheck" | "solutionSpace" | "onPromptAdmitted" | "topicBoard"
-		> & {
+		options?: PromptSetupOptions & {
 			prependMessages?: AgentMessage[];
 			skipPostPromptRecoveryWait?: boolean;
 			acceptTerminalEmptyStop?: boolean;
 			/** Follow-ups held until this run goes live; queued behind it then. */
 			followUpBatch?: PromptFollowUps;
-			/** See {@link promptCustomMessage}'s `transcriptSignal`. */
-			transcriptSignal?: AbortSignal;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -10229,7 +10225,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt; else admitted.
 			if (options?.transcriptSignal?.aborted) return false;
-			if (options?.transcriptSignal) options.onPromptAdmitted?.();
+			if (options?.transcriptSignal) admitBoundPrompt(messages, message, options);
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,

@@ -452,6 +452,19 @@ export interface AgentSessionConfig {
 }
 
 /** Options for AgentSession.prompt(). */
+/** What prompt setup (`#promptWithMessage`) reads of {@link PromptOptions}. */
+export type PromptSetupOptions = Pick<
+	PromptOptions,
+	| "toolChoice"
+	| "images"
+	| "skipCompactionCheck"
+	| "solutionSpace"
+	| "onPromptAdmitted"
+	| "topicBoard"
+	| "transcriptSignal"
+	| "transcriptPreamble"
+>;
+
 export interface PromptOptions {
 	/** Whether to expand file-based prompt templates (default: true). */
 	expandPromptTemplates?: boolean;
@@ -504,6 +517,13 @@ export interface PromptOptions {
 	 * ({@link onPromptAdmitted}) only at that last check.
 	 */
 	transcriptSignal?: AbortSignal;
+	/**
+	 * Text put ahead of a {@link transcriptSignal}-bound prompt, in the same message, only when it is admitted (its
+	 * last transcript check, right before dispatch). Nothing that runs before that sees it: command and template
+	 * expansion, mentions, keyword notices, preludes, file mentions, `before_agent_start` hooks, auto-thinking,
+	 * chillax, prewalk and auto-parallel all read the prompt without it.
+	 */
+	transcriptPreamble?: string;
 	/**
 	 * Called synchronously when this prompt is pushed onto the steer or
 	 * follow-up queue, just before {@link onPromptAdmitted}, with the messages it
