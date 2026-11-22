@@ -10256,7 +10256,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// The batch is final and synchronous to dispatch: a replaced transcript drops a bound prompt; else admitted.
 			if (bound && !bound.admit(messages)) return false;
-			notices.commit(); // Only a batch that is sent records what its notices delivered.
+			notices.commit(messages); // Only a batch that is sent records what the notices it carries delivered.
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

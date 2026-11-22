@@ -136,6 +136,9 @@ export interface VibeParentSession {
 	getModelString?: () => string | undefined;
 }
 
+/** The parent journal a lifecycle row was appended to, and is flushed through. */
+type LifecycleWriter = NonNullable<VibeParentSession["sessionManager"]>;
+
 interface VibeRestoreCandidate {
 	spawn: VibeSpawnLifecycleEvent;
 	turnCount: number;
@@ -477,28 +480,26 @@ export class VibeSessionRegistry {
 		expectedParentSessionFile: string | null,
 		transcriptSignal?: AbortSignal,
 	): Promise<boolean> {
-		const { appended } = await this.#appendLifecycleEntry(
-			session,
-			event,
-			expectedParentSessionFile,
-			transcriptSignal,
-		);
-		if (appended) await session.sessionManager?.flush();
-		return appended;
+		const entry = await this.#appendLifecycleEntry(session, event, expectedParentSessionFile, transcriptSignal);
+		if (!entry.appended) return false;
+		await entry.writer.flush();
+		return true;
 	}
 
 	/**
 	 * Append `event` to the parent transcript, unflushed, if it is still the one the worker belongs to: the same
 	 * session and file and, with `transcriptSignal` (a seed's), the same transcript (a `/tree` keeps the file and
-	 * session but ends it). Checked again after every await, right before the append. The caller flushes.
+	 * session but ends it). Checked again after every await, right before the append. Appended, the result carries
+	 * the writer that holds the row, for the caller to flush.
 	 */
 	async #appendLifecycleEntry(
 		session: VibeParentSession,
 		event: VibeLifecycleEvent,
 		expectedParentSessionFile: string | null,
 		transcriptSignal?: AbortSignal,
-	): Promise<{ appended: boolean }> {
-		if (!expectedParentSessionFile || !session.sessionManager) return { appended: false };
+	): Promise<{ appended: false } | { appended: true; writer: LifecycleWriter }> {
+		const writer = session.sessionManager;
+		if (!expectedParentSessionFile || !writer) return { appended: false };
 		const matchesCurrentScope = (): boolean => {
 			const currentSessionFile = session.getSessionFile();
 			return (
@@ -510,10 +511,10 @@ export class VibeSessionRegistry {
 			);
 		};
 		if (!matchesCurrentScope()) return { appended: false };
-		await session.sessionManager.ensureOnDisk();
+		await writer.ensureOnDisk();
 		if (!matchesCurrentScope()) return { appended: false };
-		session.sessionManager.appendCustomEntry(VIBE_LIFECYCLE_CUSTOM_TYPE, event);
-		return { appended: true };
+		writer.appendCustomEntry(VIBE_LIFECYCLE_CUSTOM_TYPE, event);
+		return { appended: true, writer };
 	}
 
 	#eventBase(record: VibeRecord): VibeLifecycleBase {
@@ -1009,7 +1010,7 @@ export class VibeSessionRegistry {
 		let appended = false;
 		try {
 			if (childSessionFile) {
-				({ appended } = await this.#appendLifecycleEntry(
+				const entry = await this.#appendLifecycleEntry(
 					session,
 					{
 						...this.#eventBase(record),
@@ -1022,9 +1023,10 @@ export class VibeSessionRegistry {
 					},
 					record.parentSessionFile,
 					signal,
-				));
-				if (!appended) throw new ToolError("Vibe parent session changed before the worker could start.");
-				await session.sessionManager?.flush();
+				);
+				if (!entry.appended) throw new ToolError("Vibe parent session changed before the worker could start.");
+				appended = true;
+				await entry.writer.flush();
 			}
 			// The last await is behind us: a seed's transcript still holding now holds until the worker is published.
 			throwIfStale(signal);
