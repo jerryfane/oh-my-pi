@@ -9,7 +9,7 @@
 import { completeSimple } from "@oh-my-pi/pi-ai";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import { cfgOffline } from "../config/auxiliary-model-policy";
-import { resolveRoleSelection } from "../config/model-resolver";
+import { resolveRoleChain } from "../config/model-resolver";
 import seedTemplate from "../prompts/system/topic-seed.md" with { type: "text" };
 import seedSummaryPrompt from "../prompts/system/topic-seed-summary.md" with { type: "text" };
 import { escapeHarnessTags } from "../session/harness-tags";
@@ -78,9 +78,10 @@ export async function buildTopicSeed(args: {
 }
 
 /**
- * The summarizer for `session`'s topics: one call to the `smol` role model
- * (same provider only when offline), journaled and cost-gated like other
- * auxiliary calls. No usable model counts as a failed summary.
+ * The summarizer for `session`'s topics: one call to the `smol` role model,
+ * the configured role or else its default priority chain (same provider only
+ * when offline), journaled and cost-gated like other auxiliary calls. No
+ * usable model counts as a failed summary.
  */
 export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 	return async transcript => {
@@ -90,11 +91,11 @@ export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 		const activeProvider = session.getActiveModel?.()?.provider;
 		if (offline && !activeProvider) return undefined;
 		const available = registry.getAvailable();
-		const model = resolveRoleSelection(
-			["smol"],
+		const model = resolveRoleChain(
+			"smol",
 			session.settings,
 			offline ? available.filter(candidate => candidate.provider === activeProvider) : available,
-		)?.model;
+		)[0]?.model;
 		if (!model) return undefined;
 		const sessionId = session.getSessionId?.() ?? undefined;
 		const journal = journalCompletion(session.sessionManager, { purpose: "topic-seed-summary", role: "smol" });
