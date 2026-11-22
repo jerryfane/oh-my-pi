@@ -77,7 +77,7 @@ import { matchModelPattern } from "../utils/model-patterns";
 import { resolveToolWireName } from "../utils/tool-wire-name";
 
 import type { CustomMessage } from "./messages";
-import { isUserQueuedMessage, SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
+import { SESSION_AGENT_NOTICE_TYPE } from "./queued-messages";
 import type { SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 
@@ -433,15 +433,6 @@ interface DeliverableNotice<T> {
 	commit(): void;
 }
 
-/** The notices a prompt's batch carries, built without consuming anything ({@link SessionTools.previewNotices}). */
-export interface PromptNoticesPreview {
-	/** Every notice, in batch order. */
-	readonly all: readonly CustomMessage[];
-	/** The mount and roster notices: {@link commit} records them delivered, so the takes no longer build them. */
-	readonly delivered: readonly CustomMessage[];
-	commit(): void;
-}
-
 function snapshotDelta(delta: NameDelta | undefined): NameDelta | undefined {
 	return delta && { added: new Set(delta.added), removed: new Set(delta.removed) };
 }
@@ -481,6 +472,8 @@ export class SessionTools {
 	 * override hides it, the complete pending delta still does.
 	 */
 	#basePromptReflectsRosterDelta = false;
+	/** The delivery state each taken notice captured, run by {@link deliverNotices} once its batch is admitted. */
+	readonly #noticeDelivery = new WeakMap<AgentMessage, () => void>();
 	/**
 	 * Newest assistant reply restored with the transcript this session was
 	 * created with, and the recorded digest of the prompt that transcript was
@@ -2070,12 +2063,12 @@ export class SessionTools {
 	}
 
 	/**
-	 * Consumes the hidden provider-visible roster notice for the current pending
+	 * Takes the hidden provider-visible roster notice for the current pending
 	 * delta. This carries no meaningful payload (a short tool-name list), so it is
 	 * never previewed or deferred for context budgeting: it is re-derived from the
 	 * live delta after pre-prompt maintenance, keeping the model's stated
-	 * availability in lockstep with the wire tool list. (A batch that may be
-	 * refused previews it with the rest: {@link previewNotices}.)
+	 * availability in lockstep with the wire tool list. The delta it announces is
+	 * recorded as delivered once the batch carrying it is ({@link deliverNotices}).
 	 *
 	 * When a rebuilt base is delivered, the notice includes only changes made after
 	 * that snapshot. A per-turn `before_agent_start` override that hides the rebuilt
@@ -2085,13 +2078,11 @@ export class SessionTools {
 	takePendingToolRosterNotice(options: {
 		baseDelivered: boolean;
 	}): CustomMessage<ToolRosterNoticeDetails> | undefined {
-		const roster = this.#previewToolRosterNotice(options.baseDelivered);
-		roster.commit();
-		return roster.notice;
+		return this.#deliverWhenSent(this.#buildToolRosterNotice(options.baseDelivered));
 	}
 
-	/** The roster notice {@link takePendingToolRosterNotice} takes; `commit` records the delta as previewed delivered. */
-	#previewToolRosterNotice(baseDelivered: boolean): DeliverableNotice<ToolRosterNoticeDetails> {
+	/** The roster notice {@link takePendingToolRosterNotice} takes; `commit` records the delta as taken delivered. */
+	#buildToolRosterNotice(baseDelivered: boolean): DeliverableNotice<ToolRosterNoticeDetails> {
 		const pending =
 			baseDelivered && this.#basePromptReflectsRosterDelta
 				? this.#pendingToolRosterDeltaAfterBase
@@ -2109,31 +2100,30 @@ export class SessionTools {
 	}
 
 	/**
-	 * The notices the takes would add to `message`'s batch (none unless it is a user prompt), built without
-	 * consuming anything, for a batch that may yet be refused (a transcript-bound prompt). `all` is in batch order:
-	 * the `xd://` mount notice while `xdev` (the earlier preview) still holds, the tool roster, then the eval-prelude,
-	 * session-agent and skill notices. Once the batch is admitted, `commit` records the mount and roster deltas those
-	 * notices carry as delivered, exactly as previewed (a change since stays pending), and the takes build neither
-	 * again: the caller adds them (`delivered`). The takes rebuild the other three, which derive from the transcript.
+	 * `taken`'s notice, whose delivery state waits for {@link deliverNotices} of a batch that carries it. A take
+	 * with no notice records at once what the base prompt this request carries already delivered.
 	 */
-	previewNotices(
-		message: AgentMessage,
-		baseDelivered: boolean,
-		xdev: { contentKey: string } | undefined,
-	): PromptNoticesPreview {
-		if (!isUserQueuedMessage(message)) return { all: [], delivered: [], commit: () => {} };
-		const mount = xdev && this.#previewXdevMountNotice(baseDelivered, xdev.contentKey);
-		const roster = this.#previewToolRosterNotice(baseDelivered);
-		const delivered = [mount?.notice, roster.notice].filter(notice => notice !== undefined);
-		const derived = [this.takeEvalPreludeNotice(), this.takeSessionAgentNotice(), this.takeSkillNotice()];
-		return {
-			all: [...delivered, ...derived.filter(notice => notice !== undefined)],
-			delivered,
-			commit: () => {
-				mount?.commit();
-				roster.commit();
-			},
-		};
+	#deliverWhenSent<T>(taken: DeliverableNotice<T>): CustomMessage<T> | undefined {
+		if (!taken.notice) {
+			taken.commit();
+			return undefined;
+		}
+		this.#noticeDelivery.set(taken.notice, taken.commit);
+		return taken.notice;
+	}
+
+	/**
+	 * Record the notices `messages` carries (the final batch, once it is admitted for dispatch) as delivered:
+	 * exactly the roster and `xd://` mount deltas each announced when it was taken, so a change since stays pending.
+	 * A batch that is not sent leaves those deltas pending for the next prompt's notices.
+	 */
+	deliverNotices(messages: readonly AgentMessage[]): void {
+		for (const message of messages) {
+			const commit = this.#noticeDelivery.get(message);
+			if (!commit) continue;
+			this.#noticeDelivery.delete(message);
+			commit();
+		}
 	}
 
 	#buildPendingToolRosterNotice(
@@ -2383,20 +2373,21 @@ export class SessionTools {
 	}
 
 	/**
-	 * Consumes the mount notice only when its rendered content still matches the
-	 * preview included in the context estimate.
+	 * Takes the mount notice only when its rendered content still matches the
+	 * preview included in the context estimate; the delta it announces is
+	 * recorded as delivered once the batch carrying it is ({@link deliverNotices}).
 	 */
 	takePendingXdevMountNotice(options: {
 		baseCatalogDelivered: boolean;
 		expectedContentKey: string;
 	}): CustomMessage<XdevMountNoticeDetails> | undefined {
-		const mount = this.#previewXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey);
-		mount.commit();
-		return mount.notice;
+		return this.#deliverWhenSent(
+			this.#buildXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey),
+		);
 	}
 
-	/** The mount notice {@link takePendingXdevMountNotice} takes; `commit` records the delta as previewed delivered. */
-	#previewXdevMountNotice(
+	/** The mount notice {@link takePendingXdevMountNotice} takes; `commit` records the delta as taken delivered. */
+	#buildXdevMountNotice(
 		baseCatalogDelivered: boolean,
 		expectedContentKey: string,
 	): DeliverableNotice<XdevMountNoticeDetails> {
@@ -2408,13 +2399,10 @@ export class SessionTools {
 			// same-named MCP tool reconnect whose schema replacement does not change
 			// mount membership or the applied-tool signature.
 			// If maintenance delivered a rebuilt base, commit additions carried by
-			// that prompt before deferring the remaining notice content.
-			return {
-				notice: undefined,
-				commit: () => {
-					if (baseCatalogDelivered) this.#recordBasePromptXdevAdditions();
-				},
-			};
+			// that prompt before deferring the remaining notice content: those it
+			// carries now, not a later mount a later rebuild adds.
+			const carried = baseCatalogDelivered ? this.#basePromptXdevAdditions() : [];
+			return { notice: undefined, commit: () => this.#recordBasePromptXdevAdditions(carried) };
 		}
 		// A hidden base rebuild can leave the projected notice byte-identical. The
 		// exact content was already budgeted, so consume it rather than withholding
@@ -2443,14 +2431,19 @@ export class SessionTools {
 		return content.map(part => (part.type === "text" ? part.text : "")).join("\u0000");
 	}
 
-	#recordBasePromptXdevAdditions(): void {
+	/** The pending mount additions the committed base prompt's catalog carries. */
+	#basePromptXdevAdditions(): string[] {
+		return [...(this.#pendingXdevMountDelta?.added ?? [])].filter(name => this.#basePromptXdevNames.has(name));
+	}
+
+	/** Record the base-carried additions `carried` (as captured) announced: they leave the pending delta. */
+	#recordBasePromptXdevAdditions(carried: readonly string[]): void {
 		const pending = this.#pendingXdevMountDelta;
 		if (!pending) return;
 		this.#ensureAnnouncedMountsSeeded();
 		let changed = false;
-		for (const name of pending.added) {
-			if (!this.#basePromptXdevNames.has(name)) continue;
-			pending.added.delete(name);
+		for (const name of carried) {
+			if (!pending.added.delete(name)) continue;
 			this.#announcedMounts.add(name);
 			changed = true;
 		}
