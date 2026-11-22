@@ -4,14 +4,16 @@
  * Extensions read the endpoint from omp's own state, never from the event
  * bus, which only says that it changed; startup clears what crashed runs left.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
 import {
 	currentTopicsControl,
 	MIN_TOKEN_LENGTH,
+	offerSessionTopicsControl,
 	offerTopicsControl,
 	startTopicsControl,
 	TOPICS_CONTROL_CHANNEL,
@@ -444,5 +446,129 @@ describe("topics control endpoint for extensions", () => {
 		} finally {
 			listener.stop(true);
 		}
+	});
+});
+
+// Unix only: Windows endpoints have no socket path limit and no uid.
+describe.skipIf(process.getuid === undefined)("topics control socket path", () => {
+	let root: string;
+	let stop: (() => void) | undefined;
+
+	beforeEach(() => {
+		// A private root, not TMPDIR: every socket path under it fits even macOS's 104-byte sun_path.
+		root = fs.mkdtempSync("/tmp/omp-tc-");
+	});
+
+	afterEach(() => {
+		stop?.();
+		stop = undefined;
+		fs.rmSync(root, { recursive: true, force: true });
+	});
+
+	async function launch(runtimeDir: string): Promise<{ stop?: () => void; notices: string[] }> {
+		const notices: string[] = [];
+		const stopped = await offerTopicsControl(
+			new EventBus(),
+			async () => fakeHost([]),
+			runtimeDir,
+			message => notices.push(message),
+		);
+		return { stop: stopped, notices };
+	}
+
+	/** Herdr's handshake: one newline-terminated JSON hello carrying the token. */
+	async function expectHelloAnswered(endpoint: TopicsControlEndpoint): Promise<void> {
+		const client = await connect(endpoint.socketPath);
+		client.send({ type: "hello", token: endpoint.token });
+		expect(await client.next()).toEqual({ type: "hello", protocol: TOPICS_CONTROL_PROTOCOL, pid: process.pid });
+		client.end();
+	}
+
+	it("refuses a runtime dir whose socket path cannot fit: nothing created, one notice with the size", async () => {
+		const runtime = path.join(root, "x".repeat(120));
+		fs.mkdirSync(runtime, { mode: 0o700 });
+		const result = await launch(runtime);
+		expect(result.stop).toBeUndefined();
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(fs.readdirSync(runtime)).toEqual([]);
+		const limit = process.platform === "darwin" ? 104 : 108;
+		const bytes = Buffer.byteLength(path.join(runtime, "omp-topics-XXXXXX", "control.sock")) + 1;
+		expect(result.notices).toEqual([
+			`Topics host control unavailable: socket path would be ${bytes} bytes (limit ${limit}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`,
+		]);
+	});
+
+	it("keeps a short runtime dir as is and answers a hello there", async () => {
+		const result = await launch(root);
+		stop = result.stop;
+		expect(result.notices).toEqual([]);
+		const endpoint = currentTopicsControl()!;
+		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root);
+		expect(path.basename(endpoint.socketPath)).toBe("control.sock");
+		await expectHelloAnswered(endpoint);
+	});
+
+	it("publishes an absolute path for a relative runtime dir and removes it on stop from any cwd", async () => {
+		const cwd = process.cwd();
+		process.chdir(root);
+		let result: { stop?: () => void; notices: string[] };
+		try {
+			fs.mkdirSync("rt", { mode: 0o700 });
+			result = await launch("rt");
+		} finally {
+			process.chdir(cwd);
+		}
+		expect(result.notices).toEqual([]);
+		const endpoint = currentTopicsControl()!;
+		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(path.join(fs.realpathSync(root), "rt"));
+		await expectHelloAnswered(endpoint);
+		result.stop?.();
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(fs.readdirSync(path.join(root, "rt"))).toEqual([]);
+	});
+
+	it("turns a mkdtemp failure into one notice and lets interactive startup continue", async () => {
+		const mkdtemp = spyOn(fs, "mkdtempSync").mockImplementation(() => {
+			throw Object.assign(new Error("EIO: injected mkdtemp failure"), { code: "EIO" });
+		});
+		const previous = process.env.XDG_RUNTIME_DIR;
+		process.env.XDG_RUNTIME_DIR = root;
+		try {
+			const result = await launch(root);
+			expect(result.stop).toBeUndefined();
+			expect(result.notices).toHaveLength(1);
+			expect(result.notices[0]).toStartWith("Topics host control unavailable: EIO: injected mkdtemp failure");
+
+			const notices: string[] = [];
+			const disposers: Array<() => void> = [];
+			await offerSessionTopicsControl(
+				{ getTopicsHost: async () => fakeHost([]), addDisposer: dispose => disposers.push(dispose) },
+				new EventBus(),
+				Settings.isolated({ "topics.enabled": true }),
+				message => notices.push(message),
+			);
+			expect(notices).toHaveLength(1);
+			expect(disposers).toEqual([]);
+		} finally {
+			mkdtemp.mockRestore();
+			if (previous === undefined) delete process.env.XDG_RUNTIME_DIR;
+			else process.env.XDG_RUNTIME_DIR = previous;
+		}
+	});
+
+	it("turns a listen failure into one notice and removes the dir it made", async () => {
+		const listen = spyOn(Bun, "listen").mockImplementation(() => {
+			throw new Error("injected listen failure");
+		});
+		try {
+			const result = await launch(root);
+			expect(result.stop).toBeUndefined();
+			expect(currentTopicsControl()).toBeUndefined();
+			expect(result.notices).toHaveLength(1);
+			expect(result.notices[0]).toContain("injected listen failure");
+		} finally {
+			listen.mockRestore();
+		}
+		expect(fs.readdirSync(root)).toEqual([]);
 	});
 });

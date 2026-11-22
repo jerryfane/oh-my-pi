@@ -63,6 +63,7 @@
 
 ### Fixed
 
+- Fixed the topics host control socket silently failing when `$XDG_RUNTIME_DIR` (or the temp dir) is too long for a Unix socket path: omp now creates nothing, shows one startup notice with the path size and limit, and keeps topics working without host control. Every other control-socket startup failure shows the same notice instead of aborting interactive startup, and a relative runtime dir is resolved to an absolute path.
 - Fixed MCP resource links and binary resources so they remain accessible as readable files or inline content rather than being dropped or shown only as placeholders.
 - Fixed commit drafts after pre-commit hooks and partial prior commits so the index, diff, selected blocks, amended parent, review files, and generated summaries remain accurate.
 - Fixed automatic Hindsight and Mnemopi retention during runs with async work, subagents, or peer messages, preventing duplicate or overlapping retention.
