@@ -2,6 +2,8 @@
  * What the topics host needs from the Inbox (the top-level session): its
  * entries, hidden state entries, visible notes that never start or interrupt a
  * turn, and one queued turn (Organise) that never interrupts a running one.
+ * Writes name the Inbox session they belong to and refuse once another session
+ * is open, so nothing meant for one conversation lands in the next.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
@@ -14,6 +16,14 @@ export interface InboxMessage {
 	details: unknown;
 }
 
+/** A write for an Inbox session that is no longer the open one (a `/new` or a switch came first). */
+export class InboxChangedError extends Error {
+	constructor() {
+		super("The Inbox session changed before the change could be saved.");
+		this.name = "InboxChangedError";
+	}
+}
+
 export interface TopicsInbox {
 	/** Id of the Inbox's current session; a session switch changes it. */
 	sessionId(): string;
@@ -21,29 +31,36 @@ export interface TopicsInbox {
 	branch(): readonly SessionEntry[];
 	/** Every entry of the session file, in file order. */
 	entries(): readonly SessionEntry[];
-	/** Append a hidden custom entry; resolves once it is on disk, rejects when the write fails. */
-	appendState(customType: string, data: unknown): Promise<void>;
 	/**
-	 * Record a visible custom message that the model sees from its next turn on
-	 * ({@link AgentSession.recordWithoutTurn}): now while the Inbox is idle, else
-	 * at its running turn's boundary. It never starts or interrupts a turn.
-	 * Resolves true once it is on disk; false when it was dropped (the session
-	 * was disposed or its transcript replaced first) or could not be written.
+	 * Append a hidden custom entry to session `sessionId`, all or nothing: it
+	 * resolves once the entry is on disk; a failed write leaves no entry behind
+	 * and rejects, and so does another open session ({@link InboxChangedError}).
 	 */
-	appendNote(message: InboxMessage): Promise<boolean>;
+	appendState(sessionId: string, customType: string, data: unknown): Promise<void>;
 	/**
-	 * Run `message` (hidden) as one Inbox turn: started at once when idle, else
-	 * queued as a follow-up behind the running turn, never interrupting it.
-	 * `queued` = the Inbox was busy.
+	 * Record a visible custom message in session `sessionId` that the model sees
+	 * from its next turn on ({@link AgentSession.recordWithoutTurn}): now while
+	 * the Inbox is idle, else at its running turn's boundary. It never starts or
+	 * interrupts a turn. Resolves true once it is on disk; false when another
+	 * session is open, or it was dropped or could not be written.
 	 */
-	queueTurn(message: InboxMessage): { queued: boolean };
-	/** Whether the turn {@link queueTurn} queued for `customType` is still queued or running. */
+	appendNote(sessionId: string, message: InboxMessage): Promise<boolean>;
+	/**
+	 * Run `message` (hidden) as one Inbox turn, never overtaking or interrupting
+	 * other work: behind prompts still in setup, then started at once when idle,
+	 * else queued as a follow-up. Resolves once the turn started (`queued: false`)
+	 * or was queued (`queued: true`); rejects when it could not be started.
+	 */
+	queueTurn(message: InboxMessage): Promise<{ queued: boolean }>;
+	/** Whether the turn {@link queueTurn} queued for `customType` is still waiting, queued or running. */
 	turnPending(customType: string): boolean;
 }
 
-interface QueuedTurn {
-	/** The prompt call has not settled yet. */
+interface PendingTurn {
+	/** Waiting for earlier prompts, or its own prompt call has not settled yet. */
 	dispatching: boolean;
+	/** It went onto the follow-up queue. */
+	queued: boolean;
 	/** The turn took the message (its `message_start` was seen). */
 	started: boolean;
 	done(): void;
@@ -51,17 +68,23 @@ interface QueuedTurn {
 
 /** The Inbox surface of a top-level {@link AgentSession}. */
 export function sessionInbox(session: AgentSession): TopicsInbox {
-	const turns = new Map<string, QueuedTurn>();
+	const turns = new Map<string, PendingTurn>();
+	const manager = session.sessionManager;
 
 	return {
-		sessionId: () => session.sessionManager.getSessionId(),
-		branch: () => session.sessionManager.getBranch(),
-		entries: () => session.sessionManager.getEntriesView(),
-		async appendState(customType, data) {
-			session.sessionManager.appendCustomEntry(customType, data);
-			await session.sessionManager.flush();
+		sessionId: () => manager.getSessionId(),
+		branch: () => manager.getBranch(),
+		entries: () => manager.getEntriesView(),
+		async appendState(sessionId, customType, data) {
+			if (manager.getSessionId() !== sessionId) throw new InboxChangedError();
+			await manager.appendEntriesAtomically(() => {
+				// Checked again under the write lock: a switch may have happened while it waited.
+				if (manager.getSessionId() !== sessionId) throw new InboxChangedError();
+				manager.appendCustomEntry(customType, data);
+			});
 		},
-		async appendNote({ customType, content, details }) {
+		async appendNote(sessionId, { customType, content, details }) {
+			if (manager.getSessionId() !== sessionId) return false;
 			try {
 				await session.recordWithoutTurn({
 					role: "custom",
@@ -81,10 +104,11 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				return false;
 			}
 		},
-		queueTurn({ customType, content, details }) {
-			const queued = session.isStreaming;
-			const turn: QueuedTurn = {
+		async queueTurn({ customType, content, details }) {
+			const outcome = Promise.withResolvers<{ queued: boolean }>();
+			const turn: PendingTurn = {
 				dispatching: true,
+				queued: false,
 				started: false,
 				done() {
 					unsubscribe();
@@ -93,20 +117,40 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 			};
 			const unsubscribe = session.subscribe(event => {
 				if (event.type === "message_start" && event.message.role === "custom") {
-					if (event.message.customType === customType) turn.started = true;
+					if (event.message.customType !== customType || turn.started) return;
+					turn.started = true;
+					if (!turn.queued) outcome.resolve({ queued: false });
 				} else if (event.type === "agent_end" && turn.started) {
 					turn.done();
 				}
 			});
 			turns.set(customType, turn);
+			// A prompt admitted but still in setup (no run open yet) goes first: starting ahead of it would make it
+			// fail as busy. Wake when its run opens, or when it dispatched, queued or bailed.
+			while (session.hasAdmittedSubmission && !session.isRunActive && !session.isDisposed) {
+				const { promise, resolve } = Promise.withResolvers<void>();
+				const stopWatching = session.subscribeRunState(() => resolve());
+				void session.waitForAdmittedSubmissions().then(resolve);
+				await promise;
+				stopWatching();
+			}
 			session
 				.promptCustomMessage(
 					{ customType, content, display: false, details, attribution: "user" },
-					{ streamingBehavior: "followUp" },
+					{
+						streamingBehavior: "followUp",
+						onPromptQueued: () => {
+							turn.queued = true;
+							outcome.resolve({ queued: true });
+						},
+					},
 				)
 				.then(
 					() => {
 						turn.dispatching = false;
+						if (turn.started || turn.queued) return;
+						turn.done();
+						outcome.reject(new Error("The Inbox turn was not started."));
 					},
 					error => {
 						logger.warn("topics: Inbox turn not started", {
@@ -114,9 +158,10 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 							error: error instanceof Error ? error.message : String(error),
 						});
 						turn.done();
+						outcome.reject(error);
 					},
 				);
-			return { queued };
+			return outcome.promise;
 		},
 		turnPending(customType) {
 			const turn = turns.get(customType);

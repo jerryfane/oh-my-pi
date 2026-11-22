@@ -20,7 +20,7 @@ import topicOrganiseTemplate from "../prompts/system/topic-organise.md" with { t
 import type { AgentSession } from "../session/agent-session";
 import type { ToolSession } from "../tools";
 import type { WorkerChange, WorkerSummary } from "../vibe/worker-scope";
-import { sessionInbox, type TopicsInbox } from "./inbox";
+import { InboxChangedError, sessionInbox, type TopicsInbox } from "./inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "./seed";
 import { cfgTopicsEnabled } from "./settings";
 import {
@@ -88,7 +88,7 @@ export interface TopicsHost {
 	acceptSuggestion(args: { suggestionId: string; by: string }): Promise<{ topicId: string; alreadyAccepted: boolean }>;
 	dismissSuggestion(args: { suggestionId: string; by: string }): Promise<{ alreadyDismissed: boolean }>;
 	/** Queue one Inbox turn that reviews the history and suggests topics. */
-	organise(args: { by: string }): { queued: boolean };
+	organise(args: { by: string }): Promise<{ queued: boolean }>;
 	/** Restore persisted topics of the current session (startup, session switch). */
 	restore(): Promise<number>;
 	onChange(listener: (change: TopicChange) => void): () => void;
@@ -122,41 +122,61 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	};
 	const unroute = setIrcRoute(session, (message, bus) => routeTopicMessage(registry, session, message, bus));
 	const suggestionListeners = new Set<(change: TopicChange) => void>();
-	const emitSuggestion = (id: string, reason: SuggestionChange["reason"]): void => {
-		const { ownerId, parentSessionId } = registry.ownerScope(session);
+	/** Announce a suggestion change to the owner scope `scope` of the Inbox session it happened in. */
+	const emitSuggestion = (
+		id: string,
+		reason: SuggestionChange["reason"],
+		{ ownerId, parentSessionId }: { ownerId: string; parentSessionId: string },
+	): void => {
 		for (const listener of suggestionListeners) listener({ id, ownerId, parentSessionId, reason });
 	};
-	/** Suggestions made but not saved yet (the Inbox turn that made them is still running). */
+	/** Suggestions made but not recorded yet (the Inbox turn that made them is still running). */
 	const unsaved: Array<{ sessionId: string; suggestion: TopicSuggestion }> = [];
-	/** Accepts whose topic is being created, by suggestion id. */
+	/** The whole accept of a suggestion (topic, accepted state, note) while it runs, by suggestion id. */
 	const accepting = new Map<string, Promise<string>>();
-	/** Suggestions whose entry did not reach the session file: an in-memory copy may exist, a reload drops it. */
-	const lost = new Set<string>();
+	/** Topics started for suggestions whose accepted state is not saved yet: a retry saves it, never respawns. */
+	const startedFor = new Map<string, string>();
+	/** Dismissals being saved, by suggestion id. */
+	const dismissing = new Map<string, Promise<void>>();
 
+	/** The suggestions of the open Inbox session: its journal, plus those still being recorded. */
 	const folded = (box: TopicsInbox) => {
 		const sessionId = box.sessionId();
-		const all = foldSuggestions(
+		return foldSuggestions(
 			box.entries(),
 			unsaved.filter(entry => entry.sessionId === sessionId).map(entry => entry.suggestion),
 		);
-		for (const id of lost) all.delete(id);
-		return all;
-	};
-	/** Save a state change, then announce it; a failed write rejects and announces nothing. */
-	const appendState = async (box: TopicsInbox, data: TopicSuggestionStateData): Promise<void> => {
-		await box.appendState(TOPIC_SUGGESTION_STATE_TYPE, data);
-		emitSuggestion(data.id, data.state === "accepted" ? "suggestion-accepted" : "suggestion-dismissed");
 	};
 
 	/**
-	 * Spawn a topic; with `seed`, the chosen Inbox messages are prepended to its
-	 * first turn once ready, and a visible "Continued in topic" note goes to the Inbox.
+	 * Save a state change in Inbox session `sessionId` (all or nothing) and
+	 * announce it to `scope`. Another open session refuses it: the suggestion is
+	 * not part of that conversation.
 	 */
+	const commitState = async (
+		box: TopicsInbox,
+		sessionId: string,
+		scope: { ownerId: string; parentSessionId: string },
+		data: TopicSuggestionStateData,
+	): Promise<void> => {
+		try {
+			await box.appendState(sessionId, TOPIC_SUGGESTION_STATE_TYPE, data);
+		} catch (error) {
+			if (!(error instanceof InboxChangedError)) throw error;
+			throw new TopicsError(
+				"suggestion_not_found",
+				`Suggestion ${data.id} belongs to an Inbox session that is no longer open.`,
+			);
+		}
+		emitSuggestion(data.id, data.state === "accepted" ? "suggestion-accepted" : "suggestion-dismissed", scope);
+	};
+
+	/** Spawn a topic; with `seed`, the chosen Inbox messages are prepended to its first turn once ready. */
 	const spawnTopic = async (args: {
 		title: string;
 		message: string;
 		name?: string;
-		seed?: { box: TopicsInbox; messageIds: string[]; reason?: string; suggestionId: string | null };
+		seed?: { box: TopicsInbox; messageIds: string[]; reason?: string };
 	}): Promise<string> => {
 		const title = args.title.trim();
 		if (!title) throw new Error("Topic title must not be empty.");
@@ -177,20 +197,54 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 					}
 				: {}),
 		});
-		if (seed) {
-			const details: TopicContinuedDetails = {
-				topicId: id,
-				title,
-				suggestionId: seed.suggestionId,
-				messageIds: [...seed.messageIds],
-			};
-			void seed.box.appendNote({
-				customType: TOPIC_CONTINUED_TYPE,
-				content: `Continued in topic ${title}`,
-				details,
-			});
-		}
 		return id;
+	};
+
+	/** The visible "Continued in topic" note, in Inbox session `sessionId` only. */
+	const noteContinued = (box: TopicsInbox, sessionId: string, details: TopicContinuedDetails): void => {
+		void box.appendNote(sessionId, {
+			customType: TOPIC_CONTINUED_TYPE,
+			content: `Continued in topic ${details.title}`,
+			details,
+		});
+	};
+
+	/**
+	 * Accept `suggestion` of Inbox session `sessionId`: start its topic (once,
+	 * even across retries), save the accepted state, announce it and note it.
+	 * Every write goes to that session; another open session refuses the accept.
+	 */
+	const acceptOnce = async (
+		box: TopicsInbox,
+		sessionId: string,
+		suggestion: TopicSuggestion,
+		by: string,
+	): Promise<string> => {
+		const scope = registry.ownerScope(session);
+		let topicId = startedFor.get(suggestion.id);
+		if (!topicId) {
+			topicId = await spawnTopic({
+				title: suggestion.title,
+				message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
+				seed: { box, messageIds: suggestion.messageIds, reason: suggestion.reason },
+			});
+			startedFor.set(suggestion.id, topicId);
+		}
+		await commitState(box, sessionId, scope, {
+			id: suggestion.id,
+			state: "accepted",
+			topicId,
+			by,
+			atMs: Date.now(),
+		});
+		startedFor.delete(suggestion.id);
+		noteContinued(box, sessionId, {
+			topicId,
+			title: suggestion.title,
+			suggestionId: suggestion.id,
+			messageIds: [...suggestion.messageIds],
+		});
+		return topicId;
 	};
 
 	return {
@@ -198,12 +252,14 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		async create({ title, message, name, seedMessageIds }) {
 			if (!seedMessageIds?.length) return { id: await spawnTopic({ title, message, name }) };
 			const box = requireInbox(inbox);
+			const sessionId = box.sessionId();
 			requireEligibleMessageIds(seedMessageIds, box.branch());
-			const id = await spawnTopic({
-				title,
-				message,
-				name,
-				seed: { box, messageIds: seedMessageIds, suggestionId: null },
+			const id = await spawnTopic({ title, message, name, seed: { box, messageIds: seedMessageIds } });
+			noteContinued(box, sessionId, {
+				topicId: id,
+				title: title.trim(),
+				suggestionId: null,
+				messageIds: [...seedMessageIds],
 			});
 			return { id };
 		},
@@ -266,19 +322,20 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				messageIds: [...new Set(messageIds)],
 				createdMs: Date.now(),
 			};
-			const pending = { sessionId: box.sessionId(), suggestion };
+			const sessionId = box.sessionId();
+			const scope = registry.ownerScope(session);
+			const pending = { sessionId, suggestion };
 			unsaved.push(pending);
 			void box
-				.appendNote({
+				.appendNote(sessionId, {
 					customType: TOPIC_SUGGESTION_TYPE,
 					content: `Suggested topic: ${suggestion.title}. ${suggestion.reason}`,
 					details: suggestion,
 				})
 				.then(saved => {
-					// A suggestion that did not reach the session file is forgotten, never announced.
+					// From here the session journal alone says whether the suggestion exists; only a saved one is announced.
 					unsaved.splice(unsaved.indexOf(pending), 1);
-					if (saved) emitSuggestion(suggestion.id, "suggested");
-					else lost.add(suggestion.id);
+					if (saved) emitSuggestion(suggestion.id, "suggested", scope);
 				});
 			return suggestion;
 		},
@@ -286,37 +343,50 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			const box = requireInbox(inbox);
 			const inFlight = accepting.get(suggestionId);
 			if (inFlight) return { topicId: await inFlight, alreadyAccepted: true };
+			const sessionId = box.sessionId();
 			const suggestion = folded(box).get(suggestionId);
 			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
 			if (suggestion.state === "accepted" && suggestion.topicId) {
 				return { topicId: suggestion.topicId, alreadyAccepted: true };
 			}
-			const started = spawnTopic({
-				title: suggestion.title,
-				message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
-				seed: { box, messageIds: suggestion.messageIds, reason: suggestion.reason, suggestionId },
-			});
-			accepting.set(suggestionId, started);
+			const operation = acceptOnce(box, sessionId, suggestion, by);
+			accepting.set(suggestionId, operation);
 			try {
-				const topicId = await started;
-				await appendState(box, { id: suggestionId, state: "accepted", topicId, by, atMs: Date.now() });
-				return { topicId, alreadyAccepted: false };
+				return { topicId: await operation, alreadyAccepted: false };
 			} finally {
 				accepting.delete(suggestionId);
 			}
 		},
 		async dismissSuggestion({ suggestionId, by }) {
 			const box = requireInbox(inbox);
+			const inFlight = dismissing.get(suggestionId);
+			if (inFlight) {
+				await inFlight;
+				return { alreadyDismissed: true };
+			}
+			const sessionId = box.sessionId();
 			const suggestion = folded(box).get(suggestionId);
 			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
-			if (suggestion.state === "accepted" || accepting.has(suggestionId)) {
+			if (suggestion.state === "accepted" || accepting.has(suggestionId) || startedFor.has(suggestionId)) {
 				throw new TopicsError("already_accepted", `Suggestion ${suggestionId} was already accepted.`);
 			}
+			// The journal keeps only saved states: a dismissal whose write failed left nothing, so it is retried.
 			if (suggestion.state === "dismissed") return { alreadyDismissed: true };
-			await appendState(box, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
-			return { alreadyDismissed: false };
+			const operation = commitState(box, sessionId, registry.ownerScope(session), {
+				id: suggestionId,
+				state: "dismissed",
+				by,
+				atMs: Date.now(),
+			});
+			dismissing.set(suggestionId, operation);
+			try {
+				await operation;
+				return { alreadyDismissed: false };
+			} finally {
+				dismissing.delete(suggestionId);
+			}
 		},
-		organise({ by }) {
+		async organise({ by }) {
 			const box = requireInbox(inbox);
 			if (box.turnPending(TOPIC_ORGANISE_TYPE)) {
 				throw new TopicsError("organise_running", "An Organise turn is already queued or running.");

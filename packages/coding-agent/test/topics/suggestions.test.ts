@@ -37,7 +37,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
-import type { InboxMessage, TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
+import { InboxChangedError, type InboxMessage, type TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
 	foldSuggestions,
@@ -92,6 +92,10 @@ describe("topic suggestions", () => {
 	let hosts: TopicsHost[];
 	let queuedTurns: InboxMessage[];
 	let turnPending: boolean;
+	/** The open Inbox session. */
+	let inboxSm: SessionManager;
+	/** Awaited by every state write before it saves; a rejection fails the write. */
+	let stateWrite: (() => Promise<void>) | undefined;
 
 	function parent(): ToolSession {
 		return {
@@ -108,20 +112,26 @@ describe("topic suggestions", () => {
 		} as unknown as ToolSession;
 	}
 
-	/** The Inbox over `sm`: notes are saved at once (an idle Inbox). */
+	/**
+	 * The Inbox over `inboxSm` (`sm` unless a test switches sessions): notes are saved at once (an idle Inbox);
+	 * a state write awaits `stateWrite` first and, like the real one, adds nothing when it fails.
+	 */
 	function inbox(): TopicsInbox {
 		return {
-			sessionId: () => sm.getSessionId(),
-			branch: () => sm.getBranch(),
-			entries: () => sm.getEntriesView(),
-			appendState: async (customType, data) => {
-				sm.appendCustomEntry(customType, data);
+			sessionId: () => inboxSm.getSessionId(),
+			branch: () => inboxSm.getBranch(),
+			entries: () => inboxSm.getEntriesView(),
+			appendState: async (sessionId, customType, data) => {
+				if (inboxSm.getSessionId() !== sessionId) throw new InboxChangedError();
+				await stateWrite?.();
+				inboxSm.appendCustomEntry(customType, data);
 			},
-			appendNote: async ({ customType, content, details }) => {
-				sm.appendCustomMessageEntry(customType, content, true, details, "agent");
+			appendNote: async (sessionId, { customType, content, details }) => {
+				if (inboxSm.getSessionId() !== sessionId) return false;
+				inboxSm.appendCustomMessageEntry(customType, content, true, details, "agent");
 				return true;
 			},
-			queueTurn: message => {
+			queueTurn: async message => {
 				queuedTurns.push(message);
 				turnPending = true;
 				return { queued: false };
@@ -192,6 +202,8 @@ describe("topic suggestions", () => {
 		turnPending = false;
 		manager = new AsyncJobManager({});
 		sm = SessionManager.create(tempDir.path(), tempDir.path());
+		inboxSm = sm;
+		stateWrite = undefined;
 		user("hello");
 		await sm.ensureOnDisk();
 		mockFirstTurns();
@@ -540,10 +552,84 @@ describe("topic suggestions", () => {
 		expect(changes.every(change => change.ownerId === OWNER)).toBe(true);
 	});
 
+	it("deduplicates the whole accept: a repeat shares its state write and its failure, a retry reuses the topic", async () => {
+		const host = hostWith();
+		const ask = user("Plan the offsite");
+		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
+		const write = Promise.withResolvers<void>();
+		stateWrite = () => write.promise;
+
+		const first = host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		const repeat = host.acceptSuggestion({ suggestionId: id, by: "guest Anna" });
+		write.reject(new Error("disk full"));
+		const outcomes = await Promise.allSettled([first, repeat]);
+		expect(outcomes.map(outcome => (outcome.status === "rejected" ? String(outcome.reason) : outcome.status))).toEqual([
+			"Error: disk full",
+			"Error: disk full",
+		]);
+		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toEqual([]);
+
+		stateWrite = undefined;
+		const retried = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(retried.alreadyAccepted).toBe(false);
+		expect(topicsRegistry().describe(parent()).map(topic => topic.id)).toEqual([retried.topicId]);
+		expect(customEntries<CustomEntry>("custom", TOPIC_SUGGESTION_STATE_TYPE).map(entry => entry.data)).toMatchObject([
+			{ id, state: "accepted", topicId: retried.topicId },
+		]);
+	});
+
+	it("refuses an accept whose Inbox session changed, writing nothing into the new one", async () => {
+		const host = hostWith();
+		const changes: TopicChange[] = [];
+		host.onChange(change => changes.push(change));
+		const ask = user("Book the venue");
+		const { id } = host.suggest({ title: "Venue", reason: "r", messageIds: [ask] });
+		const next = SessionManager.create(tempDir.path(), tempDir.path());
+		const registry = topicsRegistry();
+		const spawn = registry.spawn.bind(registry);
+		// `/new` lands while the topic is being started.
+		vi.spyOn(registry, "spawn").mockImplementation(async (...args) => {
+			const spawned = await spawn(...args);
+			inboxSm = next;
+			return spawned;
+		});
+
+		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
+		await Bun.sleep(0);
+		for (const manager of [sm, next]) {
+			const written = manager
+				.getEntries()
+				.filter(
+					entry =>
+						(entry.type === "custom" && entry.customType === TOPIC_SUGGESTION_STATE_TYPE) ||
+						(entry.type === "custom_message" && entry.customType === TOPIC_CONTINUED_TYPE),
+				);
+			expect(written).toEqual([]);
+		}
+		expect(changes.some(change => change.reason === "suggestion-accepted")).toBe(false);
+	});
+
+	it("settles a topic whose seed fails instead of leaving it starting", async () => {
+		const registry = topicsRegistry();
+		const { id, jobId } = await registry.spawn(parent(), {
+			cli: "good",
+			name: "Seedless",
+			prompt: "go",
+			title: "Seedless",
+			seed: Promise.reject(new Error("seed failed")),
+		});
+		await manager.getJob(jobId)?.promise.catch(() => {});
+		const topic = registry.describe(parent()).find(entry => entry.id === id);
+		expect(topic?.state).not.toBe("starting");
+		expect(topic?.turnStartedAt).toBeUndefined();
+		expect(firstTurns).toEqual([]);
+	});
+
 	it("queues one Organise turn naming the Inbox messages, and refuses another while it is pending", async () => {
 		const host = hostWith();
 		const ask = user("lots going on");
-		expect(host.organise({ by: "owner" })).toEqual({ queued: false });
+		expect(await host.organise({ by: "owner" })).toEqual({ queued: false });
 		expect(queuedTurns).toHaveLength(1);
 		expect(queuedTurns[0]).toMatchObject({ customType: TOPIC_ORGANISE_TYPE, details: { by: "owner" } });
 		expect(queuedTurns[0]!.content).toContain("call `topic_suggest` 3–5 times");
@@ -551,7 +637,7 @@ describe("topic suggestions", () => {
 
 		expect(await codeOf(() => host.organise({ by: "owner" }))).toBe("organise_running");
 		turnPending = false;
-		expect(host.organise({ by: "owner" })).toEqual({ queued: false });
+		expect(await host.organise({ by: "owner" })).toEqual({ queued: false });
 	});
 });
 

@@ -1182,7 +1182,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#pendingExcludedRows: CustomMessage[] = [];
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
-	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<void>>();
+	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string>>();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -1809,13 +1809,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			return;
 		}
 		// Disposal detaches last, after its drain: a row still queued then goes with the session.
-		if (this.#isDisposed) return;
+		if (this.#isDisposed) {
+			const dropped = new Error("The session was disposed before the row was recorded.");
+			for (const row of rows) this.#settleRecordedRow(row, dropped);
+			return;
+		}
 		// A transition (/new, a switch, /compact) disconnects before it aborts the run, so no handler would save
 		// or draw these events: record them directly in the transcript they were sent to, as bash rows are, so a
 		// transition that keeps it (compaction, a rolled-back switch) still shows them.
 		for (const row of rows) {
 			this.agent.appendMessage(row);
-			this.sessionManager.appendCustomMessageEntry(
+			const entryId = this.sessionManager.appendCustomMessageEntry(
 				row.customType,
 				row.content,
 				row.display,
@@ -1824,17 +1828,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				row.timestamp,
 				row.excludeFromContext,
 			);
-			this.#settleRecordedRow(row);
+			this.#settleRecordedRow(row, entryId);
 		}
 	}
 
-	/** Settle the {@link recordWithoutTurn} caller of `row`, if any: recorded, or dropped with `error`. */
-	#settleRecordedRow(row: AgentMessage, error?: Error): void {
+	/** Settle the {@link recordWithoutTurn} caller of `row`, if any: recorded as entry `outcome`, or dropped. */
+	#settleRecordedRow(row: AgentMessage, outcome: string | Error): void {
 		const waiter = this.#recordedRowWaiters.get(row);
 		if (!waiter) return;
 		this.#recordedRowWaiters.delete(row);
-		if (error) waiter.reject(error);
-		else waiter.resolve();
+		if (outcome instanceof Error) waiter.reject(outcome);
+		else waiter.resolve(outcome);
 	}
 
 	/** Drop the queued rows with the transcript they were sent to (a transition, disposal). */
@@ -1852,12 +1856,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async recordWithoutTurn(message: CustomMessage): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
-		const recorded = Promise.withResolvers<void>();
+		const recorded = Promise.withResolvers<string>();
 		this.#recordedRowWaiters.set(message, recorded);
 		this.#pendingExcludedRows.push(message);
 		if (!this.isStreaming) this.#flushExcludedRows();
-		await recorded.promise;
+		const entryId = await recorded.promise;
+		// A new session has no file until its first assistant message: create it, so the row is really on disk.
+		await this.sessionManager.ensureOnDisk();
 		await this.sessionManager.flush();
+		if (!this.sessionManager.getEntry(entryId)) {
+			throw new Error("The session's transcript changed before the row was saved.");
+		}
 	}
 
 	/** Re-validates a #sessionGeneration snapshot captured before an aside/SDK call's await.
@@ -4758,7 +4767,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// One-run instructions must not return from persisted history: prewalk
 			// nudges are consumed once, and Vibe context is rebuilt only while active.
 			if (!isPrewalkPlanNudge(message) && message.customType !== VIBE_MODE_CONTEXT_MESSAGE_TYPE) {
-				this.sessionManager.appendCustomMessageEntry(
+				const entryId = this.sessionManager.appendCustomMessageEntry(
 					message.customType,
 					message.content,
 					message.display,
@@ -4770,11 +4779,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					message.timestamp,
 					message.role === "custom" ? message.excludeFromContext : undefined,
 				);
+				this.#settleRecordedRow(message, entryId);
 			}
 			if (message.role === "custom" && message.customType === "ttsr-injection") {
 				this.#ttsr.markInjectedFromDetails(message.details);
 			}
-			this.#settleRecordedRow(message);
 			return;
 		}
 		// A refused turn stays out of the transcript (#persistSessionMessageIfMissing
@@ -7353,6 +7362,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// so events past the deadline are neither forwarded nor persisted.
 		this.#disconnectFromAgent();
 		this.#dropPendingExcludedRows();
+		// Rows already handed to the event pipeline that its detached handlers will never save.
+		const disposed = new Error("The session was disposed before the row was recorded.");
+		for (const row of [...this.#recordedRowWaiters.keys()]) this.#settleRecordedRow(row, disposed);
 		// beginDispose() drained the rest; this catches registrations made during teardown.
 		for (const dispose of this.#disposers.splice(0)) dispose();
 		this.#eventListeners = [];

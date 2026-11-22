@@ -879,7 +879,7 @@ export class VibeSessionRegistry {
 
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
-	 * `seed` (must not reject) is awaited before that turn starts and put ahead of `prompt`.
+	 * `seed` is awaited before that turn starts and put ahead of `prompt`; a rejected seed fails that turn.
 	 */
 	async spawn(
 		session: ToolSession,
@@ -1619,12 +1619,13 @@ export class VibeSessionRegistry {
 			"task",
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
 			async ({ jobId: ownJobId, signal }) => {
-				const seed = await options.seed;
-				record.state = "running";
-				record.turnCount = turnIndex;
-				record.lastActivityAt = Date.now();
-				this.#emit(record, "turn-started");
 				try {
+					// Inside the failure boundary: a seed that fails settles the worker like a failed turn.
+					const seed = await options.seed;
+					record.state = "running";
+					record.turnCount = turnIndex;
+					record.lastActivityAt = Date.now();
+					this.#emit(record, "turn-started");
 					const turnStartedPersisted = await this.#appendLifecycleEvent(
 						session,
 						{
