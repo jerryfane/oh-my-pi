@@ -78,8 +78,13 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 	const manager = session.sessionManager;
 
 	return {
+		// Bound during a transition, the transcript is provisional: such a binding matches none.
 		bind: () =>
-			new InboxBinding(session.transcriptGeneration, manager.getSessionId(), () => session.transcriptGeneration),
+			new InboxBinding(
+				session.isSessionTransitioning ? Number.NaN : session.transcriptGeneration,
+				manager.getSessionId(),
+				() => session.transcriptGeneration,
+			),
 		branch: () => afterLatestReset(manager.getBranch()),
 		entries: () => manager.getEntriesView(),
 		async appendState(binding, customType, data, check) {

@@ -66,6 +66,8 @@ export async function buildTopicSeed(args: {
 		try {
 			summary = (await args.summarize(transcriptOf(older).slice(-SUMMARY_INPUT_MAX_CHARS)))?.trim() || undefined;
 		} catch (error) {
+			// A replaced transcript cancels the seed; it is not a failed summary to fall back from.
+			if (error instanceof InboxChangedError) throw error;
 			logger.warn("topics: seed summary failed", { error: error instanceof Error ? error.message : String(error) });
 		}
 	}

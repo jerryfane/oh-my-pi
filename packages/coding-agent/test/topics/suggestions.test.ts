@@ -648,7 +648,13 @@ describe("topic suggestions", () => {
 				await ensureOnDisk();
 			});
 			const seed = vi.fn(() => Promise.reject(new Error("seed failed")));
-			const spawning = registry.spawn(parent(), { cli: "good", name: "Seedless", prompt: "go", title: "Seedless", seed });
+			const spawning = registry.spawn(parent(), {
+				cli: "good",
+				name: "Seedless",
+				prompt: "go",
+				title: "Seedless",
+				seed: { build: seed, stillWanted: () => true },
+			});
 			// Two macrotask turns: anything rejected and unowned by now is reported as unhandled.
 			await macrotask();
 			await macrotask();
@@ -668,14 +674,10 @@ describe("topic suggestions", () => {
 		}
 	});
 
-	/** A fork of `sm`: a new session holding a copy of its suggestion entries. */
-	function forkOfInbox(): SessionManager {
-		const fork = SessionManager.create(tempDir.path(), tempDir.path());
-		for (const entry of sm.getEntries()) {
-			if (entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE) {
-				fork.appendCustomMessageEntry(entry.customType, entry.content, true, entry.details, "agent");
-			}
-		}
+	/** A fork of `sm`: a new session with the same entries (ids kept), as `/fork` makes. */
+	async function forkOfInbox(): Promise<SessionManager> {
+		const fork = await SessionManager.open(sm.getSessionFile()!, tempDir.path());
+		fork.createBranchedSession(fork.getLeafId()!);
 		return fork;
 	}
 
@@ -694,7 +696,8 @@ describe("topic suggestions", () => {
 		expect(acceptedStates(sm)).toEqual([]);
 
 		stateWrite = undefined;
-		const fork = forkOfInbox();
+		await sm.flush();
+		const fork = await forkOfInbox();
 		switchInbox(fork);
 		expect(host.suggestions().map(open => open.id)).toEqual([id]);
 		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
