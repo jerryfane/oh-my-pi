@@ -114,6 +114,8 @@ interface Launch {
 	launched: ExecutorOptions[];
 	/** Every request the auto-thinking judge was sent (with `autoThinking`), as the text it was sent. */
 	judgeRequests: string[];
+	/** The Inbox's tool session, as the topics registry sees it. */
+	tools: ToolSession;
 }
 
 /**
@@ -121,10 +123,11 @@ interface Launch {
  * prompt (after `session_init` and extension start, before the prompt's last check), the auto-thinking judge's
  * request (prompt setup, before that check; with `autoThinking`), the Inbox's credential lookup for the topic's
  * start model (`preflight`: Accept's seed check, before anything is spawned), or the Inbox journal's preparation
- * for the topic's spawn record (`persist`, before the record is appended) or its flush (`flush`, after). With
- * those two, the Inbox is saved to a file.
+ * for the topic's spawn record (`persist`, before the record is appended) or its flush (`flush`, after), or, once
+ * that flush failed at once with `writeError`, the preparation of the spawn-failed tombstone that follows
+ * (`cleanup`; it then fails with `cleanupError`, if given). With those three, the Inbox is saved to a file.
  */
-type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist" | "flush";
+type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist" | "flush" | "cleanup";
 
 /**
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
@@ -145,6 +148,7 @@ async function openLaunch(
 		inboxPrompt = "Inbox",
 		unauthenticatedStart,
 		writeError,
+		cleanupError,
 	}: {
 		excerptText?: string;
 		autoThinking?: boolean;
@@ -153,6 +157,7 @@ async function openLaunch(
 		inboxPrompt?: string;
 		unauthenticatedStart?: number;
 		writeError?: Error;
+		cleanupError?: Error;
 	} = {},
 ): Promise<Launch> {
 	const cwd = path.join(root, "home", "work");
@@ -218,7 +223,7 @@ async function openLaunch(
 	});
 
 	const manager =
-		gate === "persist" || gate === "flush"
+		gate === "persist" || gate === "flush" || gate === "cleanup"
 			? SessionManager.create(cwd, path.join(root, "sessions"))
 			: SessionManager.inMemory(cwd);
 	manager.appendMessage({ role: "user", content: "first question", timestamp: 1 });
@@ -293,7 +298,7 @@ async function openLaunch(
 		}
 		return getApiKey(...args);
 	});
-	if (gate === "persist" || gate === "flush") {
+	if (gate === "persist" || gate === "flush" || gate === "cleanup") {
 		// Only a write the topic's spawn makes (its spawn record), not the suggestion's own note.
 		const registry = topicsRegistry();
 		const spawn = registry.spawn.bind(registry);
@@ -307,24 +312,42 @@ async function openLaunch(
 			}
 		});
 		let writeHeld = false;
-		const hold = async () => {
+		const hold = async (error: Error | undefined) => {
 			if (!spawning || writeHeld) return;
 			writeHeld = true;
 			gated.resolve();
 			await held.promise;
-			if (writeError) throw writeError;
+			if (error) throw error;
 		};
 		const ensureOnDisk = manager.ensureOnDisk.bind(manager);
 		const flush = manager.flush.bind(manager);
 		if (gate === "persist") {
 			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
-				await hold();
+				await hold(writeError);
 				await ensureOnDisk();
 			});
-		} else {
+		} else if (gate === "flush") {
 			vi.spyOn(manager, "flush").mockImplementation(async () => {
-				await hold();
+				await hold(writeError);
 				await flush();
+			});
+		} else {
+			// The flush that follows the spawn row's append fails; the tombstone's preparation after it is held.
+			const spawnRowLast = () => {
+				const last = manager.getEntries().at(-1) as { customType?: string; data?: { action?: string } } | undefined;
+				return last?.customType === VIBE_LIFECYCLE_CUSTOM_TYPE && last.data?.action === "spawn";
+			};
+			let flushFailed = false;
+			vi.spyOn(manager, "flush").mockImplementation(async () => {
+				if (spawning && !flushFailed && writeError && spawnRowLast()) {
+					flushFailed = true;
+					throw writeError;
+				}
+				await flush();
+			});
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				if (flushFailed) await hold(cleanupError);
+				await ensureOnDisk();
 			});
 		}
 	}
@@ -340,6 +363,7 @@ async function openLaunch(
 		release: () => held.resolve(),
 		launched,
 		judgeRequests,
+		tools: toolSession,
 	};
 }
 
@@ -513,6 +537,44 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 		expect(await code).toBe("suggestion_not_found");
 		expect(changes.filter(change => change.reason === "spawned" || change.reason === "closed")).toEqual([]);
 		expect(await lifecycle(launch)).toEqual({ branch: [], journal: [], file: [] });
+	});
+
+	it("the spawn record's flush fails (EIO), then /tree lands while its tombstone is prepared: refused as gone; no tombstone in the new branch (#24 review)", async () => {
+		const launch = await openLaunch("cleanup", { writeError: EIO });
+		await acceptAcrossRewind(launch);
+		const { branch, journal, file } = await lifecycle(launch);
+		expect({ branch, journal }).toEqual({ branch: [], journal: ["spawn"] });
+		expect(file).not.toContain("tombstone");
+	});
+
+	it("the same, with the tombstone's preparation failing too: the replacement still wins (#24 review)", async () => {
+		const launch = await openLaunch("cleanup", { writeError: EIO, cleanupError: EIO });
+		await acceptAcrossRewind(launch);
+		const { branch, journal, file } = await lifecycle(launch);
+		expect({ branch, journal }).toEqual({ branch: [], journal: ["spawn"] });
+		expect(file).not.toContain("tombstone");
+	});
+
+	it("a kill of a topic whose spawn is still pending is not found, and nothing acts once the spawn publishes it (#24 review)", async () => {
+		const launch = await openLaunch("flush");
+		const { changes, code } = acceptCode(launch);
+		await launch.gated;
+		const killing = topicsRegistry()
+			.kill(launch.tools, "Diokan")
+			.then(
+				() => "killed",
+				(error: unknown) => (error instanceof Error ? error.message : String(error)),
+			);
+		launch.release();
+
+		const killed = await killing;
+		expect(killed).not.toBe("killed");
+		expect(killed).toContain('"Diokan"');
+		expect(await code).toBeUndefined();
+		await settled(launch, "Diokan");
+		expect(launch.host.list().map(topic => topic.id)).toEqual(["Diokan"]);
+		expect(changes.filter(change => change.reason === "spawned").map(change => change.id)).toEqual(["Diokan"]);
+		expect((await lifecycle(launch)).journal).not.toContain("tombstone");
 	});
 
 	it("/tree while Accept looks up the topic's model: refused as gone from this Inbox, not as too large (#22 review)", async () => {

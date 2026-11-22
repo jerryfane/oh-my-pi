@@ -1,13 +1,13 @@
 /**
  * Contract: a prompt's batch is built once, its notices included, and that one
  * batch is admitted (a transcript-bound prompt, a topic's seeded first prompt)
- * and sent; the deltas its notices announce are recorded as delivered only once
- * it is admitted (#21, #22, #23 review). A batch refused at admission (its seed
- * does not fit even shortened) sends nothing, so the tool roster change its
- * notice announced is still pending: the next prompt carries that notice. An
- * admitted one carries it once. A late delivery records exactly what its
- * notice announced when it was taken: a roster change or a mount since stays
- * pending, and so does a mount a later base rebuild lists.
+ * and sent; the delivery effects of its notice takes are applied only once it is
+ * admitted, whether or not a take emitted a notice (#21-#24 review). A batch
+ * refused at admission (its seed does not fit even shortened) sends nothing, so
+ * the roster change or the mount its takes saw is still pending: the next prompt
+ * announces it. An admitted one carries it once. A late commit records exactly
+ * what its takes saw: a roster change or a mount since stays pending, and so
+ * does a mount a later base rebuild lists.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
@@ -107,7 +107,7 @@ const tooLarge: TranscriptPreamble = {
 	fit: (_maxTokens, count) => ({ text: tooLarge.text, tokens: count(tooLarge.text) }),
 };
 
-describe("notices of a prompt's batch (#21, #22, #23 review)", () => {
+describe("notices of a prompt's batch (#21-#24 review)", () => {
 	const sessions: AgentSession[] = [];
 
 	afterEach(async () => {
@@ -168,14 +168,15 @@ describe("notices of a prompt's batch (#21, #22, #23 review)", () => {
 		expect(requests[2]!.split(ROSTER_NOTICE)).toHaveLength(2);
 	});
 
-	it("a late delivery records only the roster delta its notice announced: a change since stays pending", async () => {
+	it("a late commit records only the roster delta its take announced: a change since stays pending", async () => {
 		const tools = captureTools();
 		const { session, requests } = await withPendingRoster();
-		const notice = tools().takePendingToolRosterNotice({ baseDelivered: false });
+		const batch = tools().noticeBatch();
+		const notice = tools().takePendingToolRosterNotice({ baseDelivered: false, batch });
 		expect(notice).toMatchObject({ details: { added: ["bash"], removed: [] } });
-		// A newer change lands before the batch carrying the notice is delivered.
+		// A newer change lands before the batch is committed.
 		await session.setActiveToolPresentation(["read", "bash", "edit"], []);
-		tools().deliverNotices([notice!]);
+		batch.commit();
 
 		await session.prompt("next");
 		await session.waitForIdle();
@@ -183,20 +184,22 @@ describe("notices of a prompt's batch (#21, #22, #23 review)", () => {
 		expect(requests[1]).not.toContain(ROSTER_NOTICE);
 	});
 
-	it("a late delivery records only the mount its notice announced: a mount since stays in the next notice (#23 review)", async () => {
+	it("a late commit records only the mount its take announced: a mount since stays in the next notice (#23 review)", async () => {
 		const tools = captureTools();
 		const { session, requests } = await xdevBench();
 		await session.refreshMCPTools([SEARCH]);
 		const peeked = tools().peekPendingXdevMountNotice({ baseCatalogDelivered: false });
+		const batch = tools().noticeBatch();
 		const notice = tools().takePendingXdevMountNotice({
 			baseCatalogDelivered: false,
 			expectedContentKey: peeked?.contentKey ?? "",
+			batch,
 		});
 		expect(notice).toMatchObject({ details: { added: ["mcp__nucleus_search"] } });
-		// A second mount and a base rebuild land before the batch carrying the notice is delivered.
+		// A second mount and a base rebuild land before the batch is committed.
 		await session.refreshMCPTools([SEARCH, FETCH]);
 		await session.refreshBaseSystemPrompt();
-		tools().deliverNotices([notice!]);
+		batch.commit();
 
 		await session.prompt("next");
 		await session.waitForIdle();
@@ -207,18 +210,48 @@ describe("notices of a prompt's batch (#21, #22, #23 review)", () => {
 	it("a stale mount preview records only the base-carried mounts it saw: a mount a later rebuild lists stays in the next notice (#23 review)", async () => {
 		const tools = captureTools();
 		// The next request's prompt is replaced (before_agent_start): its notice is all that announces a mount.
-		const { session, requests } = await xdevBench({ prefixBound: false, replacePrompt: true });
+		const { session, requests } = await xdevBench({ prefixBound: false, replacePrompt: () => true });
 		await session.refreshMCPTools([SEARCH]);
 		// The preview no longer matches (maintenance changed it); the base this request carries is delivered.
-		expect(tools().takePendingXdevMountNotice({ baseCatalogDelivered: true, expectedContentKey: "stale" })).toBe(
-			undefined,
-		);
+		const batch = tools().noticeBatch();
+		const notice = tools().takePendingXdevMountNotice({
+			baseCatalogDelivered: true,
+			expectedContentKey: "stale",
+			batch,
+		});
+		expect(notice).toBe(undefined);
 		await session.refreshMCPTools([SEARCH, FETCH]);
 		await session.refreshBaseSystemPrompt();
+		batch.commit();
 
 		await session.prompt("next");
 		await session.waitForIdle();
 		expect(requests[1]).toContain("xd://mcp__nucleus_fetch");
+	});
+
+	it("a refused bound batch records nothing, not even a take that emitted no notice: a later request with a replaced prompt still announces the device (#24 review)", async () => {
+		let replace = false;
+		const { session, requests } = await xdevBench({ prefixBound: false, replacePrompt: () => replace });
+		// The rebuilt base lists the device: the bound prompt's mount take emits no notice for it.
+		await session.refreshMCPTools([SEARCH]);
+		const refused = await session
+			.prompt("seeded", {
+				attribution: "agent",
+				transcriptSignal: new AbortController().signal,
+				transcriptPreamble: tooLarge,
+			})
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			);
+		expect(refused).toBeInstanceOf(PreambleTooLargeError);
+		expect(requests).toHaveLength(1);
+
+		replace = true;
+		await session.prompt("next");
+		await session.waitForIdle();
+		expect(requests).toHaveLength(2);
+		expect(requests[1]).toContain("xd://mcp__nucleus_search");
 	});
 });
 
@@ -247,10 +280,13 @@ const FETCH = mcpTool("fetch");
 
 /**
  * A session that mounts MCP tools as `xd://` devices (its rebuilt prompt lists the mounted catalog), past its first
- * request: prefix-bound (its prompt frozen, so mount changes travel as notices) unless `prefixBound` is false. With
- * `replacePrompt`, an extension replaces the system prompt of every request (no base catalog is delivered).
+ * request: prefix-bound (its prompt frozen, so mount changes travel as notices) unless `prefixBound` is false. While
+ * `replacePrompt` answers true, an extension replaces the request's system prompt (no base catalog is delivered).
  */
-async function xdevBench({ prefixBound = true, replacePrompt = false } = {}): Promise<{
+async function xdevBench({
+	prefixBound = true,
+	replacePrompt,
+}: { prefixBound?: boolean; replacePrompt?: () => boolean } = {}): Promise<{
 	session: AgentSession;
 	requests: string[];
 }> {
@@ -270,7 +306,7 @@ async function xdevBench({ prefixBound = true, replacePrompt = false } = {}): Pr
 		builtInNames: new Set(["read", "write"]),
 		isActive: () => true,
 	};
-	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }] });
+	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }, { content: ["ok"] }] });
 	const requests: string[] = [];
 	const agent = new Agent({
 		getApiKey: () => "test-key",
@@ -291,7 +327,8 @@ async function xdevBench({ prefixBound = true, replacePrompt = false } = {}): Pr
 		ensureWriteRegistered: async () => true,
 		extensionRunner: replacePrompt
 			? ({
-					emitBeforeAgentStart: async () => ({ systemPrompt: ["extension replacement"] }),
+					emitBeforeAgentStart: async () =>
+						replacePrompt() ? { systemPrompt: ["extension replacement"] } : undefined,
 					emit: async () => undefined,
 				} as unknown as ExtensionRunner)
 			: undefined,
