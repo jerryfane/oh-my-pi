@@ -176,12 +176,27 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		expect(notice).toMatchObject({ details: { added: ["bash"], removed: [] } });
 		// A newer change lands before the batch is committed.
 		await session.setActiveToolPresentation(["read", "bash", "edit"], []);
-		batch.commit();
+		batch.commit([notice!]);
 
 		await session.prompt("next");
 		await session.waitForIdle();
 		expect(requests[1]).toContain("Now available: edit.");
 		expect(requests[1]).not.toContain(ROSTER_NOTICE);
+	});
+
+	it("a committed batch records no delta for a notice it does not carry: the next prompt still announces it (#25 review)", async () => {
+		const tools = captureTools();
+		const { session, requests } = await withPendingRoster();
+		const batch = tools().noticeBatch();
+		expect(tools().takePendingToolRosterNotice({ baseDelivered: false, batch })).toMatchObject({
+			details: { added: ["bash"] },
+		});
+		// The notice was left out of the batch that was sent.
+		batch.commit([]);
+
+		await session.prompt("next");
+		await session.waitForIdle();
+		expect(requests[1]).toContain(ROSTER_NOTICE);
 	});
 
 	it("a late commit records only the mount its take announced: a mount since stays in the next notice (#23 review)", async () => {
@@ -199,7 +214,7 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		// A second mount and a base rebuild land before the batch is committed.
 		await session.refreshMCPTools([SEARCH, FETCH]);
 		await session.refreshBaseSystemPrompt();
-		batch.commit();
+		batch.commit([notice!]);
 
 		await session.prompt("next");
 		await session.waitForIdle();
@@ -222,7 +237,8 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		expect(notice).toBe(undefined);
 		await session.refreshMCPTools([SEARCH, FETCH]);
 		await session.refreshBaseSystemPrompt();
-		batch.commit();
+		// It emitted no notice: its effect (the base-carried mounts it saw) applies whatever the batch carries.
+		batch.commit([]);
 
 		await session.prompt("next");
 		await session.waitForIdle();

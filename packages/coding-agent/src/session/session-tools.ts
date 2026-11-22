@@ -434,20 +434,26 @@ interface DeliverableNotice<T> {
 }
 
 /**
- * The delivery effects of one prompt batch's notice takes, applied by {@link commit} once that batch is admitted:
- * the roster and `xd://` mount deltas each take announced, or found a delivered base prompt already carries,
- * exactly as taken (a change since stays pending), whether or not the take emitted a notice. A batch that is not
- * committed (it was refused) applies none of them: the next prompt's notices find the deltas still pending.
+ * One prompt batch's notice takes: each take's notice (or none) and its delivery effect, applied by {@link commit}
+ * once that batch is admitted: the roster and `xd://` mount deltas each take announced, or found a delivered base
+ * prompt already carries, exactly as taken (a change since stays pending). A take that emitted a notice has its
+ * effect applied only when the batch sent carries that notice; one that intentionally emitted none, always. A batch
+ * that is not committed (it was refused) applies none of them: the next prompt's notices find the deltas pending.
  */
 export class NoticeBatch {
-	readonly #effects: Array<() => void> = [];
+	readonly #taken: Array<DeliverableNotice<unknown>> = [];
 
-	add(effect: () => void): void {
-		this.#effects.push(effect);
+	/** Record `taken` in the batch; its notice, for the caller to put in the batch it sends. */
+	add<T>(taken: DeliverableNotice<T>): CustomMessage<T> | undefined {
+		this.#taken.push(taken);
+		return taken.notice;
 	}
 
-	commit(): void {
-		for (const effect of this.#effects.splice(0)) effect();
+	/** Apply the effects of the takes whose notice `sent` (the admitted batch) carries, and of those without one. */
+	commit(sent: readonly AgentMessage[]): void {
+		for (const { notice, commit } of this.#taken.splice(0)) {
+			if (!notice || sent.includes(notice)) commit();
+		}
 	}
 }
 
@@ -2095,9 +2101,7 @@ export class SessionTools {
 		baseDelivered: boolean;
 		batch: NoticeBatch;
 	}): CustomMessage<ToolRosterNoticeDetails> | undefined {
-		const taken = this.#buildToolRosterNotice(options.baseDelivered);
-		options.batch.add(taken.commit);
-		return taken.notice;
+		return options.batch.add(this.#buildToolRosterNotice(options.baseDelivered));
 	}
 
 	/** The roster notice {@link takePendingToolRosterNotice} takes; `commit` records the delta as taken delivered. */
@@ -2379,9 +2383,7 @@ export class SessionTools {
 		expectedContentKey: string;
 		batch: NoticeBatch;
 	}): CustomMessage<XdevMountNoticeDetails> | undefined {
-		const taken = this.#buildXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey);
-		options.batch.add(taken.commit);
-		return taken.notice;
+		return options.batch.add(this.#buildXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey));
 	}
 
 	/** The mount notice {@link takePendingXdevMountNotice} takes; `commit` records the delta as taken delivered. */
