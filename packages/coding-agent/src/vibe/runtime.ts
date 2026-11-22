@@ -468,19 +468,37 @@ export class VibeSessionRegistry {
 	}
 
 	/**
-	 * Append `event` to the parent transcript, if it is still the one the worker belongs to: the same session and
-	 * file and, with `transcriptSignal` (a seed's), the same transcript (a `/tree` keeps the file and session but
-	 * ends it). Checked again after every await, right before the append; false when it was not appended. `written`
-	 * learns that the row was appended, even when the flush that follows then fails.
+	 * Append `event` to the parent transcript, if it is still the one the worker belongs to, and flush it: false when
+	 * it was not appended ({@link #appendLifecycleEntry}).
 	 */
 	async #appendLifecycleEvent(
 		session: VibeParentSession,
 		event: VibeLifecycleEvent,
 		expectedParentSessionFile: string | null,
 		transcriptSignal?: AbortSignal,
-		written?: { appended: boolean },
 	): Promise<boolean> {
-		if (!expectedParentSessionFile || !session.sessionManager) return false;
+		const { appended } = await this.#appendLifecycleEntry(
+			session,
+			event,
+			expectedParentSessionFile,
+			transcriptSignal,
+		);
+		if (appended) await session.sessionManager?.flush();
+		return appended;
+	}
+
+	/**
+	 * Append `event` to the parent transcript, unflushed, if it is still the one the worker belongs to: the same
+	 * session and file and, with `transcriptSignal` (a seed's), the same transcript (a `/tree` keeps the file and
+	 * session but ends it). Checked again after every await, right before the append. The caller flushes.
+	 */
+	async #appendLifecycleEntry(
+		session: VibeParentSession,
+		event: VibeLifecycleEvent,
+		expectedParentSessionFile: string | null,
+		transcriptSignal?: AbortSignal,
+	): Promise<{ appended: boolean }> {
+		if (!expectedParentSessionFile || !session.sessionManager) return { appended: false };
 		const matchesCurrentScope = (): boolean => {
 			const currentSessionFile = session.getSessionFile();
 			return (
@@ -491,13 +509,11 @@ export class VibeSessionRegistry {
 				path.resolve(currentSessionFile) === expectedParentSessionFile
 			);
 		};
-		if (!matchesCurrentScope()) return false;
+		if (!matchesCurrentScope()) return { appended: false };
 		await session.sessionManager.ensureOnDisk();
-		if (!matchesCurrentScope()) return false;
+		if (!matchesCurrentScope()) return { appended: false };
 		session.sessionManager.appendCustomEntry(VIBE_LIFECYCLE_CUSTOM_TYPE, event);
-		if (written) written.appended = true;
-		await session.sessionManager.flush();
-		return true;
+		return { appended: true };
 	}
 
 	#eventBase(record: VibeRecord): VibeLifecycleBase {
@@ -514,6 +530,7 @@ export class VibeSessionRegistry {
 		session: VibeParentSession,
 		record: VibeRecord,
 		reason: VibeTombstoneReason,
+		transcriptSignal?: AbortSignal,
 	): Promise<boolean> {
 		return this.#appendLifecycleEvent(
 			session,
@@ -523,6 +540,7 @@ export class VibeSessionRegistry {
 				reason,
 			},
 			record.parentSessionFile,
+			transcriptSignal,
 		);
 	}
 
@@ -987,10 +1005,11 @@ export class VibeSessionRegistry {
 			terminalPersisted: false,
 		};
 		const key = scopeKey(scope, id);
-		const written = { appended: false };
+		const signal = args.seed?.signal;
+		let appended = false;
 		try {
 			if (childSessionFile) {
-				const spawnPersisted = await this.#appendLifecycleEvent(
+				({ appended } = await this.#appendLifecycleEntry(
 					session,
 					{
 						...this.#eventBase(record),
@@ -1002,13 +1021,13 @@ export class VibeSessionRegistry {
 						...(args.title ? { title: args.title } : {}),
 					},
 					record.parentSessionFile,
-					args.seed?.signal,
-					written,
-				);
-				if (!spawnPersisted) throw new ToolError("Vibe parent session changed before the worker could start.");
+					signal,
+				));
+				if (!appended) throw new ToolError("Vibe parent session changed before the worker could start.");
+				await session.sessionManager?.flush();
 			}
 			// The last await is behind us: a seed's transcript still holding now holds until the worker is published.
-			throwIfStale(args.seed?.signal);
+			throwIfStale(signal);
 			this.#records.set(key, record);
 			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true, seed: args.seed });
 			this.#emit(record, "spawned");
@@ -1016,15 +1035,23 @@ export class VibeSessionRegistry {
 		} catch (error) {
 			// Stale wins over a failed write. Unwritten, nothing of the worker exists; written, its record stays on the
 			// branch it was appended to, and nothing (no cleanup, no tombstone) goes into the one that replaced it.
-			throwIfStale(args.seed?.signal);
+			throwIfStale(signal);
 			this.#records.delete(key);
 			// No spawn record was written: there is nothing to end.
-			if (!written.appended) throw error;
+			if (!appended) throw error;
 			record.killed = true;
 			record.state = "dead";
 			record.lastActivityAt = Date.now();
 			record.lastActivity = "spawn failed";
-			record.terminalPersisted = await this.#appendTombstone(session, record, "spawn-failed");
+			// The cleanup is bound to the same transcript: a replacement meanwhile gets no tombstone, and still wins
+			// over the cleanup's own failure.
+			try {
+				record.terminalPersisted = await this.#appendTombstone(session, record, "spawn-failed", signal);
+			} catch (cleanupError) {
+				throwIfStale(signal);
+				throw cleanupError;
+			}
+			throwIfStale(signal);
 			if (!record.terminalPersisted) {
 				// A rejected terminal write leaves this dead record in the map so mode exit can retry it.
 				this.#records.set(key, record);
@@ -1376,8 +1403,12 @@ export class VibeSessionRegistry {
 	/** Terminate one worker; a tombstone failure still tears it down before reconciliation and error delivery. */
 	async kill(session: ToolSession, id: string): Promise<VibeKillOutcome> {
 		const scope = this.ownerScope(session);
+		// As close: a worker that does not exist yet (its spawn still pending) is not found, now or once its spawn,
+		// which holds the lock, publishes it.
+		const target = this.#record(scope, id);
 		return this.#withTerminationLock(scope, () => {
 			const record = this.#record(scope, id);
+			if (record !== target) throw new ToolError(`Unknown vibe session "${id}".`);
 			return this.#killRecord(record, session.asyncJobManager, session, "explicit-kill");
 		});
 	}

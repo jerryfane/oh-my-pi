@@ -1808,7 +1808,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	/** Draw and save the rows a live run queued (see {@link #pendingExcludedRows}). */
+	/** Draw and save the rows kept out of context that a live run queued (see {@link #pendingExcludedRows}). */
 	#flushExcludedRows(): void {
 		if (this.#pendingExcludedRows.length === 0) return;
 		const connected = this.#unsubscribeAgent !== undefined;
@@ -10229,14 +10229,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The roster notice is re-derived from the live delta here and always
 			// delivered, keeping the model's stated availability in lockstep with
 			// the wire tool list even when a roster change landed during maintenance.
+			const notices = this.#tools.noticeBatch(); // Their delivery effects, committed once the batch is admitted.
 			const xdevMountNotice = previewXdevMountNotice
 				? this.#tools.takePendingXdevMountNotice({
 						baseCatalogDelivered: baseXdevCatalogDelivered,
 						expectedContentKey: previewXdevMountNotice.contentKey,
+						batch: notices,
 					})
 				: undefined;
 			const toolRosterNotice = isUserQueuedMessage(message)
-				? this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered })
+				? this.#tools.takePendingToolRosterNotice({ baseDelivered: baseXdevCatalogDelivered, batch: notices })
 				: undefined;
 			const evalPreludeNotice = isUserQueuedMessage(message) ? this.#tools.takeEvalPreludeNotice() : undefined;
 			const sessionAgentNotice = isUserQueuedMessage(message) ? this.#tools.takeSessionAgentNotice() : undefined;
@@ -10254,7 +10256,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// The batch is final and synchronous to dispatch: a replaced transcript drops a bound prompt; else admitted.
 			if (bound && !bound.admit(messages)) return false;
-			this.#tools.deliverNotices(messages); // Only a batch that is sent marks its notices delivered.
+			notices.commit(); // Only a batch that is sent records what its notices delivered.
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

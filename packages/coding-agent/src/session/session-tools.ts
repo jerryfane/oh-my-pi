@@ -433,6 +433,24 @@ interface DeliverableNotice<T> {
 	commit(): void;
 }
 
+/**
+ * The delivery effects of one prompt batch's notice takes, applied by {@link commit} once that batch is admitted:
+ * the roster and `xd://` mount deltas each take announced, or found a delivered base prompt already carries,
+ * exactly as taken (a change since stays pending), whether or not the take emitted a notice. A batch that is not
+ * committed (it was refused) applies none of them: the next prompt's notices find the deltas still pending.
+ */
+export class NoticeBatch {
+	readonly #effects: Array<() => void> = [];
+
+	add(effect: () => void): void {
+		this.#effects.push(effect);
+	}
+
+	commit(): void {
+		for (const effect of this.#effects.splice(0)) effect();
+	}
+}
+
 function snapshotDelta(delta: NameDelta | undefined): NameDelta | undefined {
 	return delta && { added: new Set(delta.added), removed: new Set(delta.removed) };
 }
@@ -472,8 +490,6 @@ export class SessionTools {
 	 * override hides it, the complete pending delta still does.
 	 */
 	#basePromptReflectsRosterDelta = false;
-	/** The delivery state each taken notice captured, run by {@link deliverNotices} once its batch is admitted. */
-	readonly #noticeDelivery = new WeakMap<AgentMessage, () => void>();
 	/**
 	 * Newest assistant reply restored with the transcript this session was
 	 * created with, and the recorded digest of the prompt that transcript was
@@ -2067,8 +2083,8 @@ export class SessionTools {
 	 * delta. This carries no meaningful payload (a short tool-name list), so it is
 	 * never previewed or deferred for context budgeting: it is re-derived from the
 	 * live delta after pre-prompt maintenance, keeping the model's stated
-	 * availability in lockstep with the wire tool list. The delta it announces is
-	 * recorded as delivered once the batch carrying it is ({@link deliverNotices}).
+	 * availability in lockstep with the wire tool list. Recording the delta as
+	 * delivered is left to `batch` ({@link NoticeBatch}).
 	 *
 	 * When a rebuilt base is delivered, the notice includes only changes made after
 	 * that snapshot. A per-turn `before_agent_start` override that hides the rebuilt
@@ -2077,8 +2093,11 @@ export class SessionTools {
 	 */
 	takePendingToolRosterNotice(options: {
 		baseDelivered: boolean;
+		batch: NoticeBatch;
 	}): CustomMessage<ToolRosterNoticeDetails> | undefined {
-		return this.#deliverWhenSent(this.#buildToolRosterNotice(options.baseDelivered));
+		const taken = this.#buildToolRosterNotice(options.baseDelivered);
+		options.batch.add(taken.commit);
+		return taken.notice;
 	}
 
 	/** The roster notice {@link takePendingToolRosterNotice} takes; `commit` records the delta as taken delivered. */
@@ -2097,33 +2116,6 @@ export class SessionTools {
 				this.#basePromptReflectsRosterDelta = false;
 			},
 		};
-	}
-
-	/**
-	 * `taken`'s notice, whose delivery state waits for {@link deliverNotices} of a batch that carries it. A take
-	 * with no notice records at once what the base prompt this request carries already delivered.
-	 */
-	#deliverWhenSent<T>(taken: DeliverableNotice<T>): CustomMessage<T> | undefined {
-		if (!taken.notice) {
-			taken.commit();
-			return undefined;
-		}
-		this.#noticeDelivery.set(taken.notice, taken.commit);
-		return taken.notice;
-	}
-
-	/**
-	 * Record the notices `messages` carries (the final batch, once it is admitted for dispatch) as delivered:
-	 * exactly the roster and `xd://` mount deltas each announced when it was taken, so a change since stays pending.
-	 * A batch that is not sent leaves those deltas pending for the next prompt's notices.
-	 */
-	deliverNotices(messages: readonly AgentMessage[]): void {
-		for (const message of messages) {
-			const commit = this.#noticeDelivery.get(message);
-			if (!commit) continue;
-			this.#noticeDelivery.delete(message);
-			commit();
-		}
 	}
 
 	#buildPendingToolRosterNotice(
@@ -2372,18 +2364,24 @@ export class SessionTools {
 		};
 	}
 
+	/** A new batch for the notice takes of one prompt ({@link NoticeBatch}). */
+	noticeBatch(): NoticeBatch {
+		return new NoticeBatch();
+	}
+
 	/**
 	 * Takes the mount notice only when its rendered content still matches the
-	 * preview included in the context estimate; the delta it announces is
-	 * recorded as delivered once the batch carrying it is ({@link deliverNotices}).
+	 * preview included in the context estimate; recording the delta as delivered
+	 * is left to `batch` ({@link NoticeBatch}).
 	 */
 	takePendingXdevMountNotice(options: {
 		baseCatalogDelivered: boolean;
 		expectedContentKey: string;
+		batch: NoticeBatch;
 	}): CustomMessage<XdevMountNoticeDetails> | undefined {
-		return this.#deliverWhenSent(
-			this.#buildXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey),
-		);
+		const taken = this.#buildXdevMountNotice(options.baseCatalogDelivered, options.expectedContentKey);
+		options.batch.add(taken.commit);
+		return taken.notice;
 	}
 
 	/** The mount notice {@link takePendingXdevMountNotice} takes; `commit` records the delta as taken delivered. */
