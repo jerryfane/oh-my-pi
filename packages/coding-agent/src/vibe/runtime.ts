@@ -42,7 +42,7 @@ import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
-import type { FirstTurnOutcome, TranscriptPreamble } from "../session/inbox-epoch";
+import { type FirstTurnOutcome, type TranscriptPreamble, throwIfStale } from "../session/inbox-epoch";
 import { resolveSubagentStartModel } from "../task/subagent-start-model";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
@@ -914,12 +914,15 @@ export class VibeSessionRegistry {
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
 	 * `seed` is built inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn,
-	 * and so does a seed whose transcript is replaced before the child admits the turn.
+	 * and so does a seed whose transcript is replaced before the child admits the turn. A seed whose transcript was
+	 * already replaced spawns nothing ({@link throwIfStale}): checked before the owner scope is read and
+	 * again before the worker is recorded, so no spawn, title or tombstone reaches the successor transcript.
 	 */
 	async spawn(
 		session: ToolSession,
 		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: VibeSeed },
 	): Promise<VibeSpawnOutcome> {
+		throwIfStale(args.seed?.signal);
 		const scope = this.ownerScope(session);
 		return this.#withTerminationLock(scope, () => this.#spawnLocked(session, scope, args));
 	}
@@ -944,6 +947,7 @@ export class VibeSessionRegistry {
 		await session.agentOutputManager.reserve(reservedIds);
 		const id = await session.agentOutputManager.allocate(sanitizeAgentId(args.name) || generateTaskName());
 		const parentSessionFile = scope.parentSessionFile;
+		throwIfStale(args.seed?.signal);
 		const childSessionName = `${id}.jsonl`;
 		const childSessionFile = parentSessionFile
 			? path.resolve(parentSessionFile.slice(0, -6), childSessionName)
@@ -1701,7 +1705,7 @@ export class VibeSessionRegistry {
 						? await runSubprocess({
 								...spawnOptions,
 								topicBoard,
-								onFirstTurn: reportFirstTurn,
+								onFirstTurn: options.seed ? reportFirstTurn : undefined,
 								launchSignal: options.seed?.signal,
 								launchPreamble: seed,
 							})

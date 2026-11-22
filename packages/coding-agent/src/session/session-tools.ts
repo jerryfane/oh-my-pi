@@ -449,6 +449,8 @@ export class SessionTools {
 	 * override hides it, the complete pending delta still does.
 	 */
 	#basePromptReflectsRosterDelta = false;
+	/** Delivery state the notice takes advanced while {@link holdNoticeDelivery} holds it, committed once sent. */
+	#heldNoticeDelivery: Array<() => void> | undefined;
 	/**
 	 * Newest assistant reply restored with the transcript this session was
 	 * created with, and the recorded digest of the prompt that transcript was
@@ -2038,6 +2040,31 @@ export class SessionTools {
 	}
 
 	/**
+	 * Hold the delivery state the next notice takes advance (the roster and `xd://` mount deltas they consume)
+	 * until the returned function learns whether their batch was admitted: admitted, it is committed; else the
+	 * deltas stay pending for the next prompt, as when nothing was taken. The hold covers the synchronous span it
+	 * is taken in: one not settled by its end is dropped the same way.
+	 */
+	holdNoticeDelivery(): (admitted: boolean) => void {
+		const held: Array<() => void> = [];
+		this.#heldNoticeDelivery = held;
+		const release = () => {
+			if (this.#heldNoticeDelivery === held) this.#heldNoticeDelivery = undefined;
+		};
+		queueMicrotask(release);
+		return admitted => {
+			release();
+			if (admitted) for (const commit of held.splice(0)) commit();
+		};
+	}
+
+	/** Run `commit` (a notice take's delivery state) now, or once the held batch is admitted. */
+	#deliverNotice(commit: () => void): void {
+		if (this.#heldNoticeDelivery) this.#heldNoticeDelivery.push(commit);
+		else commit();
+	}
+
+	/**
 	 * Consumes the hidden provider-visible roster notice for the current pending
 	 * delta. This carries no meaningful payload (a short tool-name list), so it is
 	 * never previewed or deferred for context budgeting: it is re-derived from the
@@ -2057,9 +2084,11 @@ export class SessionTools {
 				? this.#pendingToolRosterDeltaAfterBase
 				: this.#pendingToolRosterDelta;
 		const notice = this.#buildPendingToolRosterNotice(pending);
-		this.#pendingToolRosterDelta = undefined;
-		this.#pendingToolRosterDeltaAfterBase = undefined;
-		this.#basePromptReflectsRosterDelta = false;
+		this.#deliverNotice(() => {
+			this.#pendingToolRosterDelta = undefined;
+			this.#pendingToolRosterDeltaAfterBase = undefined;
+			this.#basePromptReflectsRosterDelta = false;
+		});
 		return notice;
 	}
 
@@ -2326,14 +2355,16 @@ export class SessionTools {
 			// mount membership or the applied-tool signature.
 			// If maintenance delivered a rebuilt base, commit additions carried by
 			// that prompt before deferring the remaining notice content.
-			if (options.baseCatalogDelivered) this.#recordBasePromptXdevAdditions();
+			if (options.baseCatalogDelivered) this.#deliverNotice(() => this.#recordBasePromptXdevAdditions());
 			return undefined;
 		}
 		// A hidden base rebuild can leave the projected notice byte-identical. The
 		// exact content was already budgeted, so consume it rather than withholding
 		// both the catalog and its availability notice from this request.
-		this.#pendingXdevMountDelta = undefined;
-		this.#announcedMounts = projection.announcedMounts;
+		this.#deliverNotice(() => {
+			this.#pendingXdevMountDelta = undefined;
+			this.#announcedMounts = projection.announcedMounts;
+		});
 		return projection.notice;
 	}
 
