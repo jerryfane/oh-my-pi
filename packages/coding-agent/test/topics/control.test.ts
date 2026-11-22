@@ -55,7 +55,7 @@ function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 		},
 		acceptSuggestion: async () => ({ topicId: "New", alreadyAccepted: false }),
 		dismissSuggestion: async () => ({ alreadyDismissed: false }),
-		organise: () => ({ queued: false }),
+		organise: async () => ({ queued: false }),
 		onChange(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -227,7 +227,7 @@ describe("topics control socket", () => {
 			create: async () => {
 				throw new TopicsError(refusals.seed!, "Not user or assistant text messages: e1.");
 			},
-			organise: () => {
+			organise: async () => {
 				throw new TopicsError(refusals.organise!, "An Organise turn is already queued or running.");
 			},
 		};
