@@ -451,6 +451,7 @@ import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRo
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
 import { topicsHostFactory } from "./topics/host";
+import { TopicSuggestTool } from "./topics/suggest-tool";
 import {
 	cfgImagesBlockImages,
 	cfgStartupQuiet,
@@ -4070,6 +4071,18 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				nativeToolsByName.set(goalTool.name, wrapped);
 			}
 		}
+		// Topics: the host factory (top-level, topics enabled) and the Inbox's `topic_suggest`.
+		const createTopicsHost = topicsHostFactory(
+			toolSession,
+			(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix,
+			() => session,
+		);
+		if (createTopicsHost && !restrictToolNames) {
+			const suggestTool = wrapToolWithMetaNotice(new TopicSuggestTool(() => session.getTopicsHost()));
+			toolRegistry.set(suggestTool.name, suggestTool);
+			builtInRegistryToolNames.add(suggestTool.name);
+			nativeToolsByName.set(suggestTool.name, suggestTool);
+		}
 		for (const tool of wrappedExtensionTools) {
 			toolRegistry.set(tool.name, tool);
 			builtInRegistryToolNames.delete(tool.name);
@@ -5579,7 +5592,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				(options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix
 					? () => createVibeTools(toolSession)
 					: undefined,
-			createTopicsHost: topicsHostFactory(toolSession, (options.taskDepth ?? 0) === 0 && !options.parentTaskPrefix),
+			createTopicsHost,
 			builtInToolNames: builtInRegistryToolNames,
 			mcpManagerToolNames: initialMcpManagerToolNames,
 			transformContext,

@@ -760,6 +760,17 @@ export interface TopicSummary {
 	turnStartedAt?: number;
 }
 
+/** An open topic suggestion of the Inbox model. */
+export interface TopicSuggestion {
+	/** Suggestion id (`sg_…`). */
+	id: string;
+	title: string;
+	reason: string;
+	/** Session entry ids of the Inbox messages the suggestion covers. */
+	messageIds: string[];
+	createdMs: number;
+}
+
 /** Incremental subagent transcript read. */
 export interface SubagentMessages {
 	sessionFile: string;
@@ -1733,11 +1744,14 @@ export interface SteerSubagentParams {
 
 export interface TopicsListResult {
 	topics: TopicSummary[];
+	suggestions: TopicSuggestion[];
 }
 
 export interface TopicsNewParams {
 	title: string;
 	message: string;
+	/** Inbox user/assistant message entry ids copied into the topic. */
+	seedMessageIds?: string[];
 }
 
 export interface TopicsNewResult {
@@ -1770,6 +1784,37 @@ export interface TopicsReopenParams {
 export interface TopicsRenameParams {
 	topicId: string;
 	title: string;
+}
+
+export interface TopicsAcceptSuggestionParams {
+	suggestionId: string;
+	/** Who accepted, as the host names them. */
+	by: string;
+}
+
+export interface TopicsAcceptSuggestionResult {
+	topicId: string;
+	alreadyAccepted: boolean;
+}
+
+export interface TopicsDismissSuggestionParams {
+	suggestionId: string;
+	/** Who dismissed, as the host names them. */
+	by: string;
+}
+
+export interface TopicsDismissSuggestionResult {
+	alreadyDismissed: boolean;
+}
+
+export interface TopicsOrganiseParams {
+	/** Who asked, as the host names them. */
+	by: string;
+}
+
+export interface TopicsOrganiseResult {
+	/** The Inbox was busy; the turn runs after the current one. */
+	queued: boolean;
 }
 
 export interface LiveStartParams {
@@ -2034,6 +2079,9 @@ export interface RpcWireCommands {
 	topics_close: { params: TopicsCloseParams; result: undefined };
 	topics_reopen: { params: TopicsReopenParams; result: undefined };
 	topics_rename: { params: TopicsRenameParams; result: undefined };
+	topics_accept_suggestion: { params: TopicsAcceptSuggestionParams; result: TopicsAcceptSuggestionResult };
+	topics_dismiss_suggestion: { params: TopicsDismissSuggestionParams; result: TopicsDismissSuggestionResult };
+	topics_organise: { params: TopicsOrganiseParams; result: TopicsOrganiseResult };
 	live_start: { params: LiveStartParams; result: LiveStartResult };
 	live_connect: { params: LiveConnectParams; result: LiveConnectResult };
 	live_stop: { params: undefined; result: undefined };

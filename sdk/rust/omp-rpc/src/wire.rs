@@ -3504,6 +3504,20 @@ pub struct TopicSummary {
 	pub turn_started_at: Option<i64>,
 }
 
+/// An open topic suggestion of the Inbox model.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicSuggestion {
+	/// Suggestion id (`sg_…`).
+	pub id: String,
+	pub title: String,
+	pub reason: String,
+	/// Session entry ids of the Inbox messages the suggestion covers.
+	#[serde(rename = "messageIds")]
+	pub message_ids: Vec<String>,
+	#[serde(rename = "createdMs")]
+	pub created_ms: i64,
+}
+
 /// Incremental subagent transcript read.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SubagentMessages {
@@ -5492,12 +5506,16 @@ pub struct SteerSubagentParams {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicsListResult {
 	pub topics: Vec<TopicSummary>,
+	pub suggestions: Vec<TopicSuggestion>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicsNewParams {
 	pub title: String,
 	pub message: String,
+	/// Inbox user/assistant message entry ids copied into the topic.
+	#[serde(rename = "seedMessageIds", default, skip_serializing_if = "Option::is_none")]
+	pub seed_message_ids: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5545,6 +5563,48 @@ pub struct TopicsRenameParams {
 	#[serde(rename = "topicId")]
 	pub topic_id: String,
 	pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsAcceptSuggestionParams {
+	#[serde(rename = "suggestionId")]
+	pub suggestion_id: String,
+	/// Who accepted, as the host names them.
+	pub by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsAcceptSuggestionResult {
+	#[serde(rename = "topicId")]
+	pub topic_id: String,
+	#[serde(rename = "alreadyAccepted")]
+	pub already_accepted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsDismissSuggestionParams {
+	#[serde(rename = "suggestionId")]
+	pub suggestion_id: String,
+	/// Who dismissed, as the host names them.
+	pub by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsDismissSuggestionResult {
+	#[serde(rename = "alreadyDismissed")]
+	pub already_dismissed: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsOrganiseParams {
+	/// Who asked, as the host names them.
+	pub by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsOrganiseResult {
+	/// The Inbox was busy; the turn runs after the current one.
+	pub queued: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6835,25 +6895,28 @@ impl Command for SteerSubagentCommand {
 	}
 }
 
-/// List the owner's topics (persistent workers), newest activity first.
+/// List the owner's topics (persistent workers), newest activity first, and the open topic suggestions.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct TopicsListCommand {}
 
 impl Command for TopicsListCommand {
 	const NAME: &'static str = "topics_list";
 	const TIMEOUT_MS: Option<u64> = None;
-	type Output = Vec<TopicSummary>;
+	type Output = TopicsListResult;
 
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
-		serde_json::from_value::<TopicsListResult>(data.unwrap_or_else(|| Value::Object(Map::new()))).map(|result| result.topics)
+		serde_json::from_value::<TopicsListResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 
-/// Start a topic with a title and its first message.
+/// Start a topic with a title and its first message, optionally seeded with Inbox messages.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TopicsNewCommand {
 	pub title: String,
 	pub message: String,
+	/// Inbox user/assistant message entry ids copied into the topic.
+	#[serde(rename = "seedMessageIds", default, skip_serializing_if = "Option::is_none")]
+	pub seed_message_ids: Option<Vec<String>>,
 }
 
 impl Command for TopicsNewCommand {
@@ -6955,6 +7018,61 @@ impl Command for TopicsRenameCommand {
 	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
 		let _ = data;
 		Ok(())
+	}
+}
+
+/// Start the suggested topic, seeded with all of its Inbox messages; returns before the seed is ready.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsAcceptSuggestionCommand {
+	#[serde(rename = "suggestionId")]
+	pub suggestion_id: String,
+	/// Who accepted, as the host names them.
+	pub by: String,
+}
+
+impl Command for TopicsAcceptSuggestionCommand {
+	const NAME: &'static str = "topics_accept_suggestion";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = TopicsAcceptSuggestionResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsAcceptSuggestionResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Dismiss a topic suggestion.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsDismissSuggestionCommand {
+	#[serde(rename = "suggestionId")]
+	pub suggestion_id: String,
+	/// Who dismissed, as the host names them.
+	pub by: String,
+}
+
+impl Command for TopicsDismissSuggestionCommand {
+	const NAME: &'static str = "topics_dismiss_suggestion";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = TopicsDismissSuggestionResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsDismissSuggestionResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Queue one Inbox turn that reviews the history and suggests topics; never interrupts a running turn.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TopicsOrganiseCommand {
+	/// Who asked, as the host names them.
+	pub by: String,
+}
+
+impl Command for TopicsOrganiseCommand {
+	const NAME: &'static str = "topics_organise";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = TopicsOrganiseResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<TopicsOrganiseResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
 	}
 }
 

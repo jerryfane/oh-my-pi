@@ -5,6 +5,7 @@
 ### Added
 
 - Added an SDK and task-executor spawn depth (createAgentSession spawnDepth, ExecutorOptions spawnDepth/parentSpawnDepth) that limits subagent nesting separately from task depth; a subagent started with a reset spawn depth keeps the full task.maxRecursionDepth budget, including after it is parked and revived.
+- Added topic suggestions for the Inbox with topics enabled: the topic_suggest tool, RPC/control commands topics_accept_suggestion, topics_dismiss_suggestion and topics_organise, topics_new seedMessageIds, open suggestions in topics_list, and a machine-readable code on topics refusals.
 
 ## [19.0.0] - 2026-11-18
 

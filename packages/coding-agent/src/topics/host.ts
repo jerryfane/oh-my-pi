@@ -5,13 +5,40 @@
  * directly, without a turn of the main conversation. While a host lives,
  * agents' `agent://<id>` messages to its topics run as topic turns
  * ({@link routeTopicMessage}).
+ *
+ * The Inbox (the top-level session) also holds topic suggestions
+ * (`topics/suggestions`): the Inbox model suggests, the owner accepts (a topic
+ * seeded with the chosen Inbox messages) or dismisses, and Organise asks the
+ * Inbox model for several suggestions in one turn.
  */
+import { prompt } from "@oh-my-pi/pi-utils";
 import { setIrcRoute } from "../irc/routes";
 import { readRpcSubagentTranscript } from "../modes/rpc/rpc-subagents";
 import type { RpcSubagentMessagesResult } from "../modes/rpc/rpc-types";
+import topicAcceptedTemplate from "../prompts/system/topic-accepted.md" with { type: "text" };
+import topicOrganiseTemplate from "../prompts/system/topic-organise.md" with { type: "text" };
+import type { AgentSession } from "../session/agent-session";
 import type { ToolSession } from "../tools";
 import type { WorkerChange, WorkerSummary } from "../vibe/worker-scope";
+import { sessionInbox, type TopicsInbox } from "./inbox";
+import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "./seed";
 import { cfgTopicsEnabled } from "./settings";
+import {
+	foldSuggestions,
+	formatMessageIndex,
+	newSuggestionId,
+	requireEligibleMessageIds,
+	type SuggestionBoard,
+	suggestionSummary,
+	TOPIC_CONTINUED_TYPE,
+	TOPIC_ORGANISE_TYPE,
+	TOPIC_SUGGESTION_STATE_TYPE,
+	TOPIC_SUGGESTION_TYPE,
+	type TopicContinuedDetails,
+	TopicsError,
+	type TopicSuggestion,
+	type TopicSuggestionStateData,
+} from "./suggestions";
 import { routeTopicMessage, topicsRegistry } from "./workers";
 
 /** One topic as a host sees it. */
@@ -23,44 +50,155 @@ export interface TopicSendOutcome {
 	mode: "steered" | "queued" | "turn";
 }
 
+/** A suggestion was made (saved in the Inbox), accepted or dismissed; `id` is the suggestion's. */
+export interface SuggestionChange {
+	id: string;
+	ownerId: string;
+	parentSessionId: string;
+	reason: "suggested" | "suggestion-accepted" | "suggestion-dismissed";
+}
+
+/** What `subscribe` streams to a host: a topic's change, or a suggestion's. */
+export type TopicChange = WorkerChange | SuggestionChange;
+
+/** Dismissed suggestion titles the Inbox board lists. */
+export const BOARD_DISMISSED_TITLES = 10;
+/** Inbox messages listed (with their ids) in the Organise instruction. */
+const ORGANISE_INDEX_MESSAGES = 150;
+/** Inbox messages listed when `topic_suggest` names none or wrong ones. */
+const SUGGEST_INDEX_MESSAGES = 40;
+
 export interface TopicsHost {
 	list(): TopicSummary[];
-	/** Start a topic with an owner-facing title and its first message. */
-	create(args: { title: string; message: string; name?: string }): Promise<{ id: string }>;
+	/** Start a topic with an owner-facing title and its first message, seeded with Inbox messages when given. */
+	create(args: { title: string; message: string; name?: string; seedMessageIds?: string[] }): Promise<{ id: string }>;
 	send(id: string, message: string): Promise<TopicSendOutcome>;
 	/** Read the topic's own conversation from `fromByte` (incremental). */
 	read(id: string, fromByte?: number): Promise<RpcSubagentMessagesResult>;
 	close(id: string): Promise<void>;
 	reopen(id: string): Promise<void>;
 	rename(id: string, title: string): Promise<void>;
+	/** Open suggestions, oldest first. */
+	suggestions(): TopicSuggestion[];
+	/** Open suggestions and the latest dismissed titles, for the Inbox's topic board. */
+	suggestionBoard(): SuggestionBoard;
+	/** Record the Inbox model's suggestion (`topic_suggest`); creates nothing. */
+	suggest(args: { title: string; reason: string; messageIds: string[] }): TopicSuggestion;
+	/** Start the suggested topic, seeded with all of the suggestion's messages; returns before the seed is ready. */
+	acceptSuggestion(args: { suggestionId: string; by: string }): Promise<{ topicId: string; alreadyAccepted: boolean }>;
+	dismissSuggestion(args: { suggestionId: string; by: string }): { alreadyDismissed: boolean };
+	/** Queue one Inbox turn that reviews the history and suggests topics. */
+	organise(args: { by: string }): { queued: boolean };
 	/** Restore persisted topics of the current session (startup, session switch). */
 	restore(): Promise<number>;
-	onChange(listener: (change: WorkerChange) => void): () => void;
+	onChange(listener: (change: TopicChange) => void): () => void;
 	/** Stop taking agents' messages to the topics; the topics themselves are kept. */
 	dispose(): void;
+}
+
+export interface TopicsHostOptions {
+	/** The Inbox's session; suggestions, seeds and Organise need it. */
+	inbox?: TopicsInbox;
+	/** Condenses older seed messages; default one call to the `smol` role model. */
+	summarize?: SeedSummarizer;
+}
+
+function requireInbox(inbox: TopicsInbox | undefined): TopicsInbox {
+	if (!inbox) throw new Error("Topic suggestions need the Inbox session.");
+	return inbox;
 }
 
 /**
  * Bind the topics registry to the top-level session's tool session. A second
  * host for the same session replaces the first one's message route.
  */
-export function createTopicsHost(session: ToolSession): TopicsHost {
+export function createTopicsHost(session: ToolSession, options: TopicsHostOptions = {}): TopicsHost {
+	const { inbox } = options;
+	const summarize = options.summarize ?? smolSeedSummarizer(session);
 	const registry = topicsRegistry();
 	const ownedBySession = (change: WorkerChange): boolean => {
 		const scope = registry.ownerScope(session);
 		return change.ownerId === scope.ownerId && change.parentSessionId === scope.parentSessionId;
 	};
 	const unroute = setIrcRoute(session, (message, bus) => routeTopicMessage(registry, session, message, bus));
+	const suggestionListeners = new Set<(change: TopicChange) => void>();
+	const emitSuggestion = (id: string, reason: SuggestionChange["reason"]): void => {
+		const { ownerId, parentSessionId } = registry.ownerScope(session);
+		for (const listener of suggestionListeners) listener({ id, ownerId, parentSessionId, reason });
+	};
+	/** Suggestions made but not saved yet (the Inbox turn that made them is still running). */
+	const unsaved: Array<{ sessionId: string; suggestion: TopicSuggestion }> = [];
+	/** Accepts whose topic is being created, by suggestion id. */
+	const accepting = new Map<string, Promise<string>>();
+
+	const folded = (box: TopicsInbox) => {
+		const sessionId = box.sessionId();
+		return foldSuggestions(
+			box.entries(),
+			unsaved.filter(entry => entry.sessionId === sessionId).map(entry => entry.suggestion),
+		);
+	};
+	const appendState = (box: TopicsInbox, data: TopicSuggestionStateData): void => {
+		box.appendState(TOPIC_SUGGESTION_STATE_TYPE, data);
+		emitSuggestion(data.id, data.state === "accepted" ? "suggestion-accepted" : "suggestion-dismissed");
+	};
+
+	/**
+	 * Spawn a topic; with `seed`, the chosen Inbox messages are prepended to its
+	 * first turn once ready, and a visible "Continued in topic" note goes to the Inbox.
+	 */
+	const spawnTopic = async (args: {
+		title: string;
+		message: string;
+		name?: string;
+		seed?: { box: TopicsInbox; messageIds: string[]; reason?: string; suggestionId: string | null };
+	}): Promise<string> => {
+		const title = args.title.trim();
+		if (!title) throw new Error("Topic title must not be empty.");
+		const seed = args.seed;
+		const { id } = await registry.spawn(session, {
+			cli: "good",
+			name: args.name ?? title,
+			prompt: args.message,
+			title,
+			...(seed
+				? {
+						seed: buildTopicSeed({
+							entries: [...seed.box.entries()],
+							messageIds: seed.messageIds,
+							reason: seed.reason,
+							summarize,
+						}),
+					}
+				: {}),
+		});
+		if (seed) {
+			const details: TopicContinuedDetails = {
+				topicId: id,
+				title,
+				suggestionId: seed.suggestionId,
+				messageIds: [...seed.messageIds],
+			};
+			void seed.box.appendNote({
+				customType: TOPIC_CONTINUED_TYPE,
+				content: `Continued in topic ${title}`,
+				details,
+			});
+		}
+		return id;
+	};
+
 	return {
 		list: () => registry.describe(session),
-		async create({ title, message, name }) {
-			const trimmed = title.trim();
-			if (!trimmed) throw new Error("Topic title must not be empty.");
-			const { id } = await registry.spawn(session, {
-				cli: "good",
-				name: name ?? trimmed,
-				prompt: message,
-				title: trimmed,
+		async create({ title, message, name, seedMessageIds }) {
+			if (!seedMessageIds?.length) return { id: await spawnTopic({ title, message, name }) };
+			const box = requireInbox(inbox);
+			requireEligibleMessageIds(seedMessageIds, box.branch());
+			const id = await spawnTopic({
+				title,
+				message,
+				name,
+				seed: { box, messageIds: seedMessageIds, suggestionId: null },
 			});
 			return { id };
 		},
@@ -76,19 +214,140 @@ export function createTopicsHost(session: ToolSession): TopicsHost {
 		close: id => registry.close(session, id),
 		reopen: id => registry.reopen(session, id),
 		rename: (id, title) => registry.rename(session, id, title),
+		suggestions() {
+			if (!inbox) return [];
+			return [...folded(inbox).values()]
+				.filter(suggestion => suggestion.state === "open" && !accepting.has(suggestion.id))
+				.map(suggestionSummary);
+		},
+		suggestionBoard() {
+			if (!inbox) return { open: [], dismissed: [] };
+			const all = [...folded(inbox).values()];
+			return {
+				open: all
+					.filter(suggestion => suggestion.state === "open" && !accepting.has(suggestion.id))
+					.map(suggestionSummary),
+				dismissed: all
+					.filter(suggestion => suggestion.state === "dismissed")
+					.sort((a, b) => (b.stateOrder ?? 0) - (a.stateOrder ?? 0))
+					.slice(0, BOARD_DISMISSED_TITLES)
+					.map(suggestion => suggestion.title),
+			};
+		},
+		suggest({ title, reason, messageIds }) {
+			const box = requireInbox(inbox);
+			const trimmedTitle = title.trim();
+			const trimmedReason = reason.trim();
+			if (!trimmedTitle) throw new Error("Suggestion title must not be empty.");
+			if (!trimmedReason) throw new Error("Suggestion reason must not be empty.");
+			const branch = box.branch();
+			const index = formatMessageIndex(branch, SUGGEST_INDEX_MESSAGES);
+			if (messageIds.length === 0) {
+				throw new TopicsError(
+					"invalid_message_ids",
+					`Name the messages that belong to the topic (\`message_ids\`). Latest messages of this conversation:\n${index}`,
+				);
+			}
+			try {
+				requireEligibleMessageIds(messageIds, branch);
+			} catch (error) {
+				if (!(error instanceof TopicsError)) throw error;
+				throw new TopicsError(error.code, `${error.message} Latest messages of this conversation:\n${index}`);
+			}
+			const suggestion: TopicSuggestion = {
+				id: newSuggestionId(),
+				title: trimmedTitle,
+				reason: trimmedReason,
+				messageIds: [...new Set(messageIds)],
+				createdMs: Date.now(),
+			};
+			const pending = { sessionId: box.sessionId(), suggestion };
+			unsaved.push(pending);
+			void box
+				.appendNote({
+					customType: TOPIC_SUGGESTION_TYPE,
+					content: `Suggested topic: ${suggestion.title}. ${suggestion.reason}`,
+					details: suggestion,
+				})
+				.then(saved => {
+					unsaved.splice(unsaved.indexOf(pending), 1);
+					if (saved) emitSuggestion(suggestion.id, "suggested");
+				});
+			return suggestion;
+		},
+		async acceptSuggestion({ suggestionId, by }) {
+			const box = requireInbox(inbox);
+			const inFlight = accepting.get(suggestionId);
+			if (inFlight) return { topicId: await inFlight, alreadyAccepted: true };
+			const suggestion = folded(box).get(suggestionId);
+			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
+			if (suggestion.state === "accepted" && suggestion.topicId) {
+				return { topicId: suggestion.topicId, alreadyAccepted: true };
+			}
+			const started = spawnTopic({
+				title: suggestion.title,
+				message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
+				seed: { box, messageIds: suggestion.messageIds, reason: suggestion.reason, suggestionId },
+			});
+			accepting.set(suggestionId, started);
+			try {
+				const topicId = await started;
+				appendState(box, { id: suggestionId, state: "accepted", topicId, by, atMs: Date.now() });
+				return { topicId, alreadyAccepted: false };
+			} finally {
+				accepting.delete(suggestionId);
+			}
+		},
+		dismissSuggestion({ suggestionId, by }) {
+			const box = requireInbox(inbox);
+			const suggestion = folded(box).get(suggestionId);
+			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
+			if (suggestion.state === "accepted" || accepting.has(suggestionId)) {
+				throw new TopicsError("already_accepted", `Suggestion ${suggestionId} was already accepted.`);
+			}
+			if (suggestion.state === "dismissed") return { alreadyDismissed: true };
+			appendState(box, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
+			return { alreadyDismissed: false };
+		},
+		organise({ by }) {
+			const box = requireInbox(inbox);
+			if (box.turnPending(TOPIC_ORGANISE_TYPE)) {
+				throw new TopicsError("organise_running", "An Organise turn is already queued or running.");
+			}
+			const index = formatMessageIndex(box.branch(), ORGANISE_INDEX_MESSAGES);
+			return box.queueTurn({
+				customType: TOPIC_ORGANISE_TYPE,
+				content: prompt.render(topicOrganiseTemplate, { index: index || "(none)" }).trim(),
+				details: { by },
+			});
+		},
 		restore: () => registry.rehydrate(session),
 		onChange(listener) {
-			return registry.onChange(change => {
+			suggestionListeners.add(listener);
+			const unsubscribe = registry.onChange(change => {
 				if (ownedBySession(change)) listener(change);
 			});
+			return () => {
+				suggestionListeners.delete(listener);
+				unsubscribe();
+			};
 		},
 		dispose: unroute,
 	};
 }
 
-/** The session's topics host factory: only for a top-level session with `topics.enabled`. */
-export function topicsHostFactory(session: ToolSession, topLevel: boolean): (() => TopicsHost) | undefined {
-	return topLevel && cfgTopicsEnabled.get(session.settings) ? () => createTopicsHost(session) : undefined;
+/**
+ * The session's topics host factory: only for a top-level session with
+ * `topics.enabled`. `inboxSession` returns the Inbox once it exists (the
+ * factory runs on first use, after the session is built).
+ */
+export function topicsHostFactory(
+	session: ToolSession,
+	topLevel: boolean,
+	inboxSession?: () => AgentSession,
+): (() => TopicsHost) | undefined {
+	if (!topLevel || !cfgTopicsEnabled.get(session.settings)) return undefined;
+	return () => createTopicsHost(session, { inbox: inboxSession && sessionInbox(inboxSession()) });
 }
 
 /**
