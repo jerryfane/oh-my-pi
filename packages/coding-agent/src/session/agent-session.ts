@@ -528,6 +528,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
+import { TranscriptIdentity } from "./transcript-identity";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -1192,8 +1193,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	#pendingExcludedRows: CustomMessage[] = [];
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
 	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { generation?: number }>();
-	/** Changes on every transcript replacement (`/new`, `/clear`, fork, branch into a new session, any switch or reload). */
-	#transcriptGeneration = 0;
+	/** Which transcript is open, for work bound to one (see {@link TranscriptIdentity}). */
+	readonly #identity = new TranscriptIdentity(this);
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -1817,7 +1818,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const rows: CustomMessage[] = [];
 		for (const row of this.#pendingExcludedRows.splice(0)) {
 			const expected = this.#recordedRowWaiters.get(row)?.generation;
-			if (expected === undefined || expected === this.#transcriptGeneration) rows.push(row);
+			if (this.#identity.matches(expected)) rows.push(row);
 			else this.#settleRecordedRow(row, new InboxChangedError());
 		}
 		if (connected) {
@@ -1872,7 +1873,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	async recordWithoutTurn(message: CustomMessage, expectedGeneration?: number): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
-		this.#assertTranscriptGeneration(expectedGeneration);
+		await this.#identity.admit(expectedGeneration);
 		// Decided at admission with the journal's own rule: a row it never saves would never settle.
 		if (!isJournaledCustomMessage(message)) {
 			throw new Error(`A "${message.customType}" message is never saved in the session, so it cannot be recorded.`);
@@ -1890,23 +1891,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	/** The transcript generation: it changes on every transcript replacement (see {@link #transcriptGeneration}). */
+	/** The open transcript's generation (see {@link TranscriptIdentity}). */
 	get transcriptGeneration(): number {
-		return this.#transcriptGeneration;
-	}
-
-	/** Throw {@link InboxChangedError} when `expected` is given and another transcript is open. */
-	#assertTranscriptGeneration(expected: number | undefined): void {
-		if (expected !== undefined && expected !== this.#transcriptGeneration) throw new InboxChangedError();
+		return this.#identity.generation;
 	}
 
 	/**
-	 * {@link SessionManager.appendEntriesAtomically} for the transcript of `expectedGeneration`: under the
-	 * write lock, another open transcript refuses the batch with {@link InboxChangedError} and nothing is written.
+	 * {@link SessionManager.appendEntriesAtomically} for the transcript of `expectedGeneration`: stale work is
+	 * refused before the write's persistence preflight, and again under the write lock; nothing is written.
 	 */
-	appendEntriesAtomically<T>(append: () => T, expectedGeneration?: number): Promise<T> {
+	async appendEntriesAtomically<T>(append: () => T, expectedGeneration?: number): Promise<T> {
+		await this.#identity.admit(expectedGeneration);
 		return this.sessionManager.appendEntriesAtomically(() => {
-			this.#assertTranscriptGeneration(expectedGeneration);
+			this.#identity.check(expectedGeneration);
 			return append();
 		});
 	}
@@ -7568,7 +7565,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The cleared context is a new transcript: an aside or held message captured for the old one drops
 		// its record instead of landing here (mirrors newSession()).
 		this.#sessionGeneration++;
-		this.#transcriptGeneration++;
+		this.#identity.replace();
 		this.#pendingNextTurnMessages = [];
 		this.#dropPendingExcludedRows();
 		this.#experimentalContextNotesReminder = undefined;
@@ -10018,7 +10015,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
 		// The run starts for this transcript: a transition from here on aborts its setup (prompt generation).
-		this.#assertTranscriptGeneration(options?.expectedGeneration);
+		this.#identity.check(options?.expectedGeneration);
 		const inFlightEpoch = this.#beginInFlight();
 		// Client ownership is reserved by #prompt before dispatch preprocessing
 		// and released when its bracket settles; callers that reach this
@@ -11368,6 +11365,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			: await this.#buildSkillImageDescriptionNotice(normalizedAppMessage);
 		if (deliverAs === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
+			this.#identity.check(options?.expectedGeneration);
 			// Non-interrupting: rides the same step-boundary aside poll as
 			// sendCustomMessage's streaming aside branch — not an agent-core queue
 			// entry, so no drain-retry latch and no idle-queue drain scheduling.
@@ -11384,7 +11382,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
-		this.#assertTranscriptGeneration(options?.expectedGeneration);
+		this.#identity.check(options?.expectedGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		// Keyword notices and their user message must enter the queue in one synchronous phase.
 		if (deliverAs === "followUp") {
@@ -12929,10 +12927,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				} else {
 					await this.sessionManager.flush();
 				}
-				await this.sessionManager.newSession({
-					...options,
-					additionalDirectories: cfgWorkspaceAdditionalDirectories.get(this.settings),
-				});
+				const restoreIdentity = this.#identity.replace();
+				try {
+					await this.sessionManager.newSession({
+						...options,
+						additionalDirectories: cfgWorkspaceAdditionalDirectories.get(this.settings),
+					});
+				} catch (error) {
+					restoreIdentity();
+					throw error;
+				}
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -12971,7 +12975,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// outgoing session also drops its record instead of landing in this new one.
 			this.#irc.clearPending();
 			this.#sessionGeneration++;
-			this.#transcriptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
@@ -13094,17 +13097,22 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			// Fork the session (creates new session file with same entries)
 			let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
+			let restoreIdentity: (() => void) | undefined;
 			try {
 				// No file means fork() is a no-op. Otherwise invalidate admitted
 				// prompt setup before the asynchronous identity rewrite begins.
-				if (previousSessionFile) this.#promptGeneration++;
-				this.#transcriptGeneration++;
+				if (previousSessionFile) {
+					this.#promptGeneration++;
+					restoreIdentity = this.#identity.replace();
+				}
 				forkResult = await this.sessionManager.fork();
 			} catch (error) {
+				restoreIdentity?.();
 				this.#bash.finishSessionTransition(bashTransition, false);
 				throw error;
 			}
 			if (!forkResult) {
+				restoreIdentity?.();
 				this.#bash.finishSessionTransition(bashTransition, false);
 				return false;
 			}
@@ -14726,8 +14734,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// record on success but stays valid if the switch is rolled back to this same session.
 		const previousIrcPending = this.#irc.clearPending();
 		const previousSessionGeneration = this.#sessionGeneration++;
-		// Every switch, a reload of the same file included; a rolled-back one too (callers bound to it re-bind).
-		this.#transcriptGeneration++;
+		let restoreIdentity: (() => void) | undefined;
 		const generationSettled = Promise.withResolvers<void>();
 		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
 		this.#sessionGenerationSettled = generationSettled.promise;
@@ -14748,6 +14755,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The file may be reloaded at the same path with a different latest contract (or the
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
+			// Every switch, a reload of the same file included; a rolled-back one restores the identity.
+			restoreIdentity = this.#identity.replace();
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.#bash.markSessionTransition(bashTransition);
 			const newCwd = this.sessionManager.getCwd();
@@ -14981,6 +14990,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			);
 			this.#irc.restorePending(previousIrcPending);
 			this.#sessionGeneration = previousSessionGeneration;
+			restoreIdentity?.();
 			generationSettled.resolve();
 			this.#sessionGenerationSettled = previousSessionGenerationSettled;
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
@@ -15175,14 +15185,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// A prompt admitted during the drain awaits above belongs to the history
 				// being replaced; the generation bump drops its pending setup.
 				this.#promptGeneration++;
-				this.#transcriptGeneration++;
-				if (!leafId) {
-					const title = this.sessionManager.getSessionName();
-					const titleSource = this.sessionManager.titleSource;
-					await this.sessionManager.newSession({ parentSession: previousSessionFile });
-					if (title) await this.sessionManager.setSessionName(title, titleSource);
-				} else {
-					this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
+				const restoreIdentity = this.#identity.replace();
+				try {
+					if (!leafId) {
+						const title = this.sessionManager.getSessionName();
+						const titleSource = this.sessionManager.titleSource;
+						await this.sessionManager.newSession({ parentSession: previousSessionFile });
+						if (title) await this.sessionManager.setSessionName(title, titleSource);
+					} else {
+						this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
+					}
+				} catch (error) {
+					restoreIdentity();
+					throw error;
 				}
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
@@ -15311,6 +15326,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// after the idle check. It still belongs to the pre-branch context.
 				this.#promptGeneration++;
 				this.sessionManager.createBranchedSession(leafId);
+				this.#identity.replace();
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
@@ -15571,6 +15587,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// All cancellation/no-op exits are behind us. Invalidate prompt setup
 		// admitted on the abandoned branch before committing any tree changes.
 		this.#promptGeneration++;
+		this.#identity.replace();
 
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;

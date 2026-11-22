@@ -65,6 +65,12 @@ import type {
 	WorkerView,
 } from "./worker-scope";
 
+/** A first-turn seed: built inside the turn; `stillWanted` is checked again where the turn dispatches. */
+export interface VibeSeed {
+	build(): Promise<string>;
+	stillWanted(): boolean;
+}
+
 /** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
 export type { WorkerChange, WorkerSummary } from "./worker-scope";
 
@@ -879,11 +885,12 @@ export class VibeSessionRegistry {
 
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
-	 * `seed` is started inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn.
+	 * `seed` is built inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn,
+	 * and a seed no longer wanted when the turn would dispatch cancels it.
 	 */
 	async spawn(
 		session: ToolSession,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: () => Promise<string> },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: VibeSeed },
 	): Promise<VibeSpawnOutcome> {
 		const scope = this.ownerScope(session);
 		return this.#withTerminationLock(scope, () => this.#spawnLocked(session, scope, args));
@@ -892,7 +899,7 @@ export class VibeSessionRegistry {
 	async #spawnLocked(
 		session: ToolSession,
 		scope: VibeOwnerScope,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: () => Promise<string> },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: VibeSeed },
 	): Promise<VibeSpawnOutcome> {
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
@@ -1581,7 +1588,7 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManagerApi,
 		record: VibeRecord,
 		message: string,
-		options: { first: boolean; batch?: readonly QueuedMessage[]; seed?: () => Promise<string> },
+		options: { first: boolean; batch?: readonly QueuedMessage[]; seed?: VibeSeed },
 	): string {
 		const turnIndex = record.turnCount + 1;
 		const starters = (options.batch ?? []).filter(entry => entry.from !== undefined && !entry.note);
@@ -1621,7 +1628,7 @@ export class VibeSessionRegistry {
 			async ({ jobId: ownJobId, signal }) => {
 				try {
 					// Started here, inside the failure boundary: a seed that fails settles the worker like a failed turn.
-					const seed = await options.seed?.();
+					const seed = await options.seed?.build();
 					record.state = "running";
 					record.turnCount = turnIndex;
 					record.lastActivityAt = Date.now();
@@ -1641,17 +1648,21 @@ export class VibeSessionRegistry {
 					const topicBoard = this.policy.boardFor?.(
 						this.describe(session).filter(topic => topic.id !== record.id),
 					);
-					const result = options.first
-						? await runSubprocess({
-								...(await this.#buildSpawnOptions(
-									session,
-									record,
-									seed ? `${seed}\n\n${message}` : message,
-									signal,
-									onProgress,
-								)),
-								topicBoard,
-							})
+					const spawnOptions = options.first
+						? await this.#buildSpawnOptions(
+								session,
+								record,
+								seed ? `${seed}\n\n${message}` : message,
+								signal,
+								onProgress,
+							)
+						: undefined;
+					// At dispatch: a seed whose source is gone cancels the first turn before anything runs.
+					if (options.seed && !options.seed.stillWanted()) {
+						throw new ToolError(`Vibe session "${record.id}" was cancelled: its seed's source was replaced.`);
+					}
+					const result = spawnOptions
+						? await runSubprocess({ ...spawnOptions, topicBoard })
 						: await runSubagentFollowUpTurn({
 								id: record.id,
 								agent: record.agent,

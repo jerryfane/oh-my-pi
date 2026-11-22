@@ -26,6 +26,7 @@ import { sessionInbox, type TopicsInbox } from "./inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "./seed";
 import { cfgTopicsEnabled } from "./settings";
 import {
+	type FoldedSuggestion,
 	foldSuggestions,
 	formatMessageIndex,
 	newSuggestionId,
@@ -175,6 +176,14 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			box.entries(),
 			unsaved.filter(entry => entry.bindingKey === binding.generation).map(entry => entry.suggestion),
 		);
+	/** Whether all of `suggestion`'s messages are still eligible: on the current branch, after the latest `/clear`. */
+	const seedable = ({ box }: Admission, suggestion: TopicSuggestion): boolean => {
+		const eligible = new Set(box.branch().map(entry => entry.id));
+		return suggestion.messageIds.every(id => eligible.has(id));
+	};
+	/** Whether `suggestion` is offered for acceptance: open, not being accepted, and still seedable. */
+	const offered = (admission: Admission, suggestion: FoldedSuggestion): boolean =>
+		suggestion.state === "open" && !acceptingHere(admission, suggestion.id) && seedable(admission, suggestion);
 	/** Whether `suggestionId` is being accepted in the bound transcript. */
 	const acceptingHere = ({ binding }: Admission, suggestionId: string): boolean =>
 		accepting.get(suggestionId)?.bindingKey === binding.generation;
@@ -217,14 +226,20 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			title,
 			...(seed
 				? {
-						seed: () => {
-							if (!seed.binding.isCurrent) throw new InboxChangedError();
-							return buildTopicSeed({
-								entries: seed.entries,
-								messageIds: seed.messageIds,
-								reason: seed.reason,
-								summarize: transcript => summarize(transcript, seed.binding),
-							});
+						seed: {
+							// Checked before it is built and again once built: a replaced transcript cancels the topic.
+							build: async () => {
+								if (!seed.binding.isCurrent) throw new InboxChangedError();
+								const text = await buildTopicSeed({
+									entries: seed.entries,
+									messageIds: seed.messageIds,
+									reason: seed.reason,
+									summarize: transcript => summarize(transcript, seed.binding),
+								});
+								if (!seed.binding.isCurrent) throw new InboxChangedError();
+								return text;
+							},
+							stillWanted: () => seed.binding.isCurrent,
 						},
 					}
 				: {}),
@@ -264,7 +279,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 					message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
 					seed: {
 						binding,
-						entries: [...box.entries()],
+						entries: [...box.branch()],
 						messageIds: suggestion.messageIds,
 						reason: suggestion.reason,
 					},
@@ -303,7 +318,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				title,
 				message,
 				name,
-				seed: { binding, entries: [...box.entries()], messageIds: seedMessageIds },
+				seed: { binding, entries: [...box.branch()], messageIds: seedMessageIds },
 			});
 			noteContinued(admission, {
 				topicId: id,
@@ -328,18 +343,14 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		suggestions() {
 			if (!inbox) return [];
 			const admission = admit();
-			return [...folded(admission).values()]
-				.filter(suggestion => suggestion.state === "open" && !acceptingHere(admission, suggestion.id))
-				.map(suggestionSummary);
+			return [...folded(admission).values()].filter(suggestion => offered(admission, suggestion)).map(suggestionSummary);
 		},
 		suggestionBoard() {
 			if (!inbox) return { open: [], dismissed: [] };
 			const admission = admit();
 			const all = [...folded(admission).values()];
 			return {
-				open: all
-					.filter(suggestion => suggestion.state === "open" && !acceptingHere(admission, suggestion.id))
-					.map(suggestionSummary),
+				open: all.filter(suggestion => offered(admission, suggestion)).map(suggestionSummary),
 				dismissed: all
 					.filter(suggestion => suggestion.state === "dismissed")
 					.sort((a, b) => (b.stateOrder ?? 0) - (a.stateOrder ?? 0))
@@ -398,6 +409,12 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
 			if (suggestion.state === "accepted" && suggestion.topicId) {
 				return { topicId: suggestion.topicId, alreadyAccepted: true };
+			}
+			if (!seedable(admission, suggestion)) {
+				throw new TopicsError(
+					"suggestion_not_found",
+					`Suggestion ${suggestionId} names messages this conversation no longer has (cleared).`,
+				);
 			}
 			const operation = acceptOnce(admission, suggestion, by);
 			accepting.set(suggestionId, { bindingKey: admission.binding.generation, promise: operation });

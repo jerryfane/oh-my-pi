@@ -12,6 +12,7 @@
  *   one is queued or running is refused with `organise_running`.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Context, Message } from "@oh-my-pi/pi-ai";
@@ -73,6 +74,8 @@ interface Inbox {
 	/** Messages of every model request. */
 	requests: Message[][];
 	host: TopicsHost;
+	/** The Inbox's background jobs (topic turns). */
+	jobs: AsyncJobManager;
 }
 
 /**
@@ -137,7 +140,7 @@ async function openInbox(
 	sessions.push(session);
 	const host = await session.getTopicsHost();
 	if (!host) throw new Error("Expected a topics host");
-	return { session, manager, requests, host };
+	return { session, manager, requests, host, jobs };
 }
 
 async function codeOf(run: () => unknown): Promise<string | undefined> {
@@ -307,6 +310,187 @@ describe("Inbox notes", () => {
 			.getEntries()
 			.some(entry => entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE);
 		expect(inbox.host.suggestions().some(open => open.id === suggestion.id)).toBe(inJournal);
+	});
+});
+
+describe("Transcript identity across every replacement (#9 review)", () => {
+	function conversation(manager: SessionManager): void {
+		manager.appendMessage({ role: "user", content: "OLD-INBOX-EXCERPT first question", timestamp: 1 });
+		manager.appendMessage(createAssistantMessage("first answer"));
+		manager.appendMessage({ role: "user", content: "second question", timestamp: 2 });
+		manager.appendMessage(createAssistantMessage("second answer"));
+	}
+
+	async function persistedInbox(respond: Parameters<typeof openInbox>[0] = () => ({ content: ["ok"] })) {
+		const inbox = await openInbox(respond, conversation, true);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		return inbox;
+	}
+
+	function stateRows(manager: SessionManager, customType: string): unknown[] {
+		return manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === customType);
+	}
+
+	it("holds bound writes through a switch and keeps them valid when it rolls back; a binding taken mid-switch matches nothing", async () => {
+		const inbox = await persistedInbox();
+		const box = sessionInbox(inbox.session);
+		const original = inbox.manager.getSessionFile()!;
+		const early = box.bind();
+		// A session recorded in another directory: the switch asks to change cwd, and that is refused.
+		const elsewhere = path.join(path.dirname(original), "elsewhere");
+		fs.mkdirSync(elsewhere, { recursive: true });
+		const target = SessionManager.create(elsewhere, path.dirname(original));
+		target.appendMessage({ role: "user", content: "target", timestamp: 3 });
+		await target.ensureOnDisk();
+		await target.flush();
+		const asked = Promise.withResolvers<void>();
+		const decide = Promise.withResolvers<boolean>();
+		const switched = inbox.session.switchSession(target.getSessionFile()!, {
+			onCwdChange: async () => {
+				asked.resolve();
+				return decide.promise;
+			},
+		});
+		await asked.promise;
+		expect(inbox.session.isSessionTransitioning).toBe(true);
+		const late = box.bind();
+		const earlyWrite = box.appendState(early, "probe-early", {});
+		const lateWrite = box.appendState(late, "probe-late", {}).then(
+			() => "written",
+			(error: Error) => error,
+		);
+		decide.resolve(false);
+		await switched.catch(() => false);
+
+		await earlyWrite;
+		expect(inbox.manager.getSessionFile()).toBe(original);
+		expect(stateRows(inbox.manager, "probe-early")).toHaveLength(1);
+		expect(await lateWrite).toBeInstanceOf(InboxChangedError);
+		expect(stateRows(inbox.manager, "probe-late")).toEqual([]);
+	});
+
+	it("refuses an Organise held in deferred loading across a /btw promotion", async () => {
+		const inbox = await persistedInbox(context => ({
+			content: [lastText(context).includes(ORGANISE_MARK) ? "organised" : "ok"],
+		}));
+		const gate = Promise.withResolvers<void>();
+		let pending = true;
+		Object.defineProperty(inbox.session, "hasPendingDeferredExtensions", { configurable: true, get: () => pending });
+		vi.spyOn(inbox.session, "loadDeferredExtensions").mockImplementation(async () => {
+			await gate.promise;
+			pending = false;
+		});
+		const organised = inbox.host.organise({ by: "owner" }).then(
+			result => result,
+			(error: Error) => error,
+		);
+		await Bun.sleep(0);
+		const promoted = await inbox.session.branchFromBtw(
+			"side question",
+			createAssistantMessage("side answer"),
+			inbox.manager.getLeafId()!,
+			inbox.manager.getSessionId(),
+		);
+		expect(promoted.cancelled).toBe(false);
+		gate.resolve();
+		expect(await organised).toBeInstanceOf(InboxChangedError);
+		await inbox.session.waitForIdle();
+		expect(inbox.requests.some(request => request.map(textOf).join("\n").includes(ORGANISE_MARK))).toBe(false);
+	});
+
+	it("refuses an atomic write pending across /tree navigation: nothing reaches the file", async () => {
+		const inbox = await persistedInbox();
+		const box = sessionInbox(inbox.session);
+		const file = inbox.manager.getSessionFile()!;
+		const firstAnswer = inbox.manager
+			.getEntries()
+			.find(entry => entry.type === "message" && textOf(entry.message as Message) === "first answer")!;
+		const reached = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const ensureOnDisk = inbox.manager.ensureOnDisk.bind(inbox.manager);
+		vi.spyOn(inbox.manager, "ensureOnDisk").mockImplementationOnce(async () => {
+			reached.resolve();
+			await release.promise;
+			await ensureOnDisk();
+		});
+		const write = box.appendState(box.bind(), "probe-tree", {}).then(
+			() => "written",
+			(error: Error) => error,
+		);
+		await reached.promise;
+		const navigated = await inbox.session.navigateTree(firstAnswer.id);
+		expect(navigated.cancelled).toBe(false);
+		release.resolve();
+		expect(await write).toBeInstanceOf(InboxChangedError);
+		await inbox.manager.flush();
+		expect(await Bun.file(file).text()).not.toContain("probe-tree");
+	});
+
+	it("keeps the transcript identity on a fork that does nothing (no session file)", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }), conversation);
+		const generation = inbox.session.transcriptGeneration;
+		expect(await inbox.session.fork()).toBe(false);
+		expect(inbox.session.transcriptGeneration).toBe(generation);
+	});
+
+	it("no longer offers or accepts a suggestion whose messages /clear removed", async () => {
+		let ask = "";
+		const inbox = await openInbox(
+			() => ({ content: ["ok"] }),
+			manager => {
+				ask = manager.appendMessage({ role: "user", content: "Plan the offsite", timestamp: 1 });
+				manager.appendMessage(createAssistantMessage("sure"));
+			},
+		);
+		const suggested = Promise.withResolvers<void>();
+		inbox.host.onChange(change => {
+			if (change.reason === "suggested") suggested.resolve();
+		});
+		const { id } = inbox.host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
+		await suggested.promise;
+		expect(inbox.host.suggestions().map(open => open.id)).toEqual([id]);
+
+		expect(await inbox.session.resetSessionContext()).toBeDefined();
+		expect(inbox.host.suggestions()).toEqual([]);
+		expect(inbox.host.suggestionBoard().open).toEqual([]);
+		expect(await codeOf(() => inbox.host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe(
+			"suggestion_not_found",
+		);
+	});
+
+	it("cancels a seeded topic whose summary settles after a same-file reload: no first turn, no verbatim fallback", async () => {
+		const summaryAsked = Promise.withResolvers<void>();
+		const summary = Promise.withResolvers<string | undefined>();
+		const summarize = vi.fn<SeedSummarizer>(() => {
+			summaryAsked.resolve();
+			return summary.promise;
+		});
+		const ids: string[] = [];
+		const inbox = await openInbox(
+			() => ({ content: ["ok"] }),
+			manager => {
+				for (let n = 1; n <= 32; n++) {
+					ids.push(
+						n % 2
+							? manager.appendMessage({ role: "user", content: `SEED-TEXT ${n}`, timestamp: n })
+							: manager.appendMessage(createAssistantMessage(`SEED-TEXT ${n}`)),
+					);
+				}
+			},
+			true,
+			summarize,
+		);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const firstTurn = vi.spyOn(executorModule, "runSubprocess");
+		const { id } = await inbox.host.create({ title: "Long", message: "Go on.", seedMessageIds: ids });
+		await summaryAsked.promise;
+		expect(await inbox.session.switchSession(inbox.manager.getSessionFile()!)).toBe(true);
+		summary.resolve("LATE SUMMARY");
+		await inbox.jobs.getJob(`${id}-t1`)?.promise.catch(() => {});
+
+		expect(firstTurn).not.toHaveBeenCalled();
 	});
 });
 
