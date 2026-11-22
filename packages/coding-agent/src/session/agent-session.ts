@@ -10222,10 +10222,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
-			// A bound batch can be refused: it is admitted with its notices previewed, whose deltas are consumed only then.
-			const notices = bound && this.#tools.previewNotices(message, baseXdevCatalogDelivered, previewXdevMountNotice);
-			if (notices && !bound?.admit(messages.toSpliced(xdevMountNoticeIndex, 0, ...notices.all))) return false;
-			notices?.commit();
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,
@@ -10256,7 +10252,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					...(skillNotice ? [skillNotice] : []),
 				);
 			}
-			if (notices) messages.splice(xdevMountNoticeIndex, 0, ...notices.delivered); // Their takes above built none.
+			// The batch is final and synchronous to dispatch: a replaced transcript drops a bound prompt; else admitted.
+			if (bound && !bound.admit(messages)) return false;
+			this.#tools.deliverNotices(messages); // Only a batch that is sent marks its notices delivered.
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

@@ -120,10 +120,11 @@ interface Launch {
  * A setup step held until `release`: the SDK session's creation, the credential lookup of the child's first
  * prompt (after `session_init` and extension start, before the prompt's last check), the auto-thinking judge's
  * request (prompt setup, before that check; with `autoThinking`), the Inbox's credential lookup for the topic's
- * start model (`preflight`: Accept's seed check, before anything is spawned), or the Inbox journal's first write
- * (`persist`: the topic's spawn record; the Inbox is then saved to a file).
+ * start model (`preflight`: Accept's seed check, before anything is spawned), or the Inbox journal's preparation
+ * for the topic's spawn record (`persist`, before the record is appended) or its flush (`flush`, after). With
+ * those two, the Inbox is saved to a file.
  */
-type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist";
+type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist" | "flush";
 
 /**
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
@@ -132,7 +133,7 @@ type Gate = "creation" | "credentials" | "judge" | "preflight" | "persist";
  * Inbox's and the child's) has a `contextWindow`-token window (default 200,000); with `firstResponse`, it answers
  * its first request so (a refusal, a dropped stream). The Inbox's system prompt is `inboxPrompt`. With `unauthenticatedStart`,
  * topics are configured onto a model of that window whose provider has no credentials, and the parent's active
- * model is the main one (the executor falls back to it).
+ * model is the main one (the executor falls back to it). With `writeError`, the held journal write fails with it.
  */
 async function openLaunch(
 	gate: Gate = "creation",
@@ -143,6 +144,7 @@ async function openLaunch(
 		firstResponse,
 		inboxPrompt = "Inbox",
 		unauthenticatedStart,
+		writeError,
 	}: {
 		excerptText?: string;
 		autoThinking?: boolean;
@@ -150,6 +152,7 @@ async function openLaunch(
 		firstResponse?: MockResponse;
 		inboxPrompt?: string;
 		unauthenticatedStart?: number;
+		writeError?: Error;
 	} = {},
 ): Promise<Launch> {
 	const cwd = path.join(root, "home", "work");
@@ -215,7 +218,9 @@ async function openLaunch(
 	});
 
 	const manager =
-		gate === "persist" ? SessionManager.create(cwd, path.join(root, "sessions")) : SessionManager.inMemory(cwd);
+		gate === "persist" || gate === "flush"
+			? SessionManager.create(cwd, path.join(root, "sessions"))
+			: SessionManager.inMemory(cwd);
 	manager.appendMessage({ role: "user", content: "first question", timestamp: 1 });
 	const firstAnswer = manager.appendMessage(createAssistantMessage("first answer"));
 	const excerpt = manager.appendMessage({ role: "user", content: excerptText, timestamp: 2 });
@@ -288,7 +293,7 @@ async function openLaunch(
 		}
 		return getApiKey(...args);
 	});
-	if (gate === "persist") {
+	if (gate === "persist" || gate === "flush") {
 		// Only a write the topic's spawn makes (its spawn record), not the suggestion's own note.
 		const registry = topicsRegistry();
 		const spawn = registry.spawn.bind(registry);
@@ -301,16 +306,27 @@ async function openLaunch(
 				spawning = false;
 			}
 		});
+		let writeHeld = false;
+		const hold = async () => {
+			if (!spawning || writeHeld) return;
+			writeHeld = true;
+			gated.resolve();
+			await held.promise;
+			if (writeError) throw writeError;
+		};
 		const ensureOnDisk = manager.ensureOnDisk.bind(manager);
-		let persistHeld = false;
-		vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
-			if (spawning && !persistHeld) {
-				persistHeld = true;
-				gated.resolve();
-				await held.promise;
-			}
-			await ensureOnDisk();
-		});
+		const flush = manager.flush.bind(manager);
+		if (gate === "persist") {
+			vi.spyOn(manager, "ensureOnDisk").mockImplementation(async () => {
+				await hold();
+				await ensureOnDisk();
+			});
+		} else {
+			vi.spyOn(manager, "flush").mockImplementation(async () => {
+				await hold();
+				await flush();
+			});
+		}
 	}
 	return {
 		inbox,
@@ -417,23 +433,86 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 		expect(launch.manager.getBranch().some(entry => entry.id === launch.excerpt)).toBe(false);
 	}
 
-	it("/tree while the spawn record is written: nothing of the topic reaches the branch or the file; Accept is refused (#22 review)", async () => {
-		const launch = await openLaunch("persist");
+	/** The actions of the Inbox's vibe lifecycle rows: on its current branch, in its whole journal, and in its file. */
+	async function lifecycle(launch: Launch): Promise<{ branch: string[]; journal: string[]; file: string[] }> {
+		const actions = (entries: readonly unknown[]) =>
+			entries.flatMap(entry => {
+				const row = entry as { type?: string; customType?: string; data?: { action?: string } };
+				return row.type === "custom" && row.customType === VIBE_LIFECYCLE_CUSTOM_TYPE
+					? [row.data?.action ?? ""]
+					: [];
+			});
+		await launch.manager.flush().catch(() => {});
+		const file = launch.manager.getSessionFile();
+		if (!file) throw new Error("expected the Inbox's session file");
+		const lines = fs.existsSync(file) ? fs.readFileSync(file, "utf8").split("\n").filter(Boolean) : [];
+		return {
+			branch: actions(launch.manager.getBranch()),
+			journal: actions(launch.manager.getEntries()),
+			file: actions(lines.map(line => JSON.parse(line) as unknown)),
+		};
+	}
+
+	/** Accept, `/tree` while the spawn's journal write is held, then release it: Accept is refused. */
+	async function acceptAcrossRewind(launch: Launch): Promise<TopicChange[]> {
 		const { changes, code } = acceptCode(launch);
 		await launch.gated;
 		await rewind(launch);
 		launch.release();
-
 		expect(await code).toBe("suggestion_not_found");
 		await Bun.sleep(5);
 		expect(launch.launched).toEqual([]);
 		expect(launch.requests).toEqual([]);
 		expect(changes.filter(change => change.reason === "spawned")).toEqual([]);
-		expect(rows(launch.manager, VIBE_LIFECYCLE_CUSTOM_TYPE)).toEqual([]);
-		await launch.manager.flush();
-		const file = launch.manager.getSessionFile();
-		if (!file) throw new Error("expected the Inbox's session file");
-		expect(fs.readFileSync(file, "utf8")).not.toContain(VIBE_LIFECYCLE_CUSTOM_TYPE);
+		return changes;
+	}
+
+	const EIO = Object.assign(new Error("EIO: i/o error, write"), { code: "EIO" });
+
+	it("/tree before the spawn record is appended: nothing of the topic is written anywhere (#22 review)", async () => {
+		const launch = await openLaunch("persist");
+		await acceptAcrossRewind(launch);
+		expect(await lifecycle(launch)).toEqual({ branch: [], journal: [], file: [] });
+	});
+
+	it("/tree, then the journal's preparation fails (EIO): still refused as gone, no tombstone anywhere (#23 review)", async () => {
+		const launch = await openLaunch("persist", { writeError: EIO });
+		await acceptAcrossRewind(launch);
+		expect(await lifecycle(launch)).toEqual({ branch: [], journal: [], file: [] });
+	});
+
+	it("/tree after the spawn record is appended, its flush succeeding: the record stays on the old branch; nothing is published or cleaned up in the new one (#23 review)", async () => {
+		const launch = await openLaunch("flush");
+		await acceptAcrossRewind(launch);
+		expect(await lifecycle(launch)).toEqual({ branch: [], journal: ["spawn"], file: ["spawn"] });
+		expect(launch.host.list().map(topic => topic.title)).toEqual([]);
+	});
+
+	it("/tree after the spawn record is appended, its flush failing: refused as gone; no cleanup in the new branch (#23 review)", async () => {
+		const launch = await openLaunch("flush", { writeError: EIO });
+		await acceptAcrossRewind(launch);
+		const { branch, journal } = await lifecycle(launch);
+		expect({ branch, journal }).toEqual({ branch: [], journal: ["spawn"] });
+		expect(launch.host.list().map(topic => topic.title)).toEqual([]);
+	});
+
+	it("a topic whose spawn record is not yet written is not listed and cannot be closed (#23 review)", async () => {
+		const launch = await openLaunch("persist");
+		const { changes, code } = acceptCode(launch);
+		await launch.gated;
+		await rewind(launch);
+		expect(launch.host.list().map(topic => topic.title)).toEqual([]);
+		const closing = await launch.host.close("Diokan").then(
+			() => "closed",
+			(error: unknown) => (error instanceof Error ? error.message : String(error)),
+		);
+		expect(closing).toContain("Diokan");
+		expect(closing).not.toBe("closed");
+		launch.release();
+
+		expect(await code).toBe("suggestion_not_found");
+		expect(changes.filter(change => change.reason === "spawned" || change.reason === "closed")).toEqual([]);
+		expect(await lifecycle(launch)).toEqual({ branch: [], journal: [], file: [] });
 	});
 
 	it("/tree while Accept looks up the topic's model: refused as gone from this Inbox, not as too large (#22 review)", async () => {
