@@ -6,6 +6,7 @@
  */
 import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
@@ -449,29 +450,47 @@ describe("topics control endpoint for extensions", () => {
 	});
 });
 
+const SUN_PATH_BYTES = process.platform === "darwin" ? 104 : 108;
+/** The runner's writable temp root (TMPDIR), resolved the way production resolves a runtime dir. */
+const fixtureBase = fs.realpathSync(os.tmpdir());
+/** Whether the deepest short-path fixture's socket path fits `sun_path`; the short-path cases need it. */
+const shortFixtureFits =
+	Buffer.byteLength(path.join(fixtureBase, "omp-tc-XXXXXX", "rt", "omp-topics-XXXXXX", "control.sock")) + 1 <=
+	SUN_PATH_BYTES;
+if (!shortFixtureFits && process.getuid !== undefined) {
+	console.warn(
+		`Skipping the short socket path cases: socket paths under TMPDIR ${fixtureBase} exceed the ${SUN_PATH_BYTES}-byte sun_path. Set TMPDIR to a shorter directory to run them.`,
+	);
+}
+const itShort = it.skipIf(!shortFixtureFits);
+
 // Unix only: Windows endpoints have no socket path limit and no uid.
 describe.skipIf(process.getuid === undefined)("topics control socket path", () => {
-	let root: string;
+	let root: string | undefined;
 	let stop: (() => void) | undefined;
 
 	beforeEach(() => {
-		// A private root, not TMPDIR: every socket path under it fits even macOS's 104-byte sun_path.
-		root = fs.mkdtempSync("/tmp/omp-tc-");
+		// Unset first: a failed mkdtemp must not make teardown remove the previous test's (or no) root.
+		root = undefined;
+		root = fs.mkdtempSync(path.join(fixtureBase, "omp-tc-"));
 	});
 
 	afterEach(() => {
 		stop?.();
 		stop = undefined;
-		fs.rmSync(root, { recursive: true, force: true });
+		if (root) fs.rmSync(root, { recursive: true, force: true });
 	});
 
-	async function launch(runtimeDir: string): Promise<{ stop?: () => void; notices: string[] }> {
+	async function launch(
+		runtimeDir: string,
+		notify?: (message: string) => void,
+	): Promise<{ stop?: () => void; notices: string[] }> {
 		const notices: string[] = [];
 		const stopped = await offerTopicsControl(
 			new EventBus(),
 			async () => fakeHost([]),
 			runtimeDir,
-			message => notices.push(message),
+			notify ?? (message => notices.push(message)),
 		);
 		return { stop: stopped, notices };
 	}
@@ -485,32 +504,43 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 	}
 
 	it("refuses a runtime dir whose socket path cannot fit: nothing created, one notice with the size", async () => {
-		const runtime = path.join(root, "x".repeat(120));
+		const runtime = path.join(root!, "x".repeat(120));
 		fs.mkdirSync(runtime, { mode: 0o700 });
 		const result = await launch(runtime);
 		expect(result.stop).toBeUndefined();
 		expect(currentTopicsControl()).toBeUndefined();
 		expect(fs.readdirSync(runtime)).toEqual([]);
-		const limit = process.platform === "darwin" ? 104 : 108;
 		const bytes = Buffer.byteLength(path.join(runtime, "omp-topics-XXXXXX", "control.sock")) + 1;
 		expect(result.notices).toEqual([
-			`Topics host control unavailable: socket path would be ${bytes} bytes (limit ${limit}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`,
+			`Topics host control unavailable: socket path would be ${bytes} bytes (limit ${SUN_PATH_BYTES}). Set XDG_RUNTIME_DIR or TMPDIR to a shorter directory.`,
 		]);
 	});
 
-	it("keeps a short runtime dir as is and answers a hello there", async () => {
-		const result = await launch(root);
+	it("delivers the notice once and still resolves when the notice sink throws", async () => {
+		const runtime = path.join(root!, "x".repeat(120));
+		fs.mkdirSync(runtime, { mode: 0o700 });
+		let calls = 0;
+		const result = await launch(runtime, () => {
+			calls++;
+			throw new Error("sink failed");
+		});
+		expect(result.stop).toBeUndefined();
+		expect(calls).toBe(1);
+	});
+
+	itShort("keeps a short runtime dir as is and answers a hello there", async () => {
+		const result = await launch(root!);
 		stop = result.stop;
 		expect(result.notices).toEqual([]);
 		const endpoint = currentTopicsControl()!;
-		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root);
+		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root!);
 		expect(path.basename(endpoint.socketPath)).toBe("control.sock");
 		await expectHelloAnswered(endpoint);
 	});
 
-	it("publishes an absolute path for a relative runtime dir and removes it on stop from any cwd", async () => {
+	itShort("publishes an absolute path for a relative runtime dir and removes it on stop from any cwd", async () => {
 		const cwd = process.cwd();
-		process.chdir(root);
+		process.chdir(root!);
 		let result: { stop?: () => void; notices: string[] };
 		try {
 			fs.mkdirSync("rt", { mode: 0o700 });
@@ -520,21 +550,42 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 		}
 		expect(result.notices).toEqual([]);
 		const endpoint = currentTopicsControl()!;
-		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(path.join(fs.realpathSync(root), "rt"));
+		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(path.join(root!, "rt"));
 		await expectHelloAnswered(endpoint);
 		result.stop?.();
 		expect(currentTopicsControl()).toBeUndefined();
-		expect(fs.readdirSync(path.join(root, "rt"))).toEqual([]);
+		expect(fs.readdirSync(path.join(root!, "rt"))).toEqual([]);
 	});
 
-	it("turns a mkdtemp failure into one notice and lets interactive startup continue", async () => {
+	itShort.skipIf(!fs.existsSync("/proc/self/cwd"))(
+		"publishes the host path behind a process-relative alias (/proc/self/cwd) and removes it on stop from any cwd",
+		async () => {
+			const cwd = process.cwd();
+			process.chdir(root!);
+			let result: { stop?: () => void; notices: string[] };
+			try {
+				result = await launch("/proc/self/cwd");
+			} finally {
+				process.chdir(cwd);
+			}
+			expect(result.notices).toEqual([]);
+			const endpoint = currentTopicsControl()!;
+			// Another process (another cwd) must reach the advertised path.
+			expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root!);
+			await expectHelloAnswered(endpoint);
+			result.stop?.();
+			expect(fs.readdirSync(root!)).toEqual([]);
+		},
+	);
+
+	itShort("turns a mkdtemp failure into one notice and lets interactive startup continue", async () => {
 		const mkdtemp = spyOn(fs, "mkdtempSync").mockImplementation(() => {
 			throw Object.assign(new Error("EIO: injected mkdtemp failure"), { code: "EIO" });
 		});
 		const previous = process.env.XDG_RUNTIME_DIR;
-		process.env.XDG_RUNTIME_DIR = root;
+		process.env.XDG_RUNTIME_DIR = root!;
 		try {
-			const result = await launch(root);
+			const result = await launch(root!);
 			expect(result.stop).toBeUndefined();
 			expect(result.notices).toHaveLength(1);
 			expect(result.notices[0]).toStartWith("Topics host control unavailable: EIO: injected mkdtemp failure");
@@ -556,12 +607,12 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 		}
 	});
 
-	it("turns a listen failure into one notice and removes the dir it made", async () => {
+	itShort("turns a listen failure into one notice and removes the dir it made", async () => {
 		const listen = spyOn(Bun, "listen").mockImplementation(() => {
 			throw new Error("injected listen failure");
 		});
 		try {
-			const result = await launch(root);
+			const result = await launch(root!);
 			expect(result.stop).toBeUndefined();
 			expect(currentTopicsControl()).toBeUndefined();
 			expect(result.notices).toHaveLength(1);
@@ -569,6 +620,30 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 		} finally {
 			listen.mockRestore();
 		}
-		expect(fs.readdirSync(root)).toEqual([]);
+		expect(fs.readdirSync(root!)).toEqual([]);
+	});
+
+	itShort("stops a bound listener when setup fails after the bind, then removes its dir", async () => {
+		// The socket's directory entry moves away between bind and chmod: the chmod fails with ENOENT.
+		const moved = path.join(root!, "moved.sock");
+		const chmod = fs.chmodSync;
+		const spy = spyOn(fs, "chmodSync").mockImplementation((target, mode) => {
+			if (String(target).endsWith("control.sock")) fs.renameSync(target, moved);
+			chmod(target, mode);
+		});
+		let result: { stop?: () => void; notices: string[] };
+		try {
+			result = await launch(root!);
+		} finally {
+			spy.mockRestore();
+		}
+		stop = result.stop;
+		expect(result.stop).toBeUndefined();
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(result.notices).toHaveLength(1);
+		expect(result.notices[0]).toContain("ENOENT");
+		// No listener left behind (nothing keeps the process alive): the moved socket refuses connections.
+		await expect(Bun.connect({ unix: moved, socket: { data() {} } })).rejects.toThrow();
+		expect(fs.readdirSync(root!).filter(name => name.startsWith("omp-topics-"))).toEqual([]);
 	});
 });
