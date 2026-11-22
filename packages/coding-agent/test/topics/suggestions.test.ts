@@ -37,8 +37,8 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
-import { InboxBinding } from "@oh-my-pi/pi-coding-agent/topics/binding";
-import type { InboxMessage, TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
+import { InboxBinding, InboxChangedError } from "@oh-my-pi/pi-coding-agent/topics/binding";
+import { afterLatestReset, type InboxMessage, type TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
 	foldSuggestions,
@@ -102,7 +102,7 @@ describe("topic suggestions", () => {
 	let turnPending: boolean;
 	/** The open Inbox session. */
 	let inboxSm: SessionManager;
-	/** Counts the sessions the Inbox adopted, as the real Inbox does: a reopened session is a new transcript. */
+	/** The Inbox's transcript generation: every adopted session, a reopened one included, is a new transcript. */
 	let inboxEpoch: number;
 	/** Awaited by every state write before it saves; a rejection fails the write. */
 	let stateWrite: (() => Promise<void>) | undefined;
@@ -129,41 +129,33 @@ describe("topic suggestions", () => {
 	}
 
 	/**
-	 * The Inbox over `inboxSm` (`sm` unless a test switches sessions): notes are saved at once (an idle Inbox);
-	 * a state write awaits `stateWrite` first and, like the real one, adds nothing when it fails.
+	 * The Inbox over `inboxSm` (`sm` unless a test switches sessions), checking the binding where each effect
+	 * happens as the session does: notes are saved at once (an idle Inbox); a state write awaits `stateWrite`
+	 * first and, like the real one, adds nothing when it fails or another transcript is open by then.
 	 */
 	function inbox(): TopicsInbox {
-		const identity = () => ({
-			sessionId: inboxSm.getSessionId(),
-			sessionFile: inboxSm.getSessionFile(),
-			sessionEpoch: inboxEpoch,
-			transcriptEpoch: 0,
-		});
+		const refuseStale = (binding: InboxBinding) => {
+			if (binding.generation !== inboxEpoch) throw new InboxChangedError();
+		};
 		return {
-			bind: () => new InboxBinding(identity),
-			branch: binding => {
-				binding.assertCurrent();
-				return inboxSm.getBranch();
-			},
-			entries: binding => {
-				binding.assertCurrent();
-				return inboxSm.getEntriesView();
-			},
+			bind: () => new InboxBinding(inboxEpoch, inboxSm.getSessionId(), () => inboxEpoch),
+			branch: () => afterLatestReset(inboxSm.getBranch()),
+			entries: () => inboxSm.getEntriesView(),
 			appendState: async (binding, customType, data, check) => {
-				binding.assertCurrent();
 				await stateWrite?.();
-				binding.assertCurrent();
+				refuseStale(binding);
 				check?.();
 				inboxSm.appendCustomEntry(customType, data);
 			},
 			appendNote: async (binding, { customType, content, details }) => {
-				if (!binding.isCurrent) return false;
+				if (binding.generation !== inboxEpoch) return false;
 				inboxSm.appendCustomMessageEntry(customType, content, true, details, "agent");
 				return true;
 			},
-			queueTurn: async (binding, _customType, render) => {
-				binding.assertCurrent();
-				queuedTurns.push(render());
+			queueTurn: async (binding, customType, render) => {
+				const rendered = render();
+				refuseStale(binding);
+				queuedTurns.push({ customType, ...rendered });
 				turnPending = true;
 				return { queued: false };
 			},
@@ -756,7 +748,8 @@ describe("seed summary model", () => {
 		expect(settings.getModelRole("smol")).toBeUndefined();
 		const session = { settings, modelRegistry: registry } as unknown as ToolSession;
 
-		expect(await smolSeedSummarizer(session)("<message>older</message>")).toBe("CONDENSED");
+		const origin = new InboxBinding(0, "s1", () => 0);
+		expect(await smolSeedSummarizer(session)("<message>older</message>", origin)).toBe("CONDENSED");
 		expect(mock.calls).toHaveLength(1);
 	});
 });
