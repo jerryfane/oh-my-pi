@@ -529,6 +529,7 @@ import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./ses
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
 import { admitBoundPrompt, type InboxEpoch, InboxEpochs, StaleTranscriptError, throwIfStale } from "./inbox-epoch";
+import { withBoundPreamble } from "./inbox-epoch";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -10192,7 +10193,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				maintenanceMessages.splice(xdevMountNoticeIndex, 0, previewXdevMountNotice.notice);
 			}
 			await logger.time("prompt:prePromptCompaction", () =>
-				this.#maintenance.runPrePromptCompactionIfNeeded(maintenanceMessages),
+				this.#maintenance.runPrePromptCompactionIfNeeded(withBoundPreamble(maintenanceMessages, message, options)),
 			);
 			if (this.#promptGeneration !== generation) {
 				return false;
@@ -10225,7 +10226,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt; else admitted.
 			if (options?.transcriptSignal?.aborted) return false;
-			if (options?.transcriptSignal) admitBoundPrompt(messages, message, options);
+			if (options?.transcriptSignal) admitBoundPrompt(message, options);
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,

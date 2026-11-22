@@ -295,7 +295,7 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 			await settled(launch, topicId);
 
 			expect(launch.launched).toHaveLength(1);
-			expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
+			expect(launch.requests).toEqual([]);
 			expect(await childFile(launch, topicId)).not.toContain(EXCERPT);
 			expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
 			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
@@ -314,7 +314,7 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 			await settled(launch, id);
 
 			expect(launch.launched).toHaveLength(1);
-			expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
+			expect(launch.requests).toEqual([]);
 			expect(await childFile(launch, id)).not.toContain(EXCERPT);
 			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
 		});
@@ -363,9 +363,9 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 
 			expect(launch.judgeRequests.length).toBeGreaterThan(0);
 			expect(launch.judgeRequests.filter(request => request.includes(MARKER))).toEqual([]);
-			const main = launch.requests.filter(request => request.includes(MARKER));
-			expect(main.length).toBeGreaterThan(0);
-			const first = main[0]!;
+			// The first main request carries the whole seed once.
+			expect(launch.requests.length).toBeGreaterThan(0);
+			const first = launch.requests[0]!;
 			expect(first.split(MARKER)).toHaveLength(2);
 			// The Inbox text's tags are escaped: the seed's block opens and closes exactly once, around the marker.
 			expect(first.split("<inbox-history>")).toHaveLength(2);
@@ -385,7 +385,7 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 
 			expect(launch.judgeRequests.length).toBeGreaterThan(0);
 			expect(launch.judgeRequests.filter(request => request.includes(MARKER))).toEqual([]);
-			expect(launch.requests.filter(request => request.includes(MARKER))).toEqual([]);
+			expect(launch.requests).toEqual([]);
 			expect(await childFile(launch, id)).not.toContain(MARKER);
 			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
 		});
