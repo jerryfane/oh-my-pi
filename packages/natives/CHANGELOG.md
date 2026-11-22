@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added `ipcSetRelocationRoot(root | null)` so tests relocate over-long Unix endpoints under a private root instead of the shared `/tmp/omp-<euid>`.
+
 ### Fixed
 
 - Fixed `IpcServer.listen` accepting a `/tmp/omp-<euid>` relocation directory left without owner access by a restrictive umask (every bind then failed); it is now repaired to mode 0700.

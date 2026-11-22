@@ -2936,6 +2936,14 @@ export interface IpcListenOptions {
   maxFrameBytes?: number
 }
 
+/**
+ * Tests only: relocate over-long Unix endpoints to `<root>/omp-<euid>`
+ * instead of `/tmp/omp-<euid>`, process-wide, so a suite never touches the
+ * relocation directory other processes share; `null` restores `/tmp`. Keep
+ * `root` short: relocated paths must still fit `sun_path`. No-op on Windows.
+ */
+export declare function ipcSetRelocationRoot(root?: string | undefined | null): void
+
 /** Kind enum of the backend selected by default for this build target. */
 export declare function isoBackend(): IsoBackendKind
 

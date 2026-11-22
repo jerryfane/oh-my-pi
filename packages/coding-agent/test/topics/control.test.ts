@@ -4,9 +4,10 @@
  * Extensions read the endpoint from omp's own state, never from the event
  * bus, which only says that it changed; startup clears what crashed runs left.
  */
-import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { ipcSetRelocationRoot } from "@oh-my-pi/pi-natives";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { ExtensionRuntime, loadExtensionFromFactory } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import type { RpcSubagentMessagesResult } from "@oh-my-pi/pi-coding-agent/modes/rpc/rpc-types";
@@ -26,6 +27,22 @@ import { TopicsError, type TopicsErrorCode } from "@oh-my-pi/pi-coding-agent/top
 import type { TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { WorkerChange } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
+
+/**
+ * Over-long endpoints relocate under this private root for the whole file, never into the shared
+ * `/tmp/omp-<uid>` that live omp processes bind in. Short, so relocated paths fit `sun_path`.
+ */
+let relocationRoot: string | undefined;
+beforeAll(() => {
+	if (process.platform === "win32") return;
+	relocationRoot = fs.mkdtempSync("/tmp/omp-tc-reloc-");
+	ipcSetRelocationRoot(relocationRoot);
+});
+afterAll(() => {
+	if (!relocationRoot) return;
+	ipcSetRelocationRoot(null);
+	fs.rmSync(relocationRoot, { recursive: true, force: true });
+});
 
 const TOKEN = "s3cret-token-0123456789abcdefghijklmnop";
 /** A transcript page larger than one socket write, to prove replies are not cut off. */
@@ -462,8 +479,8 @@ describe("topics control endpoint for extensions", () => {
 describe.skipIf(process.getuid === undefined)("topics control socket placement", () => {
 	let root: string;
 	let stop: (() => void) | undefined;
-	/** The native relocation directory for socket paths that do not fit `sun_path`. */
-	const relocationDir = () => `/tmp/omp-${process.getuid!()}`;
+	/** The native relocation directory for socket paths that do not fit `sun_path` (under the private root). */
+	const relocationDir = () => `${relocationRoot}/omp-${process.getuid!()}`;
 
 	beforeEach(() => {
 		// Not derived from TMPDIR: every socket path under this root fits even macOS's 104-byte limit.
@@ -635,10 +652,10 @@ describe.skipIf(process.getuid === undefined)("topics control socket placement",
 			const result = await launch(longRuntimeDir());
 			stop = result.stop;
 			await expectWorksOrOneNotice(result);
-			// Never left unusable for this user's next launch (or another omp's socket).
+			// Never left unusable for this user's next launch.
 			if (result.stop) expect(fs.lstatSync(dir).mode & 0o777).toBe(0o700);
 		} finally {
-			if (fs.lstatSync(dir).uid === process.getuid!()) fs.chmodSync(dir, 0o700);
+			fs.chmodSync(dir, 0o700);
 		}
 	});
 });

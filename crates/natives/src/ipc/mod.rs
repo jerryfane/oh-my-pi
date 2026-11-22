@@ -168,6 +168,15 @@ pub fn ipc_endpoint(dir: String, name: String) -> String {
 	}
 }
 
+/// Tests only: relocate over-long Unix endpoints to `<root>/omp-<euid>`
+/// instead of `/tmp/omp-<euid>`, process-wide, so a suite never touches the
+/// relocation directory other processes share; `null` restores `/tmp`. Keep
+/// `root` short: relocated paths must still fit `sun_path`. No-op on Windows.
+#[napi(js_name = "ipcSetRelocationRoot")]
+pub fn ipc_set_relocation_root(root: Option<String>) {
+	endpoint::set_relocation_root(root);
+}
+
 type ConnectionCallback =
 	ThreadsafeFunction<IpcConnection, UnknownReturnValue, IpcConnection, napi::Status, false>;
 

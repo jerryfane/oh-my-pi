@@ -8,6 +8,7 @@ import {
 	type IpcListenOptions,
 	IpcServer,
 	ipcEndpoint,
+	ipcSetRelocationRoot,
 } from "../native/index.js";
 
 const isWindows = process.platform === "win32";
@@ -220,10 +221,15 @@ describe("native IPC", () => {
 	});
 
 	test.skipIf(isWindows)("ipcEndpoint relocates an over-long dir", async () => {
+		// A private short root instead of the shared `/tmp`, whose `omp-<uid>` live processes bind in.
+		const root = await fs.mkdtemp("/tmp/pi-ipc-reloc-");
+		cleanups.push(() => fs.rm(root, { recursive: true, force: true }));
+		ipcSetRelocationRoot(root);
+		cleanups.push(() => ipcSetRelocationRoot(null));
 		const dir = path.join(await tempDir(), "d".repeat(120));
 		const name = `long-${process.pid}`;
 		const endpoint = ipcEndpoint(dir, name);
-		expect(endpoint).toMatch(new RegExp(`^/tmp/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
+		expect(endpoint).toMatch(new RegExp(`^${root}/omp-${process.getuid!()}/[0-9a-f]{16}\\.sock$`));
 		expect(ipcEndpoint(dir, name)).toBe(endpoint);
 		expect(Buffer.byteLength(endpoint)).toBeLessThan(104);
 		await listen(endpoint, { framing: "lines" }, connection => {

@@ -1,7 +1,8 @@
 //! Deterministic endpoint naming shared by every process that dials or binds.
 //!
 //! The helpers here are pure so the naming rules (stem sanitizing, `sun_path`
-//! relocation, Windows pipe shape) are testable on any host OS.
+//! relocation, Windows pipe shape) are testable on any host OS; the only state
+//! is the test-only relocation root override ([`set_relocation_root`]).
 
 #[cfg(windows)]
 use std::path::{self, Path};
@@ -11,6 +12,7 @@ use std::{
 	path::{Component, Path, PathBuf},
 };
 
+use parking_lot::RwLock;
 use xxhash_rust::xxh64::xxh64;
 
 /// `name` with every char outside `[A-Za-z0-9._-]` replaced by `_`.
@@ -32,10 +34,22 @@ pub fn hash16(bytes: &[u8]) -> String {
 	format!("{:016x}", xxh64(bytes, 0))
 }
 
-/// Private per-user directory that hosts relocated Unix sockets.
+/// Root of [`relocation_dir`] instead of `/tmp`. Tests only
+/// (`ipcSetRelocationRoot`): a suite that relocates must never create, chmod or
+/// bind in the shared `/tmp/omp-<euid>` other processes use.
+static RELOCATION_ROOT: RwLock<Option<String>> = RwLock::new(None);
+
+/// Replace the relocation root process-wide; `None` restores `/tmp`.
+pub fn set_relocation_root(root: Option<String>) {
+	*RELOCATION_ROOT.write() = root;
+}
+
+/// Private per-user directory that hosts relocated Unix sockets:
+/// `/tmp/omp-<euid>`, or under the test-only root.
 #[cfg_attr(windows, allow(dead_code, reason = "pure helper unit-tested on every host"))]
 pub fn relocation_dir(euid: u32) -> String {
-	format!("/tmp/omp-{euid}")
+	let root = RELOCATION_ROOT.read();
+	format!("{}/omp-{euid}", root.as_deref().unwrap_or("/tmp").trim_end_matches('/'))
 }
 
 /// Unix socket path for `name` in the already-resolved `dir`.
