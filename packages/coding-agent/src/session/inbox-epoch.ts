@@ -10,6 +10,7 @@
  */
 
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
+import { invalidateMessageCache } from "@oh-my-pi/pi-agent-core/compaction";
 import type { UserMessage } from "@oh-my-pi/pi-ai";
 
 /** Work bound to a transcript that was replaced, or captured while a replacement runs. */
@@ -77,26 +78,45 @@ export class InboxEpochs {
 }
 
 /**
- * Admit a transcript-bound prompt at its last check before dispatch: put `transcriptPreamble` ahead of the prompt's
- * text, in the prompt itself (`message`, or its prepared form, the last user message of `messages`), then report the
- * admission. Only here does the preamble join the prompt: no setup step before it reads the preamble.
+ * What pre-prompt context maintenance sizes for a transcript-bound prompt: `messages` with `message` (the prompt)
+ * replaced by a copy that already carries the preamble, so the seed counts toward compaction and context promotion.
+ * The copy is only counted, never sent or stored: no auxiliary call (judge, summary) reads its text. Without a
+ * preamble, `messages` itself.
+ */
+export function withBoundPreamble(
+	messages: AgentMessage[],
+	message: AgentMessage,
+	{ transcriptPreamble: preamble }: { transcriptPreamble?: string } = {},
+): AgentMessage[] {
+	if (!preamble) return messages;
+	const prompt = boundPrompt(message);
+	return messages.map(candidate =>
+		candidate === message ? { ...prompt, content: withPreamble(prompt.content, preamble) } : candidate,
+	);
+}
+
+/**
+ * Admit a transcript-bound prompt at its last check before dispatch: put `transcriptPreamble` ahead of the text
+ * of `message` (the exact prompt the batch carries), then report the admission. Only here does the preamble join
+ * the prompt: no setup step before it reads the preamble. In place, so the prompt keeps its identity (turn
+ * observation, queued-message bookkeeping); its cached token estimate and conversion are invalidated with it.
  */
 export function admitBoundPrompt(
-	messages: AgentMessage[],
 	message: AgentMessage,
 	options: { transcriptPreamble?: string; onPromptAdmitted?: () => void },
 ): void {
 	const preamble = options.transcriptPreamble;
 	if (preamble) {
-		const index = messages.includes(message)
-			? messages.indexOf(message)
-			: messages.findLastIndex(m => m.role === "user");
-		const prompt = messages[index];
-		if (prompt?.role !== "user") throw new Error("A transcript-bound prompt with a preamble must be a user message.");
-		// In place: the prompt keeps its identity (turn observation, queued-message bookkeeping).
+		const prompt = boundPrompt(message);
 		prompt.content = withPreamble(prompt.content, preamble);
+		invalidateMessageCache(prompt);
 	}
 	options.onPromptAdmitted?.();
+}
+
+function boundPrompt(message: AgentMessage): UserMessage {
+	if (message.role !== "user") throw new Error("A transcript-bound prompt with a preamble must be a user message.");
+	return message;
 }
 
 /** `content` with `preamble` ahead of its text, joined to its first text block as one text. */
