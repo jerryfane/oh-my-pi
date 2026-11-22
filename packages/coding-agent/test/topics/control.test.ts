@@ -223,6 +223,7 @@ describe("topics control socket", () => {
 			code: "seed_too_large",
 			tokens: 6329,
 			limit: 3400,
+			noteWritten: true,
 		};
 		const host: TopicsHost = {
 			...fakeHost(sent),

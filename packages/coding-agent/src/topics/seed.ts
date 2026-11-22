@@ -113,29 +113,46 @@ function renderSeed(selection: SeedSelection, form: SeedForm): string {
 }
 
 /**
- * The shortest form of a seed: the summary dropped, every message left out but the newest, and its text cut
- * entirely (`summarised`: whether the full seed has a summary).
+ * The newest message alone, whole: the summary dropped and every other message left out (`summarised`: whether
+ * the full seed has a summary, whose older messages are then left out too).
  */
-function shortestForm(selection: SeedSelection, unsummarised: number, summarised: boolean): SeedForm {
+function loneForm(selection: SeedSelection, unsummarised: number, summarised: boolean): SeedForm {
 	const newest = selection.recent.at(-1);
 	return {
 		unsummarised,
 		omitted: Math.max(0, selection.recent.length - 1) + (summarised ? selection.older.length : 0),
-		recent: newest ? [{ ...newest, text: "", cut: newest.text.length }] : [],
+		recent: newest ? [newest] : [],
 	};
 }
 
+/** `form` with its one message's text cut by `cut` characters from the end (the cut says how many). */
+function cutForm(form: SeedForm, cut: number): SeedForm {
+	const recent = form.recent.map(message => ({
+		...message,
+		text: message.text.slice(0, message.text.length - cut),
+		cut,
+	}));
+	return { ...form, recent };
+}
+
 /**
- * The shortest seed a topic can start with from the messages `messageIds` names in `entries`: what the first
- * request needs at least, before any summary is made.
+ * Forms no seed of the messages `messageIds` names in `entries` is shorter than, whatever its summary (none is
+ * made yet): every seed either keeps the newest message whole, with at least the header (the first form), or cuts
+ * it, at most down to nothing (the second). The smaller one, as a request counts them, bounds the seed from below.
  */
-export function shortestTopicSeed(args: {
+export function topicSeedFloor(args: {
 	entries: readonly SessionEntry[];
 	messageIds: readonly string[];
 	reason?: string;
-}): string {
+}): string[] {
 	const selection = selectSeed(args);
-	return renderSeed(selection, shortestForm(selection, 0, selection.older.length > 0));
+	const newest = selection.recent.at(-1);
+	const bare: SeedForm = { unsummarised: 0, omitted: 0, recent: newest ? [newest] : [] };
+	const others = Math.max(0, selection.recent.length - 1);
+	return [
+		renderSeed(selection, bare),
+		renderSeed(selection, cutForm({ ...bare, omitted: others }, newest?.text.length ?? 0)),
+	];
 }
 
 /** A form's text and size, as a request counts it. */
@@ -147,12 +164,11 @@ interface Measured {
 /**
  * A topic's seed: its full text, and shorter forms for a request it does not fit. Shortening leaves out the
  * oldest verbatim messages first (the newest stays), then the summary of the older ones, then cuts the newest
- * message's text; a line says how many messages were left out and the cut says how many characters.
+ * message's text; a line says how many messages were left out and the cut says how many characters. Forms are
+ * compared as rendered: those lines can make a form larger than the one it shortens.
  */
 export class TopicSeed implements TranscriptPreamble {
 	readonly text: string;
-	/** Set when the topic's first prompt was refused for size: that request with the shortest seed, and its limit. */
-	refusal: { tokens: number; limit: number } | undefined;
 	readonly #selection: SeedSelection;
 	readonly #full: SeedForm;
 
@@ -164,18 +180,21 @@ export class TopicSeed implements TranscriptPreamble {
 	}
 
 	fit(maxTokens: number, count: (text: string) => number): { text: string; tokens: number } {
+		const measured: Measured[] = [];
 		const measure = (form: SeedForm): Measured => {
 			const text = renderSeed(this.#selection, form);
-			return { text, tokens: count(text) };
+			const result = { text, tokens: count(text) };
+			measured.push(result);
+			return result;
 		};
-		/** The first of `forms(lo..hi)` (each shorter than the one before) that fits, by bisection. */
+		/** The first of `form(lo..hi)` (each holding less than the one before) that fits, by bisection. */
 		const firstFitting = (lo: number, hi: number, form: (index: number) => SeedForm): Measured | undefined => {
 			let found: Measured | undefined;
 			while (lo <= hi) {
 				const mid = Math.floor((lo + hi) / 2);
-				const measured = measure(form(mid));
-				if (measured.tokens <= maxTokens) {
-					found = measured;
+				const candidate = measure(form(mid));
+				if (candidate.tokens <= maxTokens) {
+					found = candidate;
 					hi = mid - 1;
 				} else {
 					lo = mid + 1;
@@ -184,23 +203,18 @@ export class TopicSeed implements TranscriptPreamble {
 			return found;
 		};
 		const full = this.#full;
+		const whole = measure(full);
+		if (whole.tokens <= maxTokens) return whole;
 		const recent = full.recent;
-		const last = Math.max(0, recent.length - 1);
-		const kept = firstFitting(0, last, left => ({ ...full, omitted: left, recent: recent.slice(left) }));
+		const kept = firstFitting(1, recent.length - 1, left => ({ ...full, omitted: left, recent: recent.slice(left) }));
 		if (kept) return kept;
-		const shortest = shortestForm(this.#selection, full.unsummarised, full.summary !== undefined);
-		const newest = recent.at(-1);
-		const withoutSummary: SeedForm = { ...shortest, recent: newest ? [newest] : [] };
-		const length = newest?.text.length ?? 0;
-		const cut = firstFitting(0, length, cut => ({
-			...withoutSummary,
-			recent: newest ? [{ ...newest, text: newest.text.slice(0, length - cut), cut }] : [],
-		}));
-		return cut ?? measure(shortest);
-	}
-
-	refused(tokens: number, limit: number): void {
-		this.refusal = { tokens, limit };
+		const lone = loneForm(this.#selection, full.unsummarised, full.summary !== undefined);
+		const alone = measure(lone);
+		if (alone.tokens <= maxTokens) return alone;
+		const cut = firstFitting(1, lone.recent[0]?.text.length ?? 0, cut => cutForm(lone, cut));
+		return (
+			cut ?? measured.reduce((smallest, candidate) => (candidate.tokens < smallest.tokens ? candidate : smallest))
+		);
 	}
 }
 

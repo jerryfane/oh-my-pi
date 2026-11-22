@@ -21,9 +21,9 @@ import type { AgentSession } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
 import type { WorkerChange, WorkerSummary } from "../vibe/worker-scope";
-import { type InboxEpoch, StaleTranscriptError, throwIfStale } from "../session/inbox-epoch";
+import { type FirstTurnOutcome, type InboxEpoch, StaleTranscriptError, throwIfStale } from "../session/inbox-epoch";
 import { sessionInbox, type TopicsInbox } from "./inbox";
-import { buildTopicSeed, type SeedSummarizer, shortestTopicSeed, smolSeedSummarizer, type TopicSeed } from "./seed";
+import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer, topicSeedFloor } from "./seed";
 import { requireSeedRoom } from "./seed-room";
 import { cfgTopicsEnabled } from "./settings";
 import {
@@ -65,10 +65,14 @@ export interface SuggestionChange {
 	reason: "suggested" | "suggestion-accepted" | "suggestion-dismissed";
 }
 
+/** A launch's first request that did not start ({@link FirstTurnOutcome}). */
+type StartFailure = Extract<FirstTurnOutcome, { kind: "start-failed" }>;
+
 /**
- * A seeded topic that could not start: even its shortest seed left its first request (`tokens`) over its model's
- * limit (`limit`), so that turn was refused. Sent once, after the topic ended and the Inbox note was written; `id`
- * is the topic's, `suggestionId` the accepted suggestion's (open again; absent for `create`).
+ * A seeded topic whose first request did not start: too large for its models (`seed_too_large`, with the
+ * request's `tokens` and the `limit` it exceeded where known) or failed otherwise (`start_failed`). Sent once,
+ * after the topic ended and the Inbox note was attempted (`noteWritten`: whether it was saved); `id` is the
+ * topic's, `suggestionId` the accepted suggestion's (open again; absent for `create`).
  */
 export interface StartFailedChange {
 	id: string;
@@ -76,9 +80,10 @@ export interface StartFailedChange {
 	parentSessionId: string;
 	reason: "start-failed";
 	suggestionId?: string;
-	code: "seed_too_large";
-	tokens: number;
-	limit: number;
+	code: StartFailure["code"];
+	tokens?: number;
+	limit?: number;
+	noteWritten: boolean;
 }
 
 /** What `subscribe` streams to a host: a topic's change, a suggestion's, or a seeded topic that could not start. */
@@ -139,14 +144,10 @@ interface InFlight<T> {
 	promise: Promise<T>;
 }
 
-/**
- * A spawned topic, whether the child admitted its first prompt (the runtime reports it on every exit), and the
- * size refusal of that prompt, if its seed could not fit.
- */
+/** A spawned topic, and how its first request went (the runtime reports it on every exit). */
 interface StartedTopic {
 	id: string;
-	firstTurn: Promise<"admitted" | "refused">;
-	refusal(): { tokens: number; limit: number } | undefined;
+	firstTurn: Promise<FirstTurnOutcome>;
 }
 
 /** The vibe cli a topic's child runs as. */
@@ -155,6 +156,27 @@ const TOPIC_CLI = "good";
 function requireInbox(inbox: TopicsInbox | undefined): TopicsInbox {
 	if (!inbox) throw new Error("Topic suggestions need the Inbox session.");
 	return inbox;
+}
+
+/**
+ * The visible note that `topic` could not start: a short first line (what a card shows), then the cause, and for
+ * an accepted suggestion that it is open again.
+ */
+function startFailedNote(topic: { title: string; suggestionId: string | null }, failure: StartFailure): string {
+	const { tokens, limit } = failure;
+	const size =
+		tokens !== undefined && limit !== undefined
+			? `: ${tokens} tokens, limit ${limit}`
+			: limit !== undefined
+				? `: limit ${limit} tokens`
+				: "";
+	const cause =
+		failure.code === "seed_too_large"
+			? `The copied history is too large for the available models${size}.`
+			: `Its first request failed: ${failure.error}`;
+	const lines = [`Topic "${topic.title}" could not start`, cause];
+	if (topic.suggestionId) lines.push("The suggestion is open again.");
+	return lines.join("\n");
 }
 
 /**
@@ -255,8 +277,8 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 * is built inside that turn (its failure fails the turn), under the admitted transcript's epoch: aborted, it
 	 * cancels the summary request, the seed and the child's launch, whose first prompt is admitted only while the
 	 * epoch is live (the child saves and sends nothing of it otherwise).
-	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused. One whose
-	 * shortest seed fits no model the child can use is refused before it is spawned (`seed_too_large`).
+	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused. One whose seed
+	 * fits no model its child can use even at its floor is refused before it is spawned (`seed_too_large`).
 	 */
 	const spawnTopic = async (args: {
 		title: string;
@@ -267,16 +289,9 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const title = args.title.trim();
 		if (!title) throw new Error("Topic title must not be empty.");
 		const seed = args.seed;
-		if (seed) {
-			requireSeedRoom(session, registry.workerModelPatterns(session, TOPIC_CLI), {
-				task: args.message,
-				seed: shortestTopicSeed(seed),
-				overheadTokens: seed.admission.box.requestOverheadTokens?.() ?? 0,
-			});
-		}
-		let built: TopicSeed | undefined;
-		const firstTurn = Promise.withResolvers<"admitted" | "refused">();
-		if (!seed) firstTurn.resolve("admitted");
+		if (seed) requireSeedRoom(session, await registry.workerStartModel(session, TOPIC_CLI), topicSeedFloor(seed));
+		const firstTurn = Promise.withResolvers<FirstTurnOutcome>();
+		if (!seed) firstTurn.resolve({ kind: "started" });
 		const signal = seed?.admission.epoch.signal;
 		const { id, jobId } = await registry.spawn(session, {
 			cli: TOPIC_CLI,
@@ -289,7 +304,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 							build: async () => {
 								throwIfStale(signal);
 								const origin = { sessionId: session.getSessionId?.() ?? "", signal };
-								built = await buildTopicSeed({
+								const built = await buildTopicSeed({
 									entries: seed.entries,
 									messageIds: seed.messageIds,
 									reason: seed.reason,
@@ -308,78 +323,97 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			void endTopic(id, seed?.admission, session.asyncJobManager?.getJob(jobId)?.promise);
 			throw new StaleTranscriptError();
 		}
-		return { id, firstTurn: firstTurn.promise, refusal: () => built?.refusal };
+		return { id, firstTurn: firstTurn.promise };
 	};
 
 	/**
-	 * Tell the admitted transcript (a visible note), then the host (a `start-failed` change), that the seeded topic
-	 * `topic` could not start: even its shortest seed did not fit its first request.
+	 * Tell the admitted transcript (a visible note), then the host (one `start-failed` change), that the seeded
+	 * topic `topic` did not start (`failure`). The change is sent whether or not the note was saved (`noteWritten`):
+	 * the host learns that the topic ended either way.
 	 */
 	const reportStartFailed = async (
 		admission: Admission,
 		topic: { id: string; title: string; suggestionId: string | null },
-		refusal: { tokens: number; limit: number },
+		failure: StartFailure,
 	) => {
+		const { code, error, tokens, limit } = failure;
+		const size = { ...(tokens !== undefined ? { tokens } : {}), ...(limit !== undefined ? { limit } : {}) };
 		const details: TopicStartFailedDetails = {
 			topicId: topic.id,
 			title: topic.title,
 			suggestionId: topic.suggestionId,
-			code: "seed_too_large",
-			...refusal,
+			code,
+			error,
+			...size,
 		};
-		const reopened = topic.suggestionId ? " The suggestion is open again." : "";
-		await admission.box
-			.appendNote(admission.epoch, {
+		let noteWritten = false;
+		let noteError: unknown;
+		try {
+			noteWritten = await admission.box.appendNote(admission.epoch, {
 				customType: TOPIC_START_FAILED_TYPE,
-				content: `Topic "${topic.title}" could not start: the copied history is too large for the available models (${refusal.tokens} tokens, limit ${refusal.limit}).${reopened}`,
+				content: startFailedNote(topic, failure),
 				details,
-			})
-			.catch(() => false);
+			});
+		} catch (cause) {
+			noteError = cause;
+		}
+		if (!noteWritten) {
+			logger.warn("topics: the note that a topic could not start was not saved", {
+				id: topic.id,
+				error: noteError instanceof Error ? noteError.message : String(noteError ?? "the Inbox session changed"),
+			});
+		}
 		const change: StartFailedChange = {
 			id: topic.id,
 			ownerId: admission.scope.ownerId,
 			parentSessionId: admission.scope.parentSessionId,
 			reason: "start-failed",
 			...(topic.suggestionId ? { suggestionId: topic.suggestionId } : {}),
-			code: "seed_too_large",
-			...refusal,
+			code,
+			...size,
+			noteWritten,
 		};
 		for (const listener of suggestionListeners) listener(change);
 	};
 
 	/**
-	 * Once `started`'s first turn is admitted under the admitted transcript's live epoch, run `commit` (the accepted
-	 * state, the note). A cancelled or failed first turn, or a failed commit, ends the topic and commits nothing; a
-	 * first turn refused because its seed did not fit is reported ({@link reportStartFailed}) once the topic is ended
-	 * and `topic.release` dropped what still holds it (a pending accept), so a host acting on the report finds the
-	 * topic ended and the suggestion open.
+	 * Once `started`'s first request started (its provider answered it), run `commit` (the accepted state, the note)
+	 * in the admitted transcript; a failed commit, or a cancelled first turn, ends the topic and commits nothing. A
+	 * first request that did not start ends the topic, lets `topic.release` drop what still holds it (a pending
+	 * accept) and is reported ({@link reportStartFailed}), so a host acting on the report finds the topic ended and
+	 * the suggestion open. Rejects unless committed.
 	 */
-	const afterAdmission = async (
+	const afterStart = async (
 		admission: Admission,
 		started: StartedTopic,
 		topic: { title: string; suggestionId: string | null; release?: () => void },
 		commit: () => Promise<void>,
 	) => {
-		try {
-			if ((await started.firstTurn) !== "admitted") throw new Error("The topic's first turn was not admitted.");
-			await commit();
-		} catch (error) {
-			logger.debug("topics: topic not linked; its first turn was cancelled or failed", {
+		const outcome = await started.firstTurn;
+		if (outcome.kind === "start-failed") {
+			logger.debug("topics: topic not linked; its first request did not start", {
 				id: started.id,
-				error: error instanceof Error ? error.message : String(error),
+				code: outcome.code,
+				error: outcome.error,
 			});
-			const refusal = started.refusal();
-			if (!refusal) {
-				void endTopic(started.id, admission, undefined);
-				throw error;
-			}
 			await endTopic(started.id, admission, undefined);
 			topic.release?.();
 			await reportStartFailed(
 				admission,
 				{ id: started.id, title: topic.title, suggestionId: topic.suggestionId },
-				refusal,
+				outcome,
 			);
+			throw new Error(`Topic ${started.id} could not start: ${outcome.error}`);
+		}
+		try {
+			if (outcome.kind === "cancelled") throw new Error("The topic's first turn was cancelled.");
+			await commit();
+		} catch (error) {
+			logger.debug("topics: topic not linked; its first turn was cancelled or its link failed", {
+				id: started.id,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			void endTopic(started.id, admission, undefined);
 			throw error;
 		}
 	};
@@ -394,8 +428,9 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 
 	/**
 	 * Accept `suggestion` of the admitted transcript: spawn its topic and return its id at once; the accepted
-	 * state and the note follow once its first turn is admitted. Until then the accept is pending in memory (a
-	 * repeat joins it); if the first turn is cancelled or fails, the suggestion stays open and the topic is ended.
+	 * state and the note follow once its first request started (its provider answered it). Until then the accept is
+	 * pending in memory (a repeat joins it); if that request does not start or the first turn is cancelled, the
+	 * suggestion stays open and the topic is ended.
 	 * `entries` is the branch its eligibility was checked on. The pending accept is registered before anything
 	 * starts and forgotten by this same owner, once the spawn failed or the topic is linked or not.
 	 */
@@ -423,7 +458,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				const topicId = started.id;
 				topic.resolve(topicId);
 				const release = () => settleInFlight(accepting, suggestion.id, operation);
-				await afterAdmission(
+				await afterStart(
 					admission,
 					started,
 					{ title: suggestion.title, suggestionId: suggestion.id, release },
@@ -438,7 +473,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 					},
 				);
 			} catch (error) {
-				// The spawn failed (the caller is refused); a link that failed after it was logged by `afterAdmission`.
+				// The spawn failed (the caller is refused); a link that failed after it was logged by `afterStart`.
 				topic.reject(error);
 			} finally {
 				settleInFlight(accepting, suggestion.id, operation);
@@ -460,7 +495,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				name,
 				seed: { admission, entries: [...entries], messageIds: seedMessageIds },
 			});
-			void afterAdmission(admission, started, { title: title.trim(), suggestionId: null }, async () => {
+			void afterStart(admission, started, { title: title.trim(), suggestionId: null }, async () => {
 				await noteContinued(admission, {
 					topicId: started.id,
 					title: title.trim(),

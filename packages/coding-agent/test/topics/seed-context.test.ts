@@ -8,9 +8,10 @@
  * of what was sent, not the size of the bare task it was before. A seed that
  * still does not fit the model the request goes to (its window less the output
  * reserve) is shortened at admission: the oldest messages are left out, then
- * the newest one's text is cut, each with a line that says so. When even the
- * shortest seed does not fit, the prompt is refused: nothing is sent or saved,
- * and the seed is told the size and the limit.
+ * the newest one's text is cut, each with a line that says so; forms are
+ * compared as rendered, so a line that adds more than it saves never wins.
+ * When even the shortest seed does not fit, the prompt is refused: nothing is
+ * sent or saved, and the refusal carries the size and the limit.
  */
 import { afterEach, describe, expect, it, vi } from "bun:test";
 import { Agent, Tokenizer } from "@oh-my-pi/pi-agent-core";
@@ -24,7 +25,9 @@ import { PreambleTooLargeError } from "@oh-my-pi/pi-coding-agent/session/inbox-e
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { resolveModelCompactionSettings } from "@oh-my-pi/pi-coding-agent/session/model-compaction-threshold";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { buildTopicSeed, type TopicSeed } from "@oh-my-pi/pi-coding-agent/topics/seed";
+import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { buildTopicSeed, type TopicSeed, topicSeedFloor } from "@oh-my-pi/pi-coding-agent/topics/seed";
+import { requireSeedRoom } from "@oh-my-pi/pi-coding-agent/topics/seed-room";
 import { createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const MARKER = "SEED-CONTEXT-MARKER";
@@ -161,7 +164,6 @@ describe("a bound prompt's preamble in context sizing (#18, #19 review)", () => 
 		const limit = promptBudgetTokens(4_000, resolveModelCompactionSettings(session.settings, small));
 		expect(request).toBeLessThanOrEqual(limit);
 		expect(request).toBeGreaterThan(limit / 2);
-		expect(seed.refusal).toBeUndefined();
 	});
 
 	it("refuses the prompt when even the shortest seed does not fit: nothing is sent or saved", async () => {
@@ -175,11 +177,29 @@ describe("a bound prompt's preamble in context sizing (#18, #19 review)", () => 
 		expect(refused).toBeInstanceOf(PreambleTooLargeError);
 		expect(requests).toEqual([]);
 		expect(session.agent.state.messages.filter(message => message.role === "user")).toEqual([]);
-		expect(seed.refusal).toBeDefined();
-		expect(seed.refusal!.tokens).toBeGreaterThan(seed.refusal!.limit);
-		expect(seed.refusal).toEqual({
-			tokens: (refused as PreambleTooLargeError).tokens,
-			limit: (refused as PreambleTooLargeError).limit,
-		});
+		expect((refused as PreambleTooLargeError).tokens).toBeGreaterThan((refused as PreambleTooLargeError).limit);
+	});
+
+	it("a seed of one short message (`hi`): no form that marks a cut is taken for smaller than the uncut one (#20 review)", async () => {
+		const inbox = SessionManager.inMemory();
+		const hi = inbox.appendMessage({ role: "user", content: "hi", timestamp: 1 });
+		const args = { entries: inbox.getEntries(), messageIds: [hi] };
+		const seed = await buildTopicSeed({ ...args, summarize: async () => undefined });
+		const model = createMockModel({ contextWindow: 200_000 });
+		const tokenizer = new Tokenizer(model);
+		const count = (text: string) => tokenizer.countTokens(text);
+		const uncut = count(seed.text);
+
+		// At the boundary the uncut seed fits; one token less, nothing does, and the smallest form is still the uncut one.
+		expect(seed.fit(uncut, count)).toEqual({ text: seed.text, tokens: uncut });
+		expect(seed.fit(uncut - 1, count)).toEqual({ text: seed.text, tokens: uncut });
+		expect(seed.fit(0, count).tokens).toBe(uncut);
+		// Accept checks the same floor: a window of exactly the uncut seed is enough; a smaller one is refused.
+		const session = { settings: Settings.isolated() } as unknown as ToolSession;
+		const floor = topicSeedFloor(args);
+		expect(() => requireSeedRoom(session, { ...model, contextWindow: uncut }, floor)).not.toThrow();
+		expect(() => requireSeedRoom(session, { ...model, contextWindow: uncut - 1 }, floor)).toThrow(
+			expect.objectContaining({ code: "seed_too_large" }),
+		);
 	});
 });

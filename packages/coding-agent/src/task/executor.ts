@@ -47,7 +47,6 @@ import {
 	resolveConfiguredModelPatterns,
 	resolveExplicitModelRole,
 	resolveModelOverride,
-	resolveModelOverrideWithAuthFallback,
 } from "../config/model-resolver";
 import type { PromptTemplate } from "../config/prompt-templates";
 import {
@@ -95,7 +94,7 @@ import type { AgentSessionDisposeOptions } from "../session/agent-session-types"
 import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
-import type { TranscriptPreamble } from "../session/inbox-epoch";
+import { type FirstTurnOutcome, type TranscriptPreamble, watchFirstTurn } from "../session/inbox-epoch";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
 import { INTERRUPTED_TURN_ERROR } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE, usageContextTokens } from "../session/messages";
@@ -136,6 +135,7 @@ import { generateTaskLabel } from "./label";
 import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
+import { resolveSubagentStartModel } from "./subagent-start-model";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { recordStepsSent, type StepProgress, type StepReportRoute, sendStepReport } from "./steps";
 import type { WorkPoolYieldItem } from "./workpool-yield";
@@ -287,7 +287,7 @@ const monitoredEventTypes = new Set<MonitoredEvent["type"]>([
 const isMonitoredEvent = (event: AgentSessionEvent): event is MonitoredEvent =>
 	monitoredEventTypes.has(event.type as MonitoredEvent["type"]);
 
-function normalizeModelPatterns(value: string | string[] | undefined): string[] {
+export function normalizeModelPatterns(value: string | string[] | undefined): string[] {
 	if (!value) return [];
 	if (Array.isArray(value)) {
 		return value.map(entry => entry.trim()).filter(Boolean);
@@ -470,8 +470,11 @@ export interface ExecutorOptions {
 	steps?: string[];
 	/** Topic board sent ahead of the first prompt (topic workers; see {@link PromptOptions.topicBoard}). */
 	topicBoard?: string;
-	/** Called once the child session admits the first prompt (see {@link PromptOptions.onPromptAdmitted}). */
-	onFirstPromptAdmitted?: () => void;
+	/**
+	 * Told once how the first prompt's request went ({@link watchFirstTurn}): started once the provider answers it,
+	 * else why it did not start.
+	 */
+	onFirstTurn?: (outcome: FirstTurnOutcome) => void;
 	/**
 	 * The parent transcript this launch is bound to (its epoch signal): until the child admits its first prompt,
 	 * its abort cancels the run, and nothing of the launch (`session_init`, the prompt) is saved or sent after it.
@@ -2709,6 +2712,8 @@ async function driveSessionToResult(
 		topicBoard?: string;
 		/** Called once the session admits the initial prompt. */
 		onFirstPromptAdmitted?: () => void;
+		/** Told how the initial prompt's request went (see {@link ExecutorOptions.onFirstTurn}). */
+		onFirstTurn?: (outcome: FirstTurnOutcome) => void;
 		/** The initial prompt's transcript signal (see {@link PromptOptions.transcriptSignal}). */
 		launchSignal?: AbortSignal;
 		/** Put ahead of `task` in the initial prompt only (see {@link ExecutorOptions.launchPreamble}). */
@@ -2820,7 +2825,8 @@ async function driveSessionToResult(
 	try {
 		if (steps && !restore) recordStepsSent(session.sessionManager, steps.sent, steps.prompts);
 		monitor.holdForSteps(steps !== undefined && steps.sent < steps.prompts.length);
-		await runTurn(async () => {
+		const firstTurn = watchFirstTurn(session, abortSignal, options.onFirstTurn);
+		const initialTurn = runTurn(async () => {
 			// An IRC wake may own the session when this turn dispatches. Its prompt
 			// wins the race and this prompt throws AgentBusyError; back off through
 			// the caller hook and retry. Bounded so a wedged worker still resolves
@@ -2850,6 +2856,7 @@ async function driveSessionToResult(
 				}
 			}
 		});
+		await firstTurn(initialTurn);
 
 		// The forced final turn must answer through `yield`, or with no tools at all.
 		const reminderToolChoice = structured ? buildNamedToolChoice("yield", session.model) : "none";
@@ -4967,13 +4974,6 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 			if (options.perCallModelGrants) {
 				await awaitAbortable(modelRegistry.awaitBackgroundRefresh());
 			}
-			const allowedProvider = cfgOffline.get(settings)
-				? (options.parentActiveProvider ??
-					(options.parentActiveModelPattern
-						? resolveModelOverride([options.parentActiveModelPattern], modelRegistry, settings).model?.provider
-						: undefined) ??
-					null)
-				: undefined;
 			const configuredModelPatterns = resolveConfiguredModelPatterns(modelPatterns, settings);
 			const inheritedRetryFallbackChain =
 				configuredModelPatterns.length === 1
@@ -4984,20 +4984,24 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 						)
 					: undefined;
 			const {
-				model,
-				thinkingLevel: resolvedThinkingLevel,
-				explicitThinkingLevel,
-				authFallbackUsed,
-				warning: modelResolutionWarning,
+				allowedProvider,
+				resolution: {
+					model,
+					thinkingLevel: resolvedThinkingLevel,
+					explicitThinkingLevel,
+					authFallbackUsed,
+					warning: modelResolutionWarning,
+				},
 			} = await awaitAbortable(
-				resolveModelOverrideWithAuthFallback(
+				resolveSubagentStartModel({
 					modelPatterns,
-					options.parentActiveModelPattern,
+					parentActiveModelPattern: options.parentActiveModelPattern,
+					parentActiveProvider: options.parentActiveProvider,
+					exactOnly: !!options.perCallModelGrants,
 					modelRegistry,
 					settings,
 					id,
-					{ exactOnly: !!options.perCallModelGrants, allowedProvider },
-				),
+				}),
 			);
 			if (cfgOffline.get(settings) && !model) {
 				throw new Error("Offline mode: no subagent model is available on the active parent provider.");
@@ -5588,10 +5592,8 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
 				topicBoard: options.topicBoard,
-				onFirstPromptAdmitted: () => {
-					launchBound.abort();
-					options.onFirstPromptAdmitted?.();
-				},
+				onFirstPromptAdmitted: () => launchBound.abort(),
+				onFirstTurn: options.onFirstTurn,
 				launchSignal: options.launchSignal,
 				launchPreamble: options.launchPreamble,
 			});
