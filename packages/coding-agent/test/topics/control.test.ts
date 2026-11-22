@@ -13,6 +13,7 @@ import {
 	currentTopicsControl,
 	MIN_TOKEN_LENGTH,
 	offerTopicsControl,
+	SOCKET_PATH_MAX_BYTES,
 	startTopicsControl,
 	TOPICS_CONTROL_CHANNEL,
 	TOPICS_CONTROL_PROTOCOL,
@@ -445,4 +446,110 @@ describe("topics control endpoint for extensions", () => {
 			listener.stop(true);
 		}
 	});
+});
+
+describe("topics control socket path length", () => {
+	let tempDir: TempDir;
+	let stop: (() => void) | undefined;
+	const uid = process.getuid!();
+
+	beforeEach(() => {
+		tempDir = TempDir.createSync("@omp-topics-path-");
+	});
+
+	afterEach(() => {
+		stop?.();
+		stop = undefined;
+		tempDir.removeSync();
+	});
+
+	/** A runtime dir whose control socket paths exceed the platform limit. */
+	function longRuntimeDir(): string {
+		const dir = path.join(tempDir.path(), "runtime", "x".repeat(SOCKET_PATH_MAX_BYTES));
+		fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+		return dir;
+	}
+
+	/** The fallback root: short, inside the test's temp dir instead of the real /tmp. */
+	function fallbackRoot(): string {
+		const root = path.join(tempDir.path(), "fb");
+		fs.mkdirSync(root, { recursive: true });
+		return root;
+	}
+
+	it("falls back to a private <root>/omp-<uid> dir when the runtime dir's socket path is too long, and answers there", async () => {
+		const notices: string[] = [];
+		const root = fallbackRoot();
+		stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), longRuntimeDir(), {
+			fallbackRoot: root,
+			notify: message => notices.push(message),
+		});
+		const endpoint = currentTopicsControl();
+		expect(stop).toBeDefined();
+		expect(notices).toEqual([]);
+		const privateDir = path.join(root, `omp-${uid}`);
+		expect(path.dirname(path.dirname(endpoint!.socketPath))).toBe(privateDir);
+		expect(fs.lstatSync(privateDir).mode & 0o777).toBe(0o700);
+		expect(Buffer.byteLength(endpoint!.socketPath)).toBeLessThanOrEqual(SOCKET_PATH_MAX_BYTES);
+		const client = await connect(endpoint!.socketPath);
+		client.send({ type: "hello", token: endpoint!.token });
+		expect(await client.next()).toMatchObject({ type: "hello", protocol: TOPICS_CONTROL_PROTOCOL });
+		client.end();
+	});
+
+	it("keeps a short runtime dir and never creates the fallback", async () => {
+		const runtime = path.join(tempDir.path(), "rt");
+		fs.mkdirSync(runtime, { mode: 0o700 });
+		const root = fallbackRoot();
+		stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), runtime, { fallbackRoot: root });
+		expect(path.dirname(path.dirname(currentTopicsControl()!.socketPath))).toBe(runtime);
+		expect(fs.existsSync(path.join(root, `omp-${uid}`))).toBe(false);
+	});
+
+	const unsafeFallbacks: Array<[string, (dir: string) => void]> = [
+		[
+			"a symlink",
+			dir => {
+				const target = path.join(path.dirname(dir), "elsewhere");
+				fs.mkdirSync(target, { mode: 0o700 });
+				fs.symlinkSync(target, dir);
+			},
+		],
+		[
+			"open to others (mode 755)",
+			dir => {
+				fs.mkdirSync(dir);
+				fs.chmodSync(dir, 0o755);
+			},
+		],
+	];
+	// Only root can hand the directory to another user.
+	if (uid === 0) {
+		unsafeFallbacks.push([
+			"owned by another user",
+			dir => {
+				fs.mkdirSync(dir, { mode: 0o700 });
+				fs.chownSync(dir, 1, 1);
+			},
+		]);
+	}
+	for (const [label, make] of unsafeFallbacks) {
+		it(`refuses a fallback dir that is ${label}: no socket, and the user is told why`, async () => {
+			const root = fallbackRoot();
+			make(path.join(root, `omp-${uid}`));
+			const notices: string[] = [];
+			const runtime = longRuntimeDir();
+			stop = await offerTopicsControl(new EventBus(), async () => fakeHost([]), runtime, {
+				fallbackRoot: root,
+				notify: message => notices.push(message),
+			});
+			expect(stop).toBeUndefined();
+			expect(currentTopicsControl()).toBeUndefined();
+			expect(notices).toHaveLength(1);
+			expect(notices[0]).toContain(runtime);
+			expect(notices[0]).toContain(`${SOCKET_PATH_MAX_BYTES}-byte limit`);
+			expect(notices[0]).toContain(path.join(root, `omp-${uid}`));
+			expect(fs.readdirSync(runtime)).toEqual([]);
+		});
+	}
 });

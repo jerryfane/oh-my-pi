@@ -340,6 +340,10 @@ export function currentTopicsControl(): TopicsControlEndpoint | undefined {
 	return currentEndpoint;
 }
 
+/** Directory name prefix of a control directory; `mkdtemp` appends six characters. */
+const CONTROL_DIR_PREFIX = "omp-topics-";
+const CONTROL_SOCKET_NAME = "control.sock";
+
 /**
  * Remove control directories that crashed runs left in `runtimeDir`: our own
  * `omp-topics-*` directories whose `control.sock` refuses connections. One
@@ -356,9 +360,9 @@ async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
 		return;
 	}
 	for (const name of names) {
-		if (!name.startsWith("omp-topics-")) continue;
+		if (!name.startsWith(CONTROL_DIR_PREFIX)) continue;
 		const dir = path.join(runtimeDir, name);
-		const socketPath = path.join(dir, "control.sock");
+		const socketPath = path.join(dir, CONTROL_SOCKET_NAME);
 		try {
 			const dirStat = fs.lstatSync(dir);
 			if (!dirStat.isDirectory() || dirStat.uid !== uid) continue;
@@ -371,27 +375,111 @@ async function removeStaleControlDirs(runtimeDir: string): Promise<void> {
 	}
 }
 
+/** Usable bytes of a Unix socket path (`sun_path` minus its NUL): 104 on macOS, 108 elsewhere. */
+export const SOCKET_PATH_MAX_BYTES = process.platform === "darwin" ? 103 : 107;
+/** Root of the short private fallback directory (`<root>/omp-<uid>`). */
+const DEFAULT_FALLBACK_ROOT = "/tmp";
+
+/** The longest control socket path under `root`: the `mkdtemp` suffix is six bytes. */
+function worstCaseSocketPath(root: string): string {
+	return path.join(root, `${CONTROL_DIR_PREFIX}XXXXXX`, CONTROL_SOCKET_NAME);
+}
+
+function fitsSocketPath(root: string, limit: number): boolean {
+	return Buffer.byteLength(worstCaseSocketPath(root)) <= limit;
+}
+
+/**
+ * The short private directory `<fallbackRoot>/omp-<uid>`, created 0700. An existing one is used only when it
+ * is a real directory (not a symlink), owned by this user and closed to everyone else: on a shared `/tmp`
+ * anything else may be another user's trap. Returns the reason it is refused instead.
+ */
+function privateFallbackDir(fallbackRoot: string, uid: number): { dir: string } | { refused: string } {
+	const dir = path.join(fallbackRoot, `omp-${uid}`);
+	try {
+		fs.mkdirSync(dir, { mode: 0o700 });
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+			return { refused: `could not be created (${error instanceof Error ? error.message : String(error)})` };
+		}
+	}
+	const stat = fs.lstatSync(dir);
+	if (stat.isSymbolicLink() || !stat.isDirectory()) return { refused: "is not a real directory" };
+	if (stat.uid !== uid) return { refused: `is owned by uid ${stat.uid}, not ${uid}` };
+	if ((stat.mode & 0o077) !== 0) return { refused: `has mode ${(stat.mode & 0o777).toString(8)}, not 700` };
+	return { dir };
+}
+
+/**
+ * Where control directories go: `runtimeDir` when its socket paths fit the platform limit, else the short
+ * private fallback. Unix only: Windows (no uid) keeps `runtimeDir`. Returns why neither works instead.
+ */
+function controlRoot(
+	runtimeDir: string,
+	fallbackRoot: string,
+	limit: number,
+): { root: string } | { unavailable: string } {
+	const uid = process.getuid?.();
+	if (uid === undefined || fitsSocketPath(runtimeDir, limit)) return { root: runtimeDir };
+	const tooLong = `${worstCaseSocketPath(runtimeDir)} is ${Buffer.byteLength(worstCaseSocketPath(runtimeDir))} bytes, over the ${limit}-byte limit for Unix socket paths`;
+	const fallback = privateFallbackDir(fallbackRoot, uid);
+	if ("refused" in fallback) {
+		return { unavailable: `${tooLong}, and the fallback ${path.join(fallbackRoot, `omp-${uid}`)} ${fallback.refused}` };
+	}
+	if (!fitsSocketPath(fallback.dir, limit)) {
+		const length = Buffer.byteLength(worstCaseSocketPath(fallback.dir));
+		return {
+			unavailable: `${tooLong}, and the fallback ${worstCaseSocketPath(fallback.dir)} is ${length} bytes too`,
+		};
+	}
+	return { root: fallback.dir };
+}
+
+export interface OfferTopicsControlOptions {
+	/** Root of the short private fallback directory for a runtime dir whose socket paths are too long. */
+	fallbackRoot?: string;
+	/** Usable socket path bytes; default the platform's ({@link SOCKET_PATH_MAX_BYTES}). */
+	maxSocketPathBytes?: number;
+	/** Tell the user, once, that the control socket is unavailable and why. */
+	notify?: (message: string) => void;
+}
+
 /**
  * Open the control socket at a fresh random path with a random secret, after
  * removing what crashed runs left behind ({@link removeStaleControlDirs}). The
  * endpoint is published to {@link currentTopicsControl}; `bus` only hears that
  * it changed: now, on every {@link TOPICS_CONTROL_REQUEST_CHANNEL}, and when
- * stopped. Returns a stop function, or undefined when it could not start.
+ * stopped. A runtime dir whose socket paths exceed the Unix limit falls back
+ * to a short private dir; when neither works, the user is told. Returns a stop
+ * function, or undefined when it could not start.
  */
 export async function offerTopicsControl(
 	bus: TopicsControlBus,
 	topics: () => Promise<TopicsHost | undefined>,
 	/** `$XDG_RUNTIME_DIR` (user-private, cleared at logout) when set, else the temp dir. */
 	runtimeDir: string = process.env.XDG_RUNTIME_DIR || os.tmpdir(),
+	options: OfferTopicsControlOptions = {},
 ): Promise<(() => void) | undefined> {
+	const placed = controlRoot(
+		runtimeDir,
+		options.fallbackRoot ?? DEFAULT_FALLBACK_ROOT,
+		options.maxSocketPathBytes ?? SOCKET_PATH_MAX_BYTES,
+	);
+	if ("unavailable" in placed) {
+		const message = `Topics control socket unavailable: ${placed.unavailable}. Topics still work in omp; only a host's (Herdr's) control of them is off.`;
+		logger.error(message);
+		options.notify?.(message);
+		return undefined;
+	}
+	const root = placed.root;
 	let dir: string | undefined;
 	const changed: TopicsControlChanged = { changed: true };
 	try {
-		await removeStaleControlDirs(runtimeDir);
-		dir = fs.mkdtempSync(path.join(runtimeDir, "omp-topics-"));
+		await removeStaleControlDirs(root);
+		dir = fs.mkdtempSync(path.join(root, CONTROL_DIR_PREFIX));
 		fs.chmodSync(dir, 0o700);
 		const endpoint: TopicsControlEndpoint = {
-			socketPath: path.join(dir, "control.sock"),
+			socketPath: path.join(dir, CONTROL_SOCKET_NAME),
 			token: crypto.randomBytes(32).toString("base64url"),
 			protocol: TOPICS_CONTROL_PROTOCOL,
 			pid: process.pid,
@@ -422,8 +510,10 @@ export async function offerSessionTopicsControl(
 	session: { getTopicsHost(): Promise<TopicsHost | undefined>; addDisposer(dispose: () => void): void },
 	bus: TopicsControlBus,
 	settings: Settings,
+	/** Shows the user a startup notice (the control socket could not be placed). */
+	notify?: (message: string) => void,
 ): Promise<void> {
 	if (!cfgTopicsEnabled.get(settings)) return;
-	const stop = await offerTopicsControl(bus, () => session.getTopicsHost());
+	const stop = await offerTopicsControl(bus, () => session.getTopicsHost(), undefined, { notify });
 	if (stop) session.addDisposer(stop);
 }
