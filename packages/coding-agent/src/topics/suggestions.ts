@@ -10,6 +10,7 @@ import type { TextContent } from "@oh-my-pi/pi-ai";
 import { escapeXmlText } from "@oh-my-pi/pi-utils";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import { escapeHarnessTags } from "../session/harness-tags";
+import type { StartFailedCode } from "../session/inbox-epoch";
 import type { CustomEntry, CustomMessageEntry, SessionEntry, SessionMessageEntry } from "../session/session-entries";
 
 /** `customType` of the visible suggestion message (`details` = {@link TopicSuggestionDetails}). */
@@ -76,17 +77,19 @@ export interface TopicContinuedDetails {
 }
 
 /**
- * `details` of a {@link TOPIC_START_FAILED_TYPE} note: a seeded topic that could not start, because even its
- * shortest seed left its first request (`tokens`) over its model's limit (`limit`). The topic was ended; an
- * accepted suggestion (`suggestionId`) stays open.
+ * `details` of a {@link TOPIC_START_FAILED_TYPE} note: a seeded topic whose first request did not start, because
+ * its copied history was too large for its model (`seed_too_large`: the request's `tokens` and the `limit` it
+ * exceeded, where known) or for another reason (`start_failed`); `error` says what happened. The topic was ended;
+ * an accepted suggestion (`suggestionId`) stays open.
  */
 export interface TopicStartFailedDetails {
 	topicId: string;
 	title: string;
 	suggestionId: string | null;
-	code: "seed_too_large";
-	tokens: number;
-	limit: number;
+	code: StartFailedCode;
+	error: string;
+	tokens?: number;
+	limit?: number;
 }
 
 /** A suggestion with its latest state. */

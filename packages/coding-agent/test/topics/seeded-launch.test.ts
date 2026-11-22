@@ -28,10 +28,16 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { AgentStorage } from "@oh-my-pi/pi-coding-agent/session/agent-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { SessionTools } from "@oh-my-pi/pi-coding-agent/session/session-tools";
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
+import {
+	createTopicsHost,
+	type StartFailedChange,
+	type TopicChange,
+	type TopicsHost,
+} from "@oh-my-pi/pi-coding-agent/topics/host";
 import { sessionInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import {
 	TOPIC_CONTINUED_TYPE,
@@ -120,7 +126,10 @@ type Gate = "creation" | "credentials" | "judge";
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
  * `autoThinking`, the child's model reasons and its thinking level is `auto`: its first prompt is classified by
  * the judge role, a second mock model whose requests are recorded at the provider boundary. The main model (the
- * Inbox's and the child's) has a `contextWindow`-token window (default 200,000).
+ * Inbox's and the child's) has a `contextWindow`-token window (default 200,000); with `refuseFirst`, it refuses
+ * its first request with that error. The Inbox's system prompt is `inboxPrompt`. With `unauthenticatedStart`,
+ * topics are configured onto a model of that window whose provider has no credentials, and the parent's active
+ * model is the main one (the executor falls back to it).
  */
 async function openLaunch(
 	gate: Gate = "creation",
@@ -128,7 +137,17 @@ async function openLaunch(
 		excerptText = EXCERPT,
 		autoThinking = false,
 		contextWindow,
-	}: { excerptText?: string; autoThinking?: boolean; contextWindow?: number } = {},
+		refuseFirst,
+		inboxPrompt = "Inbox",
+		unauthenticatedStart,
+	}: {
+		excerptText?: string;
+		autoThinking?: boolean;
+		contextWindow?: number;
+		refuseFirst?: string;
+		inboxPrompt?: string;
+		unauthenticatedStart?: number;
+	} = {},
 ): Promise<Launch> {
 	const cwd = path.join(root, "home", "work");
 	const authStorage = createInMemoryAuthStorage();
@@ -142,9 +161,19 @@ async function openLaunch(
 		reasoning: autoThinking,
 		handler: context => {
 			requests.push(JSON.stringify(context.messages));
+			if (refuseFirst && requests.length === 1) return { throw: refuseFirst };
 			return { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] };
 		},
 	});
+	const unauthenticated =
+		unauthenticatedStart === undefined
+			? undefined
+			: createMockModel({
+					id: "unauthenticated-model",
+					provider: "noauth",
+					contextWindow: unauthenticatedStart,
+					handler: () => ({ throw: "the unauthenticated model was called" }),
+				});
 	if (autoThinking) Object.assign(mock, { thinking: { mode: "effort", efforts: [Effort.Low, Effort.High] } });
 	const judgeRequests: string[] = [];
 	const judge = createMockModel({
@@ -159,7 +188,12 @@ async function openLaunch(
 		},
 	});
 	const catalogAvailable = modelRegistry.getAvailable.bind(modelRegistry);
-	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [mock, judge, ...catalogAvailable(kind)]);
+	vi.spyOn(modelRegistry, "getAvailable").mockImplementation(kind => [
+		mock,
+		judge,
+		...(unauthenticated ? [unauthenticated] : []),
+		...catalogAvailable(kind),
+	]);
 	const settings = Settings.isolated({
 		"task.agentIdleTtlMs": 0,
 		"async.enabled": false,
@@ -168,7 +202,11 @@ async function openLaunch(
 		"todo.enabled": false,
 		"todo.reminders": false,
 		"advisor.enabled": false,
-		modelRoles: { default: "mock/mock-model", judge: "mock/judge-model" },
+		modelRoles: {
+			default: unauthenticated ? "noauth/unauthenticated-model" : "mock/mock-model",
+			...(unauthenticated ? { task: "noauth/unauthenticated-model" } : {}),
+			judge: "mock/judge-model",
+		},
 		"retry.fallbackChains": { judge: [] },
 		...(autoThinking ? { defaultThinkingLevel: "auto" as const } : {}),
 	});
@@ -194,12 +232,13 @@ async function openLaunch(
 		getArtifactsDir: () => null,
 		taskDepth: 0,
 		enableLsp: false,
+		...(unauthenticated ? { getActiveModelString: () => "mock/mock-model" } : {}),
 	} as unknown as ToolSession;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
 			model: mock,
-			systemPrompt: ["Inbox"],
+			systemPrompt: [inboxPrompt],
 			tools: [],
 			messages: manager.buildSessionContext().messages,
 		},
@@ -402,41 +441,32 @@ describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", 
 	});
 });
 
-describe("a seed sized to the models the topic's child can use (#19 review)", () => {
+describe("a topic started from a suggestion is accepted only once its first request started (#19, #20 review)", () => {
 	/** One valid Inbox message, about 78k characters: far beyond the windows below. */
 	const BIG = `${EXCERPT} ${"the quarterly numbers look fine ".repeat(2_400)}`;
+	/** An Inbox system prompt of about `tokens` tokens. */
+	const inboxPromptOf = (tokens: number) => "Inbox guidance line. ".repeat(Math.round(tokens / 4));
 
-	it("too large for the model, the seed is shortened: the topic starts, and only then is the suggestion accepted", async () => {
-		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 12_000 });
-		const isLinked = linked(launch);
-		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
-		const { topicId } = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
-		await launch.gated;
-		launch.release();
-		await settled(launch, topicId);
-		await isLinked;
+	interface Accepted {
+		suggestionId: string;
+		topicId: string;
+		/** Every change the host was told, in order. */
+		changes: TopicChange[];
+		/** The first `start-failed` change, with what the Inbox and the topic list held when it came. */
+		failed: Promise<{ change: StartFailedChange; notes: number; listed: boolean }>;
+	}
 
-		// The first request has the start of the message once, cut to fit, with a marker that says so.
-		const first = launch.requests[0]!;
-		expect(first.split(EXCERPT)).toHaveLength(2);
-		expect(first).toMatch(/\[truncated: \d+ characters\]/);
-		expect(first.length).toBeLessThan(BIG.length);
-		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toHaveLength(1);
-		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toHaveLength(1);
-		expect(rows(launch.manager, TOPIC_START_FAILED_TYPE)).toEqual([]);
-	});
-
-	it("a 4,000-token model only: the child cannot fit even the shortest seed; nothing is sent, the topic ends, the Inbox and the host are told once, the suggestion stays open", async () => {
-		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 4_000 });
+	/** Accept a suggestion of the excerpt and let the child run. */
+	async function acceptExcerpt(launch: Launch): Promise<Accepted> {
 		const changes: TopicChange[] = [];
-		const reported = Promise.withResolvers<{ noted: number; live: boolean }>();
+		const failed = Promise.withResolvers<{ change: StartFailedChange; notes: number; listed: boolean }>();
 		launch.host.onChange(change => {
 			changes.push(change);
 			if (change.reason !== "start-failed") return;
-			const topic = launch.host.list().find(entry => entry.id === change.id);
-			reported.resolve({
-				noted: rows(launch.manager, TOPIC_START_FAILED_TYPE).length,
-				live: topic !== undefined && topic.state !== "dead",
+			failed.resolve({
+				change,
+				notes: rows(launch.manager, TOPIC_START_FAILED_TYPE).length,
+				listed: launch.host.list().some(topic => topic.id === change.id),
 			});
 		});
 		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
@@ -445,62 +475,170 @@ describe("a seed sized to the models the topic's child can use (#19 review)", ()
 		await launch.gated;
 		launch.release();
 		await settled(launch, accepted.topicId);
+		return { suggestionId: suggestion.id, topicId: accepted.topicId, changes, failed: failed.promise };
+	}
 
-		// Sent once the topic ended and the note was written.
-		expect(await reported.promise).toEqual({ noted: 1, live: false });
-		const spawned = changes.find(change => change.id === accepted.topicId && change.reason === "spawned");
+	/** The topic started: the suggestion is accepted, linked, and nothing says it failed. */
+	async function expectStarted(launch: Launch, run: Accepted, isLinked: Promise<void>): Promise<string> {
+		await isLinked;
+		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toMatchObject([{ data: { topicId: run.topicId } }]);
+		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toHaveLength(1);
+		expect(rows(launch.manager, TOPIC_START_FAILED_TYPE)).toEqual([]);
+		expect(run.changes.filter(change => change.reason === "start-failed")).toEqual([]);
+		expect(launch.requests.length).toBeGreaterThan(0);
+		return launch.requests[0]!;
+	}
+
+	/**
+	 * The topic did not start: exactly one `start-failed` change, sent once the note was written and the topic
+	 * left the list; nothing was accepted, the suggestion is open, and a repeat Accept starts a new topic.
+	 */
+	async function expectStartFailed(launch: Launch, run: Accepted): Promise<StartFailedChange> {
+		const { change, notes, listed } = await run.failed;
+		expect({ notes, listed }).toEqual({ notes: 1, listed: false });
+		const spawned = run.changes.find(candidate => candidate.id === run.topicId && candidate.reason === "spawned");
 		if (!spawned) throw new Error("expected the topic's spawn change");
-		const failures = changes.filter(change => change.reason === "start-failed");
-		expect(failures).toEqual([
-			{
-				id: accepted.topicId,
-				ownerId: spawned.ownerId,
-				parentSessionId: spawned.parentSessionId,
-				reason: "start-failed",
-				suggestionId: suggestion.id,
-				code: "seed_too_large",
-				tokens: expect.any(Number),
-				limit: expect.any(Number),
-			},
-		]);
-		const failure = failures[0] as { tokens: number; limit: number };
-		expect(failure.tokens).toBeGreaterThan(failure.limit);
-		expect(launch.requests).toEqual([]);
-		expect(await childFile(launch, accepted.topicId)).not.toContain(EXCERPT);
-		const [note] = rows(launch.manager, TOPIC_START_FAILED_TYPE) as Array<{ display: boolean; content: string }>;
-		expect(note).toMatchObject({
-			display: true,
-			content: `Topic "Diokan" could not start: the copied history is too large for the available models (${failure.tokens} tokens, limit ${failure.limit}). The suggestion is open again.`,
-			details: {
-				topicId: accepted.topicId,
-				title: "Diokan",
-				suggestionId: suggestion.id,
-				code: "seed_too_large",
-				tokens: failure.tokens,
-				limit: failure.limit,
-			},
+		expect(run.changes.filter(candidate => candidate.reason === "start-failed")).toEqual([change]);
+		expect(change).toMatchObject({
+			id: run.topicId,
+			ownerId: spawned.ownerId,
+			parentSessionId: spawned.parentSessionId,
+			reason: "start-failed",
+			suggestionId: run.suggestionId,
+			noteWritten: true,
 		});
 		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
 		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
-		expect(launch.host.suggestions().map(open => open.id)).toEqual([suggestion.id]);
-		// A repeat Accept starts a new topic: the first was never accepted.
-		const retry = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+		expect(launch.host.suggestions().map(open => open.id)).toEqual([run.suggestionId]);
+		const retry = await launch.host.acceptSuggestion({ suggestionId: run.suggestionId, by: "owner" });
 		expect(retry.alreadyAccepted).toBe(false);
-		expect(retry.topicId).not.toBe(accepted.topicId);
+		expect(retry.topicId).not.toBe(run.topicId);
 		await settled(launch, retry.topicId);
+		return change;
+	}
+
+	/** The Inbox's note that the topic could not start: a short first line, then the cause, then the suggestion. */
+	function noteOf(launch: Launch): { display: boolean; content: string; details: Record<string, unknown> } {
+		const [note] = rows(launch.manager, TOPIC_START_FAILED_TYPE) as Array<{
+			display: boolean;
+			content: string;
+			details: Record<string, unknown>;
+		}>;
+		if (!note) throw new Error("expected the note");
+		return note;
+	}
+
+	it("too large for the model, the seed is shortened: the topic starts, and only then is the suggestion accepted", async () => {
+		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 12_000 });
+		const isLinked = linked(launch);
+		const run = await acceptExcerpt(launch);
+
+		// The first request has the start of the message once, cut to fit, with a marker that says so.
+		const first = await expectStarted(launch, run, isLinked);
+		expect(first.split(EXCERPT)).toHaveLength(2);
+		expect(first).toMatch(/\[truncated: \d+ characters\]/);
+		expect(first.length).toBeLessThan(BIG.length);
 	});
 
-	it("too large for every model even at its shortest: Accept and Create are refused at once (seed_too_large); nothing is saved or spawned", async () => {
-		const launch = await openLaunch("creation", { contextWindow: 80 });
+	it("an 11,200-token Inbox prompt and a 12,000-token child: the Inbox's prompt is not the child's; the topic starts", async () => {
+		const launch = await openLaunch("credentials", { contextWindow: 12_000, inboxPrompt: inboxPromptOf(11_200) });
+		const isLinked = linked(launch);
+		const run = await acceptExcerpt(launch);
+
+		const first = await expectStarted(launch, run, isLinked);
+		expect(first.split(EXCERPT)).toHaveLength(2);
+		expect(first).not.toContain("[truncated:");
+	});
+
+	it("topics configured onto an unauthenticated 4,000-token model: checked against the 12,000-token model the launch falls back to; the topic starts there", async () => {
+		const launch = await openLaunch("credentials", {
+			contextWindow: 12_000,
+			unauthenticatedStart: 4_000,
+			inboxPrompt: inboxPromptOf(4_200),
+		});
+		const isLinked = linked(launch);
+		const run = await acceptExcerpt(launch);
+
+		const first = await expectStarted(launch, run, isLinked);
+		expect(first.split(EXCERPT)).toHaveLength(2);
+	});
+
+	it("a 4,000-token model only: even the shortest seed does not fit; nothing is sent, the topic ends, the Inbox and the host are told once, the suggestion stays open", async () => {
+		const launch = await openLaunch("credentials", { excerptText: BIG, contextWindow: 4_000 });
+		const run = await acceptExcerpt(launch);
+
+		const change = await expectStartFailed(launch, run);
+		const { code, tokens, limit } = change;
+		expect(code).toBe("seed_too_large");
+		expect(typeof tokens === "number" && typeof limit === "number" && tokens > limit).toBe(true);
+		expect(launch.requests).toEqual([]);
+		expect(await childFile(launch, run.topicId)).not.toContain(EXCERPT);
+		expect(noteOf(launch)).toMatchObject({
+			display: true,
+			content: [
+				'Topic "Diokan" could not start',
+				`The copied history is too large for the available models: ${tokens} tokens, limit ${limit}.`,
+				"The suggestion is open again.",
+			].join("\n"),
+			details: {
+				topicId: run.topicId,
+				title: "Diokan",
+				suggestionId: run.suggestionId,
+				code: "seed_too_large",
+				tokens,
+				limit,
+			},
+		});
+	});
+
+	it("a notice the child adds after the seed's check (an eval prelude) leaves no room: the request is refused unsent, the suggestion stays open", async () => {
+		const launch = await openLaunch("credentials", { contextWindow: 12_000 });
+		vi.spyOn(SessionTools.prototype, "takeEvalPreludeNotice").mockReturnValueOnce({
+			role: "custom",
+			customType: "eval-prelude-notice",
+			content: "Eval prelude guidance. ".repeat(2_200),
+			display: false,
+			details: { added: [], removed: [] },
+			timestamp: Date.now(),
+		} as never);
+		const run = await acceptExcerpt(launch);
+
+		const change = await expectStartFailed(launch, run);
+		expect(change).toMatchObject({ code: "seed_too_large" });
+		// Nothing with the notice was sent; what was sent is the retry's (its launch has no such notice).
+		expect(launch.requests.length).toBeGreaterThan(0);
+		expect(launch.requests.filter(request => request.includes("Eval prelude guidance."))).toEqual([]);
+	});
+
+	it("the provider refuses the first request as too long: the topic did not start; it ends, the suggestion stays open", async () => {
+		const launch = await openLaunch("credentials", {
+			contextWindow: 12_000,
+			refuseFirst: "prompt is too long: 13520 tokens > 12000 maximum",
+		});
+		const run = await acceptExcerpt(launch);
+
+		const change = await expectStartFailed(launch, run);
+		expect(change).toMatchObject({ code: "seed_too_large", limit: 12_000 });
+		expect(change).not.toHaveProperty("tokens");
+		expect(noteOf(launch).content).toBe(
+			[
+				'Topic "Diokan" could not start',
+				"The copied history is too large for the available models: limit 12000 tokens.",
+				"The suggestion is open again.",
+			].join("\n"),
+		);
+	});
+
+	it("too large for every model even at its floor: Accept and Create are refused at once (seed_too_large); nothing is saved or spawned", async () => {
+		const launch = await openLaunch("creation", { contextWindow: 40 });
 		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
 		const tooLarge = { code: "seed_too_large" };
 		for (let attempt = 0; attempt < 2; attempt++) {
 			const accepting = launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
 			await expect(accepting).rejects.toMatchObject(tooLarge);
 		}
-		await expect(
-			launch.host.create({ title: "Deal", message: "go", seedMessageIds: [launch.excerpt] }),
-		).rejects.toMatchObject({ code: "seed_too_large" });
+		const creating = launch.host.create({ title: "Deal", message: "go", seedMessageIds: [launch.excerpt] });
+		await expect(creating).rejects.toMatchObject(tooLarge);
 
 		expect(launch.launched).toEqual([]);
 		expect(launch.host.list()).toEqual([]);

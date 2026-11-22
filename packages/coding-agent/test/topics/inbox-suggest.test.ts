@@ -572,7 +572,7 @@ describe("Inbox epochs: bound work is aborted when the transcript is replaced (#
 		await inbox.manager.ensureOnDisk();
 		await inbox.manager.flush();
 		const firstTurns = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
-			options.onFirstPromptAdmitted?.();
+			options.onFirstTurn?.({ kind: "started" });
 			return {
 				index: options.index,
 				id: options.id,
@@ -888,7 +888,7 @@ describe("Inbox generation checked at the point of effect (#8 review)", () => {
 		);
 		await inbox.manager.ensureOnDisk();
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async (options: ExecutorOptions) => {
-			options.onFirstPromptAdmitted?.();
+			options.onFirstTurn?.({ kind: "started" });
 			return {
 				index: options.index,
 				id: options.id,

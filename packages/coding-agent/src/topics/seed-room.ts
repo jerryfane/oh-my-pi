@@ -1,48 +1,37 @@
 /**
- * Whether a seeded topic can start at all, decided when it is accepted or created, before anything is saved or
- * spawned: its task plus the shortest seed ({@link shortestTopicSeed}) must fit the first request of a model the
- * topic's child can use (the one it starts on, or its context-promotion target), that model's window less the
- * output reserve and the request's system prompt and tools. Those are the child's own once it runs; the Inbox's
- * stand in for them here. Running, the child sizes its first request exactly and shortens the seed to fit it
- * ({@link BoundPrompt}); only a seed that cannot fit even there refuses its first turn.
+ * Whether a seeded topic can start at all, decided when it is accepted or created, before anything is spawned. It
+ * refuses only what is proven impossible: the seed's floor ({@link topicSeedFloor}), with nothing else of the
+ * request, is larger than the window of every model the topic's child can use: the one its launch selects
+ * ({@link VibeSessionRegistry.workerStartModel}) and that model's context-promotion target. Everything else is
+ * left to the child, which fits the seed to its first request and reports whether that request started.
  */
 import { Tokenizer } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { resolveModelOverride } from "../config/model-resolver";
-import { promotionTarget, promptLimit } from "../session/inbox-epoch";
+import { promotionTarget } from "../session/inbox-epoch";
 import type { ToolSession } from "../tools";
 import { TopicsError } from "./suggestions";
 
-/** The models a child starting on `patterns` can send its first request to: its own, and its promotion target. */
-function childModels(session: ToolSession, patterns: string[]): Model[] {
+/** The models a child starting on `start` can send its first request to: `start`, and its promotion target. */
+function childModels(session: ToolSession, start: Model): Model[] {
 	const registry = session.modelRegistry;
-	if (!registry) return [];
-	const settings = session.settings;
-	const parent = session.getActiveModelString?.();
-	const start =
-		resolveModelOverride(patterns, registry, settings).model ??
-		(parent ? resolveModelOverride([parent], registry, settings).model : undefined);
-	if (!start) return [];
-	const target = promotionTarget(start, settings, registry);
-	return target ? [registry.fitContextWindow(start, settings), target] : [registry.fitContextWindow(start, settings)];
+	if (!registry) return [start];
+	const fitted = registry.fitContextWindow(start, session.settings);
+	const target = promotionTarget(fitted, session.settings, registry);
+	return target ? [fitted, target] : [fitted];
 }
 
 /**
- * Refuse a seeded topic (`seed_too_large`) whose first request (`overheadTokens` of system prompt and tools, the
- * `task`, the shortest `seed`) fits no model a child starting on `patterns` can use. Unknown models or windows
- * refuse nothing: the child still checks its request.
+ * Refuse a seeded topic (`seed_too_large`) whose seed floor (`floor`: its smallest forms) is larger than the
+ * window of every model a child starting on `start` can use. An unknown model or window refuses nothing.
  */
-export function requireSeedRoom(
-	session: ToolSession,
-	patterns: string[],
-	request: { task: string; seed: string; overheadTokens: number },
-): void {
+export function requireSeedRoom(session: ToolSession, start: Model | undefined, floor: readonly string[]): void {
+	if (!start) return;
 	let closest: { tokens: number; limit: number } | undefined;
-	for (const model of childModels(session, patterns)) {
-		const limit = promptLimit(model, session.settings);
-		if (limit === undefined) return;
+	for (const model of childModels(session, start)) {
+		const limit = model.contextWindow ?? 0;
+		if (limit <= 0) return;
 		const tokenizer = new Tokenizer(model);
-		const tokens = request.overheadTokens + tokenizer.countTokens(request.task) + tokenizer.countTokens(request.seed);
+		const tokens = Math.min(...floor.map(form => tokenizer.countTokens(form)));
 		if (tokens <= limit) return;
 		if (!closest || limit - tokens > closest.limit - closest.tokens) closest = { tokens, limit };
 	}

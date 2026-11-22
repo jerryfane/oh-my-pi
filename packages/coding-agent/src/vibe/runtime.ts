@@ -36,13 +36,15 @@ import { AgentLifecycleManager } from "../registry/agent-lifecycle";
 import { type AgentRef, AgentRegistry, MAIN_AGENT_ID } from "../registry/agent-registry";
 import { SessionManager, SessionPersistenceIndeterminateError } from "../session/session-manager";
 import { getBundledAgent } from "../task/agents";
-import { type ExecutorOptions, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
+import { type ExecutorOptions, normalizeModelPatterns, runSubagentFollowUpTurn, runSubprocess } from "../task/executor";
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
 import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import type { ToolSession } from "../tools";
-import type { TranscriptPreamble } from "../session/inbox-epoch";
+import type { FirstTurnOutcome, TranscriptPreamble } from "../session/inbox-epoch";
+import { resolveSubagentStartModel } from "../task/subagent-start-model";
+import type { Model } from "@oh-my-pi/pi-ai";
 import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
@@ -70,14 +72,14 @@ import type {
  * A first-turn seed: built inside the turn, from the transcript `signal` is bound to, and put ahead of the first
  * prompt only ({@link ExecutorOptions.launchPreamble}), never in the worker's metadata. The child's launch is bound
  * to it too ({@link ExecutorOptions.launchSignal}): aborted before the child admitted its first prompt, the launch
- * is cancelled and nothing of it is saved or sent. `firstTurn` reports, exactly once and on every exit, whether the
- * child admitted the first prompt into its own session (`admitted`) or the turn ended before that (`refused`: a
- * failed seed or setup, a cancelled job or launch).
+ * is cancelled and nothing of it is saved or sent. `firstTurn` is told, exactly once and on every exit, how the
+ * first request went ({@link FirstTurnOutcome}): `started` once the provider answered it, `cancelled` when the job
+ * or the launch was aborted first, else `start-failed` (a failed seed or setup, a refused or failed request).
  */
 export interface VibeSeed {
 	signal: AbortSignal;
 	build(): Promise<TranscriptPreamble>;
-	firstTurn(outcome: "admitted" | "refused"): void;
+	firstTurn(outcome: FirstTurnOutcome): void;
 }
 
 /** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
@@ -428,10 +430,21 @@ export class VibeSessionRegistry {
 		}
 	}
 
-	/** The model patterns a new `cli` worker of `session` starts on (as its spawn resolves them). */
-	workerModelPatterns(session: VibeParentSession, cli: VibeCli): string[] {
-		const { modelOverride } = this.#resolveWorker(session, cli);
-		return modelOverride === undefined ? [] : [modelOverride].flat();
+	/**
+	 * The model a new `cli` worker of `session` starts on, as its launch selects it ({@link resolveSubagentStartModel});
+	 * undefined when none resolves.
+	 */
+	async workerStartModel(session: ToolSession, cli: VibeCli): Promise<Model | undefined> {
+		const { agent, modelOverride } = this.#resolveWorker(session, cli);
+		if (!session.modelRegistry) return undefined;
+		const { resolution } = await resolveSubagentStartModel({
+			modelPatterns: normalizeModelPatterns(modelOverride ?? agent.model),
+			parentActiveModelPattern: session.getActiveModelString?.(),
+			exactOnly: false,
+			modelRegistry: session.modelRegistry,
+			settings: session.settings,
+		});
+		return resolution.model;
 	}
 
 	#resolveWorker(session: VibeParentSession, cli: VibeCli): ResolvedVibeWorker {
@@ -1638,11 +1651,23 @@ export class VibeSessionRegistry {
 		};
 
 		let firstTurnReported = !options.seed;
-		const reportFirstTurn = (outcome: "admitted" | "refused") => {
+		const reportFirstTurn = (outcome: FirstTurnOutcome) => {
 			if (firstTurnReported) return;
 			firstTurnReported = true;
 			options.seed?.firstTurn(outcome);
 		};
+		/** A first turn the child did not report on ended: cancelled when it was aborted, else failed with `error`. */
+		const endFirstTurn = (aborted: boolean, error: string | undefined) =>
+			reportFirstTurn(
+				aborted || options.seed?.signal.aborted
+					? { kind: "cancelled" }
+					: {
+							kind: "start-failed",
+							code: "start_failed",
+							error: error ?? "The first turn ended before it started.",
+						},
+			);
+		let firstTurnError: string | undefined;
 		const jobId = manager.register(
 			"task",
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
@@ -1676,7 +1701,7 @@ export class VibeSessionRegistry {
 						? await runSubprocess({
 								...spawnOptions,
 								topicBoard,
-								onFirstPromptAdmitted: () => reportFirstTurn("admitted"),
+								onFirstTurn: reportFirstTurn,
 								launchSignal: options.seed?.signal,
 								launchPreamble: seed,
 							})
@@ -1692,10 +1717,12 @@ export class VibeSessionRegistry {
 								artifactsDir: session.getSessionFile()?.slice(0, -6),
 								topicBoard,
 							});
+					firstTurnError = result.error;
 					return await this.#settleTurn(session, manager, record, turn, ownJobId, turnIndex, result);
 				} catch (error) {
 					if (error instanceof VibeTurnError) throw error;
 					const reason = error instanceof Error ? error.message : String(error);
+					firstTurnError ??= reason;
 					record.lastActivity = firstLine(`turn failed: ${reason}`);
 					await this.#finishTurn(session, manager, record, ownJobId);
 					await this.policy.onTurnSettled?.({ id: record.id, askers: turn.askers, error: reason });
@@ -1703,7 +1730,7 @@ export class VibeSessionRegistry {
 						`[vibe:${record.id} cli=${record.cli} turn=${turnIndex}] turn failed: ${reason}`,
 					);
 				} finally {
-					reportFirstTurn("refused");
+					endFirstTurn(signal.aborted, firstTurnError);
 				}
 			},
 			{ id: `${record.id}-t${turnIndex}`, agentId: record.id, ownerId: record.ownerId },
@@ -1712,10 +1739,10 @@ export class VibeSessionRegistry {
 		const settled = manager.getJob(jobId)?.promise;
 		if (settled) {
 			void settled.then(
-				() => reportFirstTurn("refused"),
-				() => reportFirstTurn("refused"),
+				() => endFirstTurn(false, undefined),
+				error => endFirstTurn(false, error instanceof Error ? error.message : String(error)),
 			);
-		} else reportFirstTurn("refused");
+		} else endFirstTurn(false, undefined);
 		// Topic results are read by the owner from the topic itself; they must not land in the parent conversation.
 		if (!this.policy.deliverResults) manager.acknowledgeDeliveries([jobId]);
 		turn.jobId = jobId;

@@ -11,8 +11,10 @@
 
 import type { AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache, promptBudgetTokens } from "@oh-my-pi/pi-agent-core/compaction";
-import type { Model, UserMessage } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model, UserMessage } from "@oh-my-pi/pi-ai";
+import * as AIError from "@oh-my-pi/pi-ai/error";
 import type { Settings } from "../config/settings";
+import type { AgentSessionEvent } from "./agent-session-events";
 import { cfgContextPromotionEnabled } from "./context-settings";
 import { resolveModelCompactionSettings } from "./model-compaction-threshold";
 import { resolveContextPromotionConfiguredTarget } from "./role-models";
@@ -88,12 +90,10 @@ export class InboxEpochs {
 export interface TranscriptPreamble {
 	readonly text: string;
 	/**
-	 * The longest form of the preamble within `maxTokens` (as `count` measures text), and its `tokens`; when even
-	 * its shortest form exceeds `maxTokens`, that shortest form.
+	 * The longest form of the preamble within `maxTokens` (as `count` measures text), the whole one first, and its
+	 * `tokens`; when no form fits, the one `count` finds smallest.
 	 */
 	fit(maxTokens: number, count: (text: string) => number): { text: string; tokens: number };
-	/** Told when its prompt is refused: even the shortest preamble leaves the request at `tokens`, over `limit`. */
-	refused?(tokens: number, limit: number): void;
 }
 
 /** A transcript-bound prompt refused at admission: even its shortest preamble makes the request too large. */
@@ -105,6 +105,106 @@ export class PreambleTooLargeError extends Error {
 		super(`The prompt's copied history is too large for the model: ${tokens} tokens, limit ${limit}.`);
 		this.name = "PreambleTooLargeError";
 	}
+}
+
+/** Why a launch's first request did not start: too large for its model (`seed_too_large`), or anything else. */
+export type StartFailedCode = "seed_too_large" | "start_failed";
+
+/**
+ * How a launch's first request went: `started` once the provider answered it; `start-failed` when its turn ended
+ * before that, with the `error` and, for a size cause, the request's `tokens` and the `limit` it exceeded where
+ * known; `cancelled` when the launch was aborted first.
+ */
+export type FirstTurnOutcome =
+	| { kind: "started" }
+	| { kind: "start-failed"; code: StartFailedCode; error: string; tokens?: number; limit?: number }
+	| { kind: "cancelled" };
+
+/** What {@link watchFirstTurn} reads of a session: its model and its events. */
+export interface FirstTurnSession {
+	readonly model: Model | undefined;
+	subscribe(listener: (event: AgentSessionEvent) => void): () => void;
+}
+
+/**
+ * Watch `session`'s first turn and `report` how its request went, once. It started when the provider answered:
+ * the first response content streams in, or an answer ends that is not an error. Retries inside the turn
+ * (compaction or context promotion after an overflow) count: a later answer still starts it. The returned function
+ * takes the turn and reports when it settles unstarted: `cancelled` once `signal` (the run's) aborted, else
+ * `start-failed` ({@link startFailure}). Without `report`, nothing is watched.
+ */
+export function watchFirstTurn(
+	session: FirstTurnSession,
+	signal: AbortSignal,
+	report: ((outcome: FirstTurnOutcome) => void) | undefined,
+): <T>(turn: Promise<T>) => Promise<T> {
+	if (!report) return turn => turn;
+	let started = false;
+	let failure: AssistantMessage | undefined;
+	const unsubscribe = session.subscribe(event => {
+		if (started || (event.type !== "message_update" && event.type !== "message_end")) return;
+		if (event.message.role !== "assistant") return;
+		if (event.type === "message_update") {
+			started = event.assistantMessageEvent.type !== "start";
+		} else if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
+			failure = event.message;
+		} else {
+			started = true;
+		}
+		if (!started) return;
+		unsubscribe();
+		report({ kind: "started" });
+	});
+	const settle = (error: unknown) => {
+		unsubscribe();
+		if (started) return;
+		report(signal.aborted ? { kind: "cancelled" } : startFailure(error, failure, session.model));
+	};
+	return async turn => {
+		try {
+			const value = await turn;
+			settle(undefined);
+			return value;
+		} catch (error) {
+			settle(error);
+			throw error;
+		}
+	};
+}
+
+/**
+ * Why a first turn did not start, from what it threw (`error`) or its last failed answer (`failure`): a preamble
+ * that did not fit, or a provider that refused the request as too long for `model`, is `seed_too_large`.
+ */
+function startFailure(
+	error: unknown,
+	failure: AssistantMessage | undefined,
+	model: Model | undefined,
+): FirstTurnOutcome {
+	if (error instanceof PreambleTooLargeError) {
+		return {
+			kind: "start-failed",
+			code: "seed_too_large",
+			error: error.message,
+			tokens: error.tokens,
+			limit: error.limit,
+		};
+	}
+	const contextWindow = model?.contextWindow ?? 0;
+	if (error === undefined && failure && AIError.isContextOverflow(failure, contextWindow)) {
+		return {
+			kind: "start-failed",
+			code: "seed_too_large",
+			error: failure.errorMessage ?? "The request is too long for the model.",
+			...(contextWindow > 0 ? { limit: contextWindow } : {}),
+		};
+	}
+	const reason = error instanceof Error ? error.message : error === undefined ? failure?.errorMessage : String(error);
+	return {
+		kind: "start-failed",
+		code: "start_failed",
+		error: reason || "The first request ended before the provider answered.",
+	};
 }
 
 /** The models and windows a session runs with (its registry fits each window to its settings). */
@@ -208,21 +308,18 @@ export class BoundPrompt {
 	}
 
 	/**
-	 * The last check before dispatch of `messages` (the batch, with the bare prompt): false when the transcript was
-	 * replaced (nothing is sent). Else the preamble, fitted to the model the request goes to, joins the prompt in
-	 * place, so the prompt keeps its identity (turn observation, queued-message bookkeeping), with its cached token
-	 * estimate and conversion invalidated; then the prompt is reported admitted. When even the shortest preamble
-	 * does not fit, the preamble is told and the prompt refused ({@link PreambleTooLargeError}).
+	 * The last check before dispatch of `messages` (the final batch, its notices included, with the bare prompt):
+	 * false when the transcript was replaced (nothing is sent). Else the preamble, fitted to the model the request
+	 * goes to, joins the prompt in place, so the prompt keeps its identity (turn observation, queued-message
+	 * bookkeeping), with its cached token estimate and conversion invalidated; then the prompt is reported admitted.
+	 * When even the shortest preamble does not fit, the prompt is refused ({@link PreambleTooLargeError}).
 	 */
 	admit(messages: AgentMessage[]): boolean {
 		if (this.#signal.aborted) return false;
 		if (this.#preamble) {
 			const { model, settings } = this.#session;
 			const fitted = this.#fitted(messages, model && promptLimit(model, settings));
-			if (!fitted.fits) {
-				this.#preamble.refused?.(fitted.tokens, fitted.limit);
-				throw new PreambleTooLargeError(fitted.tokens, fitted.limit);
-			}
+			if (!fitted.fits) throw new PreambleTooLargeError(fitted.tokens, fitted.limit);
 			const prompt = userPrompt(this.#prompt);
 			prompt.content = fitted.content;
 			invalidateMessageCache(prompt);

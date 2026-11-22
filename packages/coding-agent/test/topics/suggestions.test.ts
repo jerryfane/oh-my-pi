@@ -44,6 +44,7 @@ import {
 	foldSuggestions,
 	TOPIC_CONTINUED_TYPE,
 	TOPIC_ORGANISE_TYPE,
+	TOPIC_START_FAILED_TYPE,
 	TOPIC_SUGGESTION_STATE_TYPE,
 	TOPIC_SUGGESTION_TYPE,
 	TopicsError,
@@ -167,13 +168,13 @@ describe("topic suggestions", () => {
 		return host;
 	}
 
-	/** Run every topic's first turn the way the executor does (admits its prompt; leaves a child transcript, idle ref). */
+	/** Run every topic's first turn the way the executor does (its request starts; leaves a child transcript, idle ref). */
 	function mockFirstTurns(): void {
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			firstTurns.push(options);
 			// As the executor: a job aborted before it starts is refused before its first prompt.
 			if (options.signal?.aborted) return { ...resultFor(options), exitCode: 1, aborted: true };
-			options.onFirstPromptAdmitted?.();
+			options.onFirstTurn?.({ kind: "started" });
 			const childFile = path.join(
 				path.dirname(sm.getSessionFile()!),
 				path.basename(sm.getSessionFile()!, ".jsonl"),
@@ -697,7 +698,7 @@ describe("topic suggestions", () => {
 			expect(topic?.state).not.toBe("starting");
 			expect(topic?.turnStartedAt).toBeUndefined();
 			expect(firstTurns).toEqual([]);
-			expect(firstTurn.mock.calls).toEqual([["refused"]]);
+			expect(firstTurn.mock.calls).toEqual([[{ kind: "start-failed", code: "start_failed", error: "seed failed" }]]);
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
@@ -766,10 +767,9 @@ describe("topic suggestions", () => {
 		expect(topicsRegistry().worker(parent(), retried.topicId)).toBeDefined();
 	});
 
-
-	it("leaves the suggestion open and links nothing when the first turn fails before dispatch, outside the seed (#12 review)", async () => {
-		// Sizing the seed and the spawn each resolve the worker's model; building its first turn's options then
-		// fails, after the seed, before dispatch: the job records the failure and fulfils its promise.
+	it("leaves the suggestion open and links nothing when the first turn fails before dispatch, outside the seed (#12, #20 review)", async () => {
+		// Checking the seed's room and the spawn each resolve the worker's model; building its first turn's options
+		// then fails, after the seed, before dispatch: the job records the failure and fulfils its promise.
 		let modelReads = 0;
 		const failing = {
 			...parent(),
@@ -780,6 +780,8 @@ describe("topic suggestions", () => {
 		} as unknown as ToolSession;
 		const host = createTopicsHost(failing, { inbox: inbox(), summarize: async () => "SUMMARY" });
 		hosts.push(host);
+		const changes: TopicChange[] = [];
+		host.onChange(change => changes.push(change));
 		const ask = user("Plan the offsite");
 		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
 		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
@@ -792,6 +794,56 @@ describe("topic suggestions", () => {
 		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toEqual([]);
 		expect(host.suggestions().map(open => open.id)).toEqual([id]);
 		expect(topicsRegistry().worker(failing, topicId)).toBeUndefined();
+		// A start failure that is not the seed's size: the generic code, the error, one update, one note.
+		expect(changes.filter(change => change.reason === "start-failed")).toMatchObject([
+			{ id: topicId, suggestionId: id, code: "start_failed", noteWritten: true },
+		]);
+		expect(customEntries("custom_message", TOPIC_START_FAILED_TYPE)).toMatchObject([
+			{ details: { topicId, suggestionId: id, code: "start_failed", error: "no active model" } },
+		]);
+	});
+
+	it("sends the start-failed update even when its Inbox note cannot be written, saying so (#20 review)", async () => {
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
+			firstTurns.push(options);
+			options.onFirstTurn?.({ kind: "start-failed", code: "start_failed", error: "provider unavailable" });
+			return { ...resultFor(options), exitCode: 1, error: "provider unavailable" };
+		});
+		const base = inbox();
+		const failingNotes: TopicsInbox = {
+			...base,
+			appendNote: async (epoch, note) => {
+				if (note.customType === TOPIC_START_FAILED_TYPE) throw new Error("EIO: i/o error");
+				return base.appendNote(epoch, note);
+			},
+		};
+		const host = createTopicsHost(parent(), { inbox: failingNotes, summarize: async () => "SUMMARY" });
+		hosts.push(host);
+		const changes: TopicChange[] = [];
+		host.onChange(change => changes.push(change));
+		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [user("Plan the offsite")] });
+		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await manager.getJob(`${topicId}-t1`)?.promise;
+		await macrotask();
+		await macrotask();
+
+		expect(changes.filter(change => change.reason === "start-failed")).toEqual([
+			{
+				id: topicId,
+				ownerId: OWNER,
+				parentSessionId: sm.getSessionId(),
+				reason: "start-failed",
+				suggestionId: id,
+				code: "start_failed",
+				noteWritten: false,
+			},
+		]);
+		expect(customEntries("custom_message", TOPIC_START_FAILED_TYPE)).toEqual([]);
+		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+		const retried = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(retried.alreadyAccepted).toBe(false);
+		expect(retried.topicId).not.toBe(topicId);
 	});
 
 	it("never links a worker cancelled before its first prompt was admitted; the suggestion stays open (#12 review)", async () => {
