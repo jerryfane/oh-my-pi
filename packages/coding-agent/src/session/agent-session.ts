@@ -251,7 +251,6 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
-import { InboxChangedError } from "../topics/binding";
 import { topicBoardForTurn } from "../topics/board";
 import { SessionTopics, type TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
@@ -528,7 +527,7 @@ import { buildSessionMetadata } from "./session-metadata";
 import { SessionProviderBoundary, type SessionProviderBoundaryHost } from "./session-provider-boundary";
 import { SessionStatsTracker, type SessionStatsTrackerHost } from "./session-stats";
 import { promptDigestOfEntry, SessionTools, type SessionToolsHost } from "./session-tools";
-import { TranscriptIdentity } from "./transcript-identity";
+import { type InboxEpoch, InboxEpochs, StaleTranscriptError, throwIfStale } from "./inbox-epoch";
 import { resolveWebsocketPreference } from "./settings-stream-fn";
 import type { ShakeMode, ShakeResult } from "./shake-types";
 import { ToolChoiceQueue } from "./tool-choice-queue";
@@ -1192,9 +1191,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#pendingExcludedRows: CustomMessage[] = [];
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
-	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { generation?: number }>();
-	/** Which transcript is open, for work bound to one (see {@link TranscriptIdentity}). */
-	readonly #identity = new TranscriptIdentity(this);
+	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { signal?: AbortSignal }>();
+	/** The open transcript's epoch, for work bound to it (see {@link InboxEpochs}). */
+	readonly #epochs = new InboxEpochs();
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -1514,6 +1513,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	readonly #sessionTransitionScope: Disposable = {
 		[Symbol.dispose]: () => {
 			if (--this.#sessionTransitionDepth !== 0) return;
+			// Whichever transcript it settled on (a replacement or the restored one), bound work starts afresh.
+			this.#epochs.start();
 			const resolve = this.#resolveSessionTransition;
 			this.#sessionTransitionSettled = undefined;
 			this.#resolveSessionTransition = undefined;
@@ -1817,9 +1818,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// A row meant for another transcript is refused here, where it would be appended.
 		const rows: CustomMessage[] = [];
 		for (const row of this.#pendingExcludedRows.splice(0)) {
-			const expected = this.#recordedRowWaiters.get(row)?.generation;
-			if (this.#identity.matches(expected)) rows.push(row);
-			else this.#settleRecordedRow(row, new InboxChangedError());
+			if (this.#recordedRowWaiters.get(row)?.signal?.aborted) this.#settleRecordedRow(row, new StaleTranscriptError());
+			else rows.push(row);
 		}
 		if (connected) {
 			this.#recordWithoutTurn(rows);
@@ -1871,15 +1871,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * custom message, and never steers a turn. Resolves once the entry is on disk; rejects when the session
 	 * is disposed or a transition drops the row first, or when the session file cannot be written.
 	 */
-	async recordWithoutTurn(message: CustomMessage, expectedGeneration?: number): Promise<void> {
+	async recordWithoutTurn(message: CustomMessage, transcriptSignal?: AbortSignal): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
-		await this.#identity.admit(expectedGeneration);
+		throwIfStale(transcriptSignal);
 		// Decided at admission with the journal's own rule: a row it never saves would never settle.
 		if (!isJournaledCustomMessage(message)) {
 			throw new Error(`A "${message.customType}" message is never saved in the session, so it cannot be recorded.`);
 		}
 		const recorded = Promise.withResolvers<string>();
-		this.#recordedRowWaiters.set(message, { ...recorded, generation: expectedGeneration });
+		this.#recordedRowWaiters.set(message, { ...recorded, signal: transcriptSignal });
 		this.#pendingExcludedRows.push(message);
 		if (!this.isStreaming) this.#flushExcludedRows();
 		const entryId = await recorded.promise;
@@ -1891,19 +1891,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	/** The open transcript's generation (see {@link TranscriptIdentity}). */
-	get transcriptGeneration(): number {
-		return this.#identity.generation;
+	/** The open transcript's epoch; throws {@link StaleTranscriptError} at once while a replacement runs. */
+	captureInboxEpoch(): InboxEpoch {
+		return this.#epochs.capture();
 	}
 
 	/**
-	 * {@link SessionManager.appendEntriesAtomically} for the transcript of `expectedGeneration`: stale work is
-	 * refused before the write's persistence preflight, and again under the write lock; nothing is written.
+	 * {@link SessionManager.appendEntriesAtomically} for the transcript of `transcriptSignal`: work bound to a
+	 * replaced transcript is refused before the write's persistence preflight and again under its lock.
 	 */
-	async appendEntriesAtomically<T>(append: () => T, expectedGeneration?: number): Promise<T> {
-		await this.#identity.admit(expectedGeneration);
+	async appendEntriesAtomically<T>(append: () => T, transcriptSignal?: AbortSignal): Promise<T> {
+		throwIfStale(transcriptSignal);
 		return this.sessionManager.appendEntriesAtomically(() => {
-			this.#identity.check(expectedGeneration);
+			throwIfStale(transcriptSignal);
 			return append();
 		});
 	}
@@ -6826,10 +6826,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 	}
 
-	#beginSessionTransition(): Disposable {
+	/** `replaces` = false: the transition ends the Inbox epoch itself, once it knows it replaces the transcript. */
+	#beginSessionTransition(replaces = true): Disposable {
 		// Before anything awaits: a reload keeps the session id, so only the transition itself can supersede
 		// a pending idle check or an in-flight recap that belong to the transcript being replaced.
 		this.#idleMaintenance?.invalidate();
+		if (replaces) this.#epochs.end();
 		if (this.#sessionTransitionDepth++ === 0) {
 			const settled = Promise.withResolvers<void>();
 			this.#sessionTransitionSettled = settled.promise;
@@ -7565,7 +7567,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The cleared context is a new transcript: an aside or held message captured for the old one drops
 		// its record instead of landing here (mirrors newSession()).
 		this.#sessionGeneration++;
-		this.#identity.replace();
 		this.#pendingNextTurnMessages = [];
 		this.#dropPendingExcludedRows();
 		this.#experimentalContextNotesReminder = undefined;
@@ -9598,8 +9599,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
-			/** The transcript generation it is meant for; another open transcript refuses it where it would start or queue. */
-			expectedGeneration?: number;
+			/** Its transcript's epoch signal: once aborted, it is refused where it would start or queue, or dropped from the queue. */
+			transcriptSignal?: AbortSignal;
 		},
 	): Promise<boolean> {
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
@@ -9611,7 +9612,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
-			expectedGeneration?: number;
+			transcriptSignal?: AbortSignal;
 		},
 	): Promise<boolean> {
 		const followUps = this.#createPromptFollowUps(options?.followUps);
@@ -9662,7 +9663,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					queueChipText?: string;
 					queueOnly?: boolean;
 					onPromptQueued?: PromptOptions["onPromptQueued"];
-					expectedGeneration?: number;
+					transcriptSignal?: AbortSignal;
 			  })
 			| undefined,
 		outcome: PromptDispatchOutcome,
@@ -9714,7 +9715,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
 				onPromptQueued: options?.onPromptQueued,
-				expectedGeneration: options?.expectedGeneration,
+				transcriptSignal: options?.transcriptSignal,
 			});
 			// Still held only if the message was not queued (an aside whose session changed while it was prepared).
 			this.#reportDroppedCustomPrompt(message, options, followUps);
@@ -9765,7 +9766,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
 				onPromptQueued: options?.onPromptQueued,
-				expectedGeneration: options?.expectedGeneration,
+				transcriptSignal: options?.transcriptSignal,
 			});
 			// Still held only if the message was not queued (an aside whose session changed while it was prepared).
 			this.#reportDroppedCustomPrompt(message, options, followUps);
@@ -10006,8 +10007,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			acceptTerminalEmptyStop?: boolean;
 			/** Follow-ups held until this run goes live; queued behind it then. */
 			followUpBatch?: PromptFollowUps;
-			/** See {@link promptCustomMessage}'s `expectedGeneration`. */
-			expectedGeneration?: number;
+			/** See {@link promptCustomMessage}'s `transcriptSignal`. */
+			transcriptSignal?: AbortSignal;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
@@ -10015,7 +10016,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
 		// The run starts for this transcript: a transition from here on aborts its setup (prompt generation).
-		this.#identity.check(options?.expectedGeneration);
+		throwIfStale(options?.transcriptSignal);
 		const inFlightEpoch = this.#beginInFlight();
 		// Client ownership is reserved by #prompt before dispatch preprocessing
 		// and released when its bracket settles; callers that reach this
@@ -10227,6 +10228,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
+			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt.
+			if (options?.transcriptSignal?.aborted) return false;
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,
@@ -11328,8 +11331,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			onPromptAdmitted?: () => void;
 			/** Called synchronously with the messages pushed onto the queue. See {@link PromptOptions.onPromptQueued}. */
 			onPromptQueued?: (queued: readonly AgentMessage[]) => void;
-			/** Refuse the push once another transcript is open (see {@link promptCustomMessage}). */
-			expectedGeneration?: number;
+			/** See {@link promptCustomMessage}'s `transcriptSignal`. */
+			transcriptSignal?: AbortSignal;
 		},
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
@@ -11365,7 +11368,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			: await this.#buildSkillImageDescriptionNotice(normalizedAppMessage);
 		if (deliverAs === "aside") {
 			if (await this.#sessionGenerationChanged(sessionGeneration)) return;
-			this.#identity.check(options?.expectedGeneration);
+			if (options?.transcriptSignal) throw new Error("A transcript-bound message cannot be queued as an aside.");
 			// Non-interrupting: rides the same step-boundary aside poll as
 			// sendCustomMessage's streaming aside branch — not an agent-core queue
 			// entry, so no drain-retry latch and no idle-queue drain scheduling.
@@ -11382,7 +11385,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
-		this.#identity.check(options?.expectedGeneration);
+		const transcriptSignal = options?.transcriptSignal;
+		throwIfStale(transcriptSignal);
 		this.#allowQueuedMessageDrainRetry();
 		// Keyword notices and their user message must enter the queue in one synchronous phase.
 		if (deliverAs === "followUp") {
@@ -11394,6 +11398,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (descriptionNotice) this.agent.steer(descriptionNotice);
 			this.agent.steer(normalizedAppMessage);
 		}
+		// Bound to its transcript: a replacement beginning while it waits drops it before it is ever delivered.
+		transcriptSignal?.addEventListener(
+			"abort",
+			() => {
+				const queue = deliverAs === "followUp" ? "followUp" : "steering";
+				const queued = queue === "followUp" ? this.agent.peekFollowUpQueue() : this.agent.peekSteeringQueue();
+				if (!queued.includes(normalizedAppMessage)) return;
+				logger.debug("Dropped a queued message of a replaced transcript", { customType: message.customType });
+				this.agent.replaceQueue(queue, queued.filter(queuedMessage => queuedMessage !== normalizedAppMessage));
+			},
+			{ once: true },
+		);
 		onPromptQueued?.([...prependMessages, ...(descriptionNotice ? [descriptionNotice] : []), normalizedAppMessage]);
 		onPromptAdmitted?.();
 		this.#scheduleIdleQueueDrain();
@@ -12927,16 +12943,10 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				} else {
 					await this.sessionManager.flush();
 				}
-				const restoreIdentity = this.#identity.replace();
-				try {
-					await this.sessionManager.newSession({
-						...options,
-						additionalDirectories: cfgWorkspaceAdditionalDirectories.get(this.settings),
-					});
-				} catch (error) {
-					restoreIdentity();
-					throw error;
-				}
+				await this.sessionManager.newSession({
+					...options,
+					additionalDirectories: cfgWorkspaceAdditionalDirectories.get(this.settings),
+				});
 				this.#bash.markSessionTransition(bashTransition);
 				// The new session owns the transcript from here, so the previous
 				// conversation's advisor spend is retired with it. Clearing at the commit
@@ -13053,7 +13063,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async fork(entryId?: string, options?: { requireIdle?: boolean }): Promise<boolean> {
 		const queued = this.#enterSessionTransition(() => this.fork(entryId, options));
 		if (queued) return queued;
-		using _transition = this.#beginSessionTransition();
+		using _transition = this.#beginSessionTransition(false);
 		this.#assertVibeSessionTransitionAllowed("fork the session");
 		const requireIdleFor = entryId !== undefined || options?.requireIdle ? "fork the session" : undefined;
 		if (entryId !== undefined) {
@@ -13097,22 +13107,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 			// Fork the session (creates new session file with same entries)
 			let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
-			let restoreIdentity: (() => void) | undefined;
 			try {
 				// No file means fork() is a no-op. Otherwise invalidate admitted
-				// prompt setup before the asynchronous identity rewrite begins.
+				// prompt setup (and bound work) before the asynchronous identity rewrite begins.
 				if (previousSessionFile) {
 					this.#promptGeneration++;
-					restoreIdentity = this.#identity.replace();
+					this.#epochs.end();
 				}
 				forkResult = await this.sessionManager.fork();
 			} catch (error) {
-				restoreIdentity?.();
 				this.#bash.finishSessionTransition(bashTransition, false);
 				throw error;
 			}
 			if (!forkResult) {
-				restoreIdentity?.();
 				this.#bash.finishSessionTransition(bashTransition, false);
 				return false;
 			}
@@ -14734,7 +14741,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// record on success but stays valid if the switch is rolled back to this same session.
 		const previousIrcPending = this.#irc.clearPending();
 		const previousSessionGeneration = this.#sessionGeneration++;
-		let restoreIdentity: (() => void) | undefined;
 		const generationSettled = Promise.withResolvers<void>();
 		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
 		this.#sessionGenerationSettled = generationSettled.promise;
@@ -14755,8 +14761,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// The file may be reloaded at the same path with a different latest contract (or the
 			// switch rolled back via restoreState); re-read it on the next model call either way.
 			this.#sessionInit = undefined;
-			// Every switch, a reload of the same file included; a rolled-back one restores the identity.
-			restoreIdentity = this.#identity.replace();
 			await this.sessionManager.setSessionFile(sessionPath);
 			this.#bash.markSessionTransition(bashTransition);
 			const newCwd = this.sessionManager.getCwd();
@@ -14990,7 +14994,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			);
 			this.#irc.restorePending(previousIrcPending);
 			this.#sessionGeneration = previousSessionGeneration;
-			restoreIdentity?.();
 			generationSettled.resolve();
 			this.#sessionGenerationSettled = previousSessionGenerationSettled;
 			this.#pendingNextTurnMessages = previousPendingNextTurnMessages;
@@ -15185,19 +15188,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// A prompt admitted during the drain awaits above belongs to the history
 				// being replaced; the generation bump drops its pending setup.
 				this.#promptGeneration++;
-				const restoreIdentity = this.#identity.replace();
-				try {
-					if (!leafId) {
-						const title = this.sessionManager.getSessionName();
-						const titleSource = this.sessionManager.titleSource;
-						await this.sessionManager.newSession({ parentSession: previousSessionFile });
-						if (title) await this.sessionManager.setSessionName(title, titleSource);
-					} else {
-						this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
-					}
-				} catch (error) {
-					restoreIdentity();
-					throw error;
+				this.#epochs.end();
+				if (!leafId) {
+					const title = this.sessionManager.getSessionName();
+					const titleSource = this.sessionManager.titleSource;
+					await this.sessionManager.newSession({ parentSession: previousSessionFile });
+					if (title) await this.sessionManager.setSessionName(title, titleSource);
+				} else {
+					this.sessionManager.createBranchedSession(leafId, { copyArtifacts: options?.copyArtifacts });
 				}
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
@@ -15326,7 +15324,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// after the idle check. It still belongs to the pre-branch context.
 				this.#promptGeneration++;
 				this.sessionManager.createBranchedSession(leafId);
-				this.#identity.replace();
 				this.#bash.markSessionTransition(bashTransition);
 				this.#advisors.clearCost();
 				sessionTransitioned = true;
@@ -15425,7 +15422,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	): Promise<NavigateTreeResult> {
 		const queued = this.#enterSessionTransition(() => this.navigateTree(targetId, options));
 		if (queued) return queued;
-		using _transition = this.#beginSessionTransition();
+		using _transition = this.#beginSessionTransition(false);
 		await this.#bash.flushPending();
 		this.#flushExcludedRows();
 		const oldLeafId = this.sessionManager.getLeafId();
@@ -15587,7 +15584,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// All cancellation/no-op exits are behind us. Invalidate prompt setup
 		// admitted on the abandoned branch before committing any tree changes.
 		this.#promptGeneration++;
-		this.#identity.replace();
+		this.#epochs.end();
 
 		// Determine the new leaf position based on target type
 		let newLeafId: string | null;

@@ -37,7 +37,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
-import { InboxBinding, InboxChangedError } from "@oh-my-pi/pi-coding-agent/topics/binding";
+import { InboxEpochs, throwIfStale } from "@oh-my-pi/pi-coding-agent/session/inbox-epoch";
 import { afterLatestReset, type InboxMessage, type TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
@@ -102,15 +102,16 @@ describe("topic suggestions", () => {
 	let turnPending: boolean;
 	/** The open Inbox session. */
 	let inboxSm: SessionManager;
-	/** The Inbox's transcript generation: every adopted session, a reopened one included, is a new transcript. */
-	let inboxEpoch: number;
+	/** The Inbox's epochs: switching sessions (a `/new`, a fork, a reopen) ends one and starts the next. */
+	let inboxEpochs: InboxEpochs;
 	/** Awaited by every state write before it saves; a rejection fails the write. */
 	let stateWrite: (() => Promise<void>) | undefined;
 
 	/** Open `next` in the Inbox: a `/new`, a fork, or a reopen of an earlier session. */
 	function switchInbox(next: SessionManager): void {
+		inboxEpochs.end();
 		inboxSm = next;
-		inboxEpoch++;
+		inboxEpochs.start();
 	}
 
 	function parent(): ToolSession {
@@ -134,27 +135,25 @@ describe("topic suggestions", () => {
 	 * first and, like the real one, adds nothing when it fails or another transcript is open by then.
 	 */
 	function inbox(): TopicsInbox {
-		const refuseStale = (binding: InboxBinding) => {
-			if (binding.generation !== inboxEpoch) throw new InboxChangedError();
-		};
 		return {
-			bind: () => new InboxBinding(inboxEpoch, inboxSm.getSessionId(), () => inboxEpoch),
+			capture: () => inboxEpochs.capture(),
 			branch: () => afterLatestReset(inboxSm.getBranch()),
 			entries: () => inboxSm.getEntriesView(),
-			appendState: async (binding, customType, data, check) => {
+			appendState: async (epoch, customType, data, check) => {
+				throwIfStale(epoch.signal);
 				await stateWrite?.();
-				refuseStale(binding);
+				throwIfStale(epoch.signal);
 				check?.();
 				inboxSm.appendCustomEntry(customType, data);
 			},
-			appendNote: async (binding, { customType, content, details }) => {
-				if (binding.generation !== inboxEpoch) return false;
+			appendNote: async (epoch, { customType, content, details }) => {
+				if (epoch.signal.aborted) return false;
 				inboxSm.appendCustomMessageEntry(customType, content, true, details, "agent");
 				return true;
 			},
-			queueTurn: async (binding, customType, render) => {
+			queueTurn: async (epoch, customType, render) => {
 				const rendered = render();
-				refuseStale(binding);
+				throwIfStale(epoch.signal);
 				queuedTurns.push({ customType, ...rendered });
 				turnPending = true;
 				return { queued: false };
@@ -203,6 +202,13 @@ describe("topic suggestions", () => {
 		return turn;
 	}
 
+	/** Wait until `topicId`'s first turn ran and what follows its admission (the accepted state, the note) settled. */
+	async function committed(topicId: string): Promise<void> {
+		await firstTurnOf(topicId);
+		await macrotask();
+		await macrotask();
+	}
+
 	function user(text: string): string {
 		return sm.appendMessage({ role: "user", content: text, timestamp: Date.now() });
 	}
@@ -226,7 +232,7 @@ describe("topic suggestions", () => {
 		manager = new AsyncJobManager({});
 		sm = SessionManager.create(tempDir.path(), tempDir.path());
 		inboxSm = sm;
-		inboxEpoch = 0;
+		inboxEpochs = new InboxEpochs();
 		stateWrite = undefined;
 		user("hello");
 		await sm.ensureOnDisk();
@@ -323,6 +329,8 @@ describe("topic suggestions", () => {
 			topicId: accepted.topicId,
 			alreadyAccepted: true,
 		});
+		expect(await codeOf(() => host.dismissSuggestion({ suggestionId: id, by: "owner" }))).toBe("already_accepted");
+		await committed(accepted.topicId);
 		expect(await codeOf(() => host.dismissSuggestion({ suggestionId: id, by: "owner" }))).toBe("already_accepted");
 
 		const states = customEntries<CustomEntry>("custom", TOPIC_SUGGESTION_STATE_TYPE).map(entry => entry.data);
@@ -458,7 +466,7 @@ describe("topic suggestions", () => {
 		const ask = user("Book the venue");
 		const { id } = host.suggest({ title: "Venue", reason: "r", messageIds: [ask] });
 		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
-		await Bun.sleep(0);
+		await committed(topicId);
 
 		const notes = customEntries<CustomMessageEntry>("custom_message", TOPIC_CONTINUED_TYPE);
 		expect(notes).toMatchObject([
@@ -562,7 +570,7 @@ describe("topic suggestions", () => {
 		const second = host.suggest({ title: "Two", reason: "r", messageIds: [ask] });
 		await Bun.sleep(0);
 		await host.dismissSuggestion({ suggestionId: second.id, by: "owner" });
-		await host.acceptSuggestion({ suggestionId: first.id, by: "owner" });
+		await committed((await host.acceptSuggestion({ suggestionId: first.id, by: "owner" })).topicId);
 
 		const reasons = changes
 			.filter(change => change.reason.startsWith("suggest"))
@@ -576,31 +584,37 @@ describe("topic suggestions", () => {
 		expect(changes.every(change => change.ownerId === OWNER)).toBe(true);
 	});
 
-	it("deduplicates the whole accept: a repeat shares its state write and its failure, a retry reuses the topic", async () => {
+	it("joins a repeat accept while it is pending; a failed state write leaves the suggestion open, ends the topic, and a retry starts a fresh one", async () => {
 		const host = hostWith();
 		const ask = user("Plan the offsite");
 		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
 		const write = Promise.withResolvers<void>();
 		stateWrite = () => write.promise;
 
-		const first = host.acceptSuggestion({ suggestionId: id, by: "owner" });
-		const repeat = host.acceptSuggestion({ suggestionId: id, by: "guest Anna" });
+		const first = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(await host.acceptSuggestion({ suggestionId: id, by: "guest Anna" })).toEqual({
+			topicId: first.topicId,
+			alreadyAccepted: true,
+		});
+		expect(host.suggestions()).toEqual([]);
+		await firstTurnOf(first.topicId);
 		write.reject(new Error("disk full"));
-		const outcomes = await Promise.allSettled([first, repeat]);
-		expect(outcomes.map(outcome => (outcome.status === "rejected" ? String(outcome.reason) : outcome.status))).toEqual([
-			"Error: disk full",
-			"Error: disk full",
-		]);
+		await macrotask();
+		await macrotask();
 		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
 		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toEqual([]);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+		expect(topicsRegistry().worker(parent(), first.topicId)).toBeUndefined();
 
 		stateWrite = undefined;
 		const retried = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
 		expect(retried.alreadyAccepted).toBe(false);
-		expect(topicsRegistry().describe(parent()).map(topic => topic.id)).toEqual([retried.topicId]);
+		expect(retried.topicId).not.toBe(first.topicId);
+		await committed(retried.topicId);
 		expect(customEntries<CustomEntry>("custom", TOPIC_SUGGESTION_STATE_TYPE).map(entry => entry.data)).toMatchObject([
 			{ id, state: "accepted", topicId: retried.topicId },
 		]);
+		expect(topicsRegistry().worker(parent(), retried.topicId)).toBeDefined();
 	});
 
 	it("refuses an accept whose Inbox session changed, writing nothing into the new one", async () => {
@@ -653,7 +667,7 @@ describe("topic suggestions", () => {
 				name: "Seedless",
 				prompt: "go",
 				title: "Seedless",
-				seed: { build: seed, stillWanted: () => true },
+				seed: { build: seed, dispatch: () => {} },
 			});
 			// Two macrotask turns: anything rejected and unowned by now is reported as unhandled.
 			await macrotask();
@@ -687,42 +701,55 @@ describe("topic suggestions", () => {
 			.filter(entry => entry.type === "custom" && entry.customType === TOPIC_SUGGESTION_STATE_TYPE);
 	}
 
-	it("refuses a retried accept in a fork after the accepted state failed to save, writing nothing there", async () => {
+	it("never links a topic its Inbox does not list: an ENOSPC accepted-state write, then a fork, then a retry there", async () => {
 		const host = hostWith();
 		const ask = user("Plan the offsite");
 		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
 		stateWrite = () => Promise.reject(Object.assign(new Error("ENOSPC: no space left on device"), { code: "ENOSPC" }));
-		await expect(host.acceptSuggestion({ suggestionId: id, by: "owner" })).rejects.toThrow("ENOSPC");
+		const first = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await committed(first.topicId);
 		expect(acceptedStates(sm)).toEqual([]);
+		expect(topicsRegistry().worker(parent(), first.topicId)).toBeUndefined();
 
 		stateWrite = undefined;
 		await sm.flush();
 		const fork = await forkOfInbox();
 		switchInbox(fork);
 		expect(host.suggestions().map(open => open.id)).toEqual([id]);
-		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
-		expect(acceptedStates(fork)).toEqual([]);
+		const retried = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(retried.topicId).not.toBe(first.topicId);
+		await committed(retried.topicId);
+		expect(acceptedStates(fork)).toMatchObject([{ data: { id, state: "accepted", topicId: retried.topicId } }]);
+		expect(topicsRegistry().worker(parent(), retried.topicId)).toBeDefined();
 		expect(acceptedStates(sm)).toEqual([]);
 	});
 
-	it("refuses a retried accept after /new and a reopen of the original Inbox: no false success", async () => {
+	it("never links an accept whose commit crossed /new; after a reopen, a retry starts a fresh live topic", async () => {
 		const host = hostWith();
 		const ask = user("Book the venue");
 		const { id } = host.suggest({ title: "Venue", reason: "r", messageIds: [ask] });
 		const write = Promise.withResolvers<void>();
 		stateWrite = () => write.promise;
-		const accepting = host.acceptSuggestion({ suggestionId: id, by: "owner" });
-		await Bun.sleep(0);
+		const first = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await firstTurnOf(first.topicId);
 		// `/new` completes while the accepted state is being saved, then the original Inbox is reopened.
 		switchInbox(SessionManager.create(tempDir.path(), tempDir.path()));
 		write.resolve();
-		expect(await codeOf(() => accepting)).toBe("suggestion_not_found");
+		await macrotask();
+		await macrotask();
 		stateWrite = undefined;
 		switchInbox(sm);
-
-		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }))).toBe("suggestion_not_found");
 		expect(acceptedStates(sm)).toEqual([]);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+
+		const retried = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(retried).toEqual({ topicId: expect.any(String), alreadyAccepted: false });
+		expect(retried.topicId).not.toBe(first.topicId);
+		await committed(retried.topicId);
+		expect(acceptedStates(sm)).toMatchObject([{ data: { topicId: retried.topicId } }]);
+		expect(topicsRegistry().worker(parent(), retried.topicId)).toBeDefined();
 	});
+
 
 	it("queues one Organise turn naming the Inbox messages, and refuses another while it is pending", async () => {
 		const host = hostWith();
@@ -751,7 +778,7 @@ describe("seed summary model", () => {
 		expect(settings.getModelRole("smol")).toBeUndefined();
 		const session = { settings, modelRegistry: registry } as unknown as ToolSession;
 
-		const origin = new InboxBinding(0, "s1", () => 0);
+		const origin = { sessionId: "s1", signal: new AbortController().signal };
 		expect(await smolSeedSummarizer(session)("<message>older</message>", origin)).toBe("CONDENSED");
 		expect(mock.calls).toHaveLength(1);
 	});

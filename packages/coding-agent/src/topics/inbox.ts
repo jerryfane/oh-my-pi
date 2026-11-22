@@ -2,13 +2,14 @@
  * What the topics host needs from the Inbox (the top-level session): its
  * entries, hidden state entries, visible notes that never start or interrupt a
  * turn, and one queued turn (Organise) that never interrupts a running one.
- * Every write and turn carries an {@link InboxBinding}; the session checks it
- * where the effect happens, so nothing meant for one transcript lands in the next.
+ * Every write and turn carries the {@link InboxEpoch} it was captured in; the
+ * session drops it wherever that epoch has been aborted (its transcript is being
+ * or was replaced), so nothing meant for one transcript lands in the next.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
-import { InboxBinding } from "./binding";
+import { type InboxEpoch, StaleTranscriptError } from "../session/inbox-epoch";
 
 /** A custom message for the Inbox. */
 export interface InboxMessage {
@@ -18,8 +19,8 @@ export interface InboxMessage {
 }
 
 export interface TopicsInbox {
-	/** Bind to the open Inbox transcript. */
-	bind(): InboxBinding;
+	/** The open Inbox transcript's epoch; throws {@link StaleTranscriptError} at once while it is being replaced. */
+	capture(): InboxEpoch;
 	/**
 	 * The open transcript's conversation as the model has it: the current branch after its latest reset
 	 * (`/clear`), root first. Message indexes and message-id checks use this.
@@ -29,26 +30,26 @@ export interface TopicsInbox {
 	entries(): readonly SessionEntry[];
 	/**
 	 * Append a hidden custom entry to the bound transcript, all or nothing: it resolves once the entry is
-	 * on disk; a failed write leaves no entry behind and rejects. Under the write lock the session refuses
-	 * another open transcript ({@link InboxChangedError}) and `check` runs; either refusal writes nothing.
+	 * on disk; a failed write leaves no entry behind and rejects. An aborted `epoch` is refused
+	 * ({@link StaleTranscriptError}) before and under the write lock, where `check` runs too; refusals write nothing.
 	 */
-	appendState(binding: InboxBinding, customType: string, data: unknown, check?: () => void): Promise<void>;
+	appendState(epoch: InboxEpoch, customType: string, data: unknown, check?: () => void): Promise<void>;
 	/**
 	 * Record a visible custom message in the bound transcript that the model sees from its next turn on
 	 * ({@link AgentSession.recordWithoutTurn}): now while the Inbox is idle, else at its running turn's
 	 * boundary. It never starts or interrupts a turn. Resolves true once it is on disk; false when another
 	 * transcript is open where it would be appended, or it was dropped or could not be written.
 	 */
-	appendNote(binding: InboxBinding, message: InboxMessage): Promise<boolean>;
+	appendNote(epoch: InboxEpoch, message: InboxMessage): Promise<boolean>;
 	/**
 	 * Run the hidden `customType` message `render()` returns as one Inbox turn of the bound transcript, never
 	 * overtaking or interrupting other work: behind prompts still in setup, then started at once when idle,
-	 * else queued as a follow-up. The session refuses another open transcript where the turn would start or
-	 * queue ({@link InboxChangedError}): nothing is sent or saved. Resolves once the turn started
+	 * else queued as a follow-up. An aborted `epoch` refuses it where it would start or queue, and drops it
+	 * from the queue ({@link StaleTranscriptError}): nothing is sent or saved. Resolves once the turn started
 	 * (`queued: false`) or was queued (`queued: true`).
 	 */
 	queueTurn(
-		binding: InboxBinding,
+		epoch: InboxEpoch,
 		customType: string,
 		render: () => Pick<InboxMessage, "content" | "details">,
 	): Promise<{ queued: boolean }>;
@@ -78,22 +79,16 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 	const manager = session.sessionManager;
 
 	return {
-		// Bound during a transition, the transcript is provisional: such a binding matches none.
-		bind: () =>
-			new InboxBinding(
-				session.isSessionTransitioning ? Number.NaN : session.transcriptGeneration,
-				manager.getSessionId(),
-				() => session.transcriptGeneration,
-			),
+		capture: () => session.captureInboxEpoch(),
 		branch: () => afterLatestReset(manager.getBranch()),
 		entries: () => manager.getEntriesView(),
-		async appendState(binding, customType, data, check) {
+		async appendState(epoch, customType, data, check) {
 			await session.appendEntriesAtomically(() => {
 				check?.();
 				manager.appendCustomEntry(customType, data);
-			}, binding.generation);
+			}, epoch.signal);
 		},
-		async appendNote(binding, { customType, content, details }) {
+		async appendNote(epoch, { customType, content, details }) {
 			try {
 				await session.recordWithoutTurn(
 					{
@@ -105,7 +100,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 						attribution: "agent",
 						timestamp: Date.now(),
 					},
-					binding.generation,
+					epoch.signal,
 				);
 				return true;
 			} catch (error) {
@@ -116,7 +111,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				return false;
 			}
 		},
-		async queueTurn(binding, customType, render) {
+		async queueTurn(epoch, customType, render) {
 			const outcome = Promise.withResolvers<{ queued: boolean }>();
 			const turn: PendingTurn = {
 				dispatching: true,
@@ -159,7 +154,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 					{ customType, content, display: false, details, attribution: "user" },
 					{
 						streamingBehavior: "followUp",
-						expectedGeneration: binding.generation,
+						transcriptSignal: epoch.signal,
 						onPromptQueued: () => {
 							turn.queued = true;
 							outcome.resolve({ queued: true });
@@ -171,7 +166,9 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 						turn.dispatching = false;
 						if (turn.started || turn.queued) return;
 						turn.done();
-						outcome.reject(new Error("The Inbox turn was not started."));
+						outcome.reject(
+							epoch.signal.aborted ? new StaleTranscriptError() : new Error("The Inbox turn was not started."),
+						);
 					},
 					error => {
 						logger.warn("topics: Inbox turn not started", {
