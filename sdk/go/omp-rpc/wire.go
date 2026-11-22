@@ -3372,6 +3372,36 @@ func (v *TopicSummaryState) UnmarshalJSON(data []byte) error {
 	return unknownValue("TopicSummaryState", s)
 }
 
+// An open topic suggestion of the Inbox model.
+type TopicSuggestion struct {
+	// Suggestion id (`sg_…`).
+	ID     string `json:"id"`
+	Title  string `json:"title"`
+	Reason string `json:"reason"`
+	// Session entry ids of the Inbox messages the suggestion covers.
+	MessageIds []string `json:"messageIds"`
+	CreatedMs  int64    `json:"createdMs"`
+}
+
+func (v *TopicSuggestion) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicSuggestion", v.decodeFrom)
+}
+
+func (v *TopicSuggestion) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicSuggestion
+	d := fieldDecoder{raw: raw, owner: "TopicSuggestion"}
+	d.required("id", &out.ID)
+	d.required("title", &out.Title)
+	d.required("reason", &out.Reason)
+	d.required("messageIds", &out.MessageIds)
+	d.required("createdMs", &out.CreatedMs)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 // Incremental subagent transcript read.
 type SubagentMessages struct {
 	SessionFile string `json:"sessionFile"`
@@ -7514,7 +7544,8 @@ func (v *CancelSubagentResult) decodeFrom(raw map[string]json.RawMessage) error 
 }
 
 type TopicsListResult struct {
-	Topics []TopicSummary `json:"topics"`
+	Topics      []TopicSummary    `json:"topics"`
+	Suggestions []TopicSuggestion `json:"suggestions"`
 }
 
 func (v *TopicsListResult) UnmarshalJSON(data []byte) error {
@@ -7525,6 +7556,7 @@ func (v *TopicsListResult) decodeFrom(raw map[string]json.RawMessage) error {
 	var out TopicsListResult
 	d := fieldDecoder{raw: raw, owner: "TopicsListResult"}
 	d.required("topics", &out.Topics)
+	d.required("suggestions", &out.Suggestions)
 	if d.err != nil {
 		return d.err
 	}
@@ -7591,6 +7623,66 @@ func (v *TopicsSendResultMode) UnmarshalJSON(data []byte) error {
 		return nil
 	}
 	return unknownValue("TopicsSendResultMode", s)
+}
+
+type TopicsAcceptSuggestionResult struct {
+	TopicID         string `json:"topicId"`
+	AlreadyAccepted bool   `json:"alreadyAccepted"`
+}
+
+func (v *TopicsAcceptSuggestionResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsAcceptSuggestionResult", v.decodeFrom)
+}
+
+func (v *TopicsAcceptSuggestionResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsAcceptSuggestionResult
+	d := fieldDecoder{raw: raw, owner: "TopicsAcceptSuggestionResult"}
+	d.required("topicId", &out.TopicID)
+	d.required("alreadyAccepted", &out.AlreadyAccepted)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicsDismissSuggestionResult struct {
+	AlreadyDismissed bool `json:"alreadyDismissed"`
+}
+
+func (v *TopicsDismissSuggestionResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsDismissSuggestionResult", v.decodeFrom)
+}
+
+func (v *TopicsDismissSuggestionResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsDismissSuggestionResult
+	d := fieldDecoder{raw: raw, owner: "TopicsDismissSuggestionResult"}
+	d.required("alreadyDismissed", &out.AlreadyDismissed)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type TopicsOrganiseResult struct {
+	// The Inbox was busy; the turn runs after the current one.
+	Queued bool `json:"queued"`
+}
+
+func (v *TopicsOrganiseResult) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "TopicsOrganiseResult", v.decodeFrom)
+}
+
+func (v *TopicsOrganiseResult) decodeFrom(raw map[string]json.RawMessage) error {
+	var out TopicsOrganiseResult
+	d := fieldDecoder{raw: raw, owner: "TopicsOrganiseResult"}
+	d.required("queued", &out.Queued)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
 }
 
 type LiveStartResult struct {
@@ -8292,20 +8384,22 @@ func (c Commands) SteerSubagent(ctx context.Context, p SteerSubagentCommand) err
 	return c.call(ctx, "steer_subagent", p, 0, nil)
 }
 
-// TopicsList sends "topics_list": List the owner's topics (persistent workers), newest activity first.
-func (c Commands) TopicsList(ctx context.Context) ([]TopicSummary, error) {
+// TopicsList sends "topics_list": List the owner's topics (persistent workers), newest activity first, and the open topic suggestions.
+func (c Commands) TopicsList(ctx context.Context) (TopicsListResult, error) {
 	var out TopicsListResult
 	err := c.call(ctx, "topics_list", nil, 0, &out)
-	return out.Topics, err
+	return out, err
 }
 
 // TopicsNewCommand holds the parameters of "topics_new".
 type TopicsNewCommand struct {
 	Title   string `json:"title"`
 	Message string `json:"message"`
+	// Inbox user/assistant message entry ids copied into the topic.
+	SeedMessageIds []string `json:"seedMessageIds,omitempty"`
 }
 
-// TopicsNew sends "topics_new": Start a topic with a title and its first message.
+// TopicsNew sends "topics_new": Start a topic with a title and its first message, optionally seeded with Inbox messages.
 func (c Commands) TopicsNew(ctx context.Context, p TopicsNewCommand) (string, error) {
 	var out TopicsNewResult
 	err := c.call(ctx, "topics_new", p, 0, &out)
@@ -8367,6 +8461,47 @@ type TopicsRenameCommand struct {
 // TopicsRename sends "topics_rename": Change a topic's title.
 func (c Commands) TopicsRename(ctx context.Context, p TopicsRenameCommand) error {
 	return c.call(ctx, "topics_rename", p, 0, nil)
+}
+
+// TopicsAcceptSuggestionCommand holds the parameters of "topics_accept_suggestion".
+type TopicsAcceptSuggestionCommand struct {
+	SuggestionID string `json:"suggestionId"`
+	// Who accepted, as the host names them.
+	By string `json:"by"`
+}
+
+// TopicsAcceptSuggestion sends "topics_accept_suggestion": Start the suggested topic, seeded with all of its Inbox messages; returns before the seed is ready.
+func (c Commands) TopicsAcceptSuggestion(ctx context.Context, p TopicsAcceptSuggestionCommand) (TopicsAcceptSuggestionResult, error) {
+	var out TopicsAcceptSuggestionResult
+	err := c.call(ctx, "topics_accept_suggestion", p, 0, &out)
+	return out, err
+}
+
+// TopicsDismissSuggestionCommand holds the parameters of "topics_dismiss_suggestion".
+type TopicsDismissSuggestionCommand struct {
+	SuggestionID string `json:"suggestionId"`
+	// Who dismissed, as the host names them.
+	By string `json:"by"`
+}
+
+// TopicsDismissSuggestion sends "topics_dismiss_suggestion": Dismiss a topic suggestion.
+func (c Commands) TopicsDismissSuggestion(ctx context.Context, p TopicsDismissSuggestionCommand) (TopicsDismissSuggestionResult, error) {
+	var out TopicsDismissSuggestionResult
+	err := c.call(ctx, "topics_dismiss_suggestion", p, 0, &out)
+	return out, err
+}
+
+// TopicsOrganiseCommand holds the parameters of "topics_organise".
+type TopicsOrganiseCommand struct {
+	// Who asked, as the host names them.
+	By string `json:"by"`
+}
+
+// TopicsOrganise sends "topics_organise": Queue one Inbox turn that reviews the history and suggests topics; never interrupts a running turn.
+func (c Commands) TopicsOrganise(ctx context.Context, p TopicsOrganiseCommand) (TopicsOrganiseResult, error) {
+	var out TopicsOrganiseResult
+	err := c.call(ctx, "topics_organise", p, 0, &out)
+	return out, err
 }
 
 // LiveStartCommand holds the parameters of "live_start".

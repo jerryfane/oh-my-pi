@@ -946,6 +946,18 @@ class TopicSummary:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class TopicSuggestion:
+    """An open topic suggestion of the Inbox model."""
+    id: str
+    """Suggestion id (`sg_…`)."""
+    title: str
+    reason: str
+    message_ids: tuple[str, ...]
+    """Session entry ids of the Inbox messages the suggestion covers."""
+    created_ms: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SubagentMessages:
     """Incremental subagent transcript read."""
     session_file: str
@@ -1726,9 +1738,32 @@ class NegotiateProtocolResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class TopicsListResult:
+    topics: tuple[TopicSummary, ...]
+    suggestions: tuple[TopicSuggestion, ...]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class TopicsSendResult:
     topic_id: str
     mode: Literal["steered", "queued", "turn"]
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class TopicsAcceptSuggestionResult:
+    topic_id: str
+    already_accepted: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class TopicsDismissSuggestionResult:
+    already_dismissed: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class TopicsOrganiseResult:
+    queued: bool
+    """The Inbox was busy; the turn runs after the current one."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2401,6 +2436,17 @@ def parse_topic_summary(value: object, path: str = "TopicSummary") -> TopicSumma
         owner_line=optional(payload, "ownerLine", decode_str, path),
         session_file=optional(payload, "sessionFile", decode_str, path),
         turn_started_at=optional(payload, "turnStartedAt", decode_int, path),
+    )
+
+
+def parse_topic_suggestion(value: object, path: str = "TopicSuggestion") -> TopicSuggestion:
+    payload = expect_object(value, path)
+    return TopicSuggestion(
+        id=required(payload, "id", decode_str, path),
+        title=required(payload, "title", decode_str, path),
+        reason=required(payload, "reason", decode_str, path),
+        message_ids=required(payload, "messageIds", array(decode_str), path),
+        created_ms=required(payload, "createdMs", decode_int, path),
     )
 
 
@@ -3273,11 +3319,41 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_topics_list_result(value: object, path: str = "TopicsListResult") -> TopicsListResult:
+    payload = expect_object(value, path)
+    return TopicsListResult(
+        topics=required(payload, "topics", array(parse_topic_summary), path),
+        suggestions=required(payload, "suggestions", array(parse_topic_suggestion), path),
+    )
+
+
 def parse_topics_send_result(value: object, path: str = "TopicsSendResult") -> TopicsSendResult:
     payload = expect_object(value, path)
     return TopicsSendResult(
         topic_id=required(payload, "topicId", decode_str, path),
         mode=required(payload, "mode", cast('Decoder[Literal["steered", "queued", "turn"]]', literal(frozenset({"steered", "queued", "turn"}))), path),
+    )
+
+
+def parse_topics_accept_suggestion_result(value: object, path: str = "TopicsAcceptSuggestionResult") -> TopicsAcceptSuggestionResult:
+    payload = expect_object(value, path)
+    return TopicsAcceptSuggestionResult(
+        topic_id=required(payload, "topicId", decode_str, path),
+        already_accepted=required(payload, "alreadyAccepted", decode_bool, path),
+    )
+
+
+def parse_topics_dismiss_suggestion_result(value: object, path: str = "TopicsDismissSuggestionResult") -> TopicsDismissSuggestionResult:
+    payload = expect_object(value, path)
+    return TopicsDismissSuggestionResult(
+        already_dismissed=required(payload, "alreadyDismissed", decode_bool, path),
+    )
+
+
+def parse_topics_organise_result(value: object, path: str = "TopicsOrganiseResult") -> TopicsOrganiseResult:
+    payload = expect_object(value, path)
+    return TopicsOrganiseResult(
+        queued=required(payload, "queued", decode_bool, path),
     )
 
 
@@ -3581,16 +3657,18 @@ class WireClient:
         params["message"] = message
         self._command("steer_subagent", params)
 
-    def topics_list(self) -> tuple[TopicSummary, ...]:
-        """List the owner's topics (persistent workers), newest activity first."""
+    def topics_list(self) -> TopicsListResult:
+        """List the owner's topics (persistent workers), newest activity first, and the open topic suggestions."""
         params: dict[str, object] = {}
-        return required(expect_object(self._command("topics_list", params), "topics_list"), "topics", array(parse_topic_summary), "topics_list")
+        return parse_topics_list_result(self._command("topics_list", params), "topics_list")
 
-    def topics_new(self, title: str, message: str) -> str:
-        """Start a topic with a title and its first message."""
+    def topics_new(self, title: str, message: str, *, seed_message_ids: Sequence[str] | None = None) -> str:
+        """Start a topic with a title and its first message, optionally seeded with Inbox messages."""
         params: dict[str, object] = {}
         params["title"] = title
         params["message"] = message
+        if seed_message_ids is not None:
+            params["seedMessageIds"] = list(seed_message_ids)
         return required(expect_object(self._command("topics_new", params), "topics_new"), "topicId", decode_str, "topics_new")
 
     def topics_send(self, topic_id: str, message: str) -> TopicsSendResult:
@@ -3626,6 +3704,26 @@ class WireClient:
         params["topicId"] = topic_id
         params["title"] = title
         self._command("topics_rename", params)
+
+    def topics_accept_suggestion(self, suggestion_id: str, by: str) -> TopicsAcceptSuggestionResult:
+        """Start the suggested topic, seeded with all of its Inbox messages; returns before the seed is ready."""
+        params: dict[str, object] = {}
+        params["suggestionId"] = suggestion_id
+        params["by"] = by
+        return parse_topics_accept_suggestion_result(self._command("topics_accept_suggestion", params), "topics_accept_suggestion")
+
+    def topics_dismiss_suggestion(self, suggestion_id: str, by: str) -> TopicsDismissSuggestionResult:
+        """Dismiss a topic suggestion."""
+        params: dict[str, object] = {}
+        params["suggestionId"] = suggestion_id
+        params["by"] = by
+        return parse_topics_dismiss_suggestion_result(self._command("topics_dismiss_suggestion", params), "topics_dismiss_suggestion")
+
+    def topics_organise(self, by: str) -> TopicsOrganiseResult:
+        """Queue one Inbox turn that reviews the history and suggests topics; never interrupts a running turn."""
+        params: dict[str, object] = {}
+        params["by"] = by
+        return parse_topics_organise_result(self._command("topics_organise", params), "topics_organise")
 
     def live_start(self, *, voice: str | None = None, instructions: str | None = None) -> str:
         """Start a live voice session bound to this session; returns the voice in use."""
@@ -4337,7 +4435,12 @@ __all__ = [
     "ToolLoadMode",
     "ToolResultMessage",
     "ToolStreamUpdateEvent",
+    "TopicSuggestion",
     "TopicSummary",
+    "TopicsAcceptSuggestionResult",
+    "TopicsDismissSuggestionResult",
+    "TopicsListResult",
+    "TopicsOrganiseResult",
     "TopicsSendResult",
     "TtsrTriggeredEvent",
     "TurnEndEvent",
@@ -4510,7 +4613,12 @@ __all__ = [
     "parse_tool_execution_update_event",
     "parse_tool_result_message",
     "parse_tool_stream_update_event",
+    "parse_topic_suggestion",
     "parse_topic_summary",
+    "parse_topics_accept_suggestion_result",
+    "parse_topics_dismiss_suggestion_result",
+    "parse_topics_list_result",
+    "parse_topics_organise_result",
     "parse_topics_send_result",
     "parse_ttsr_triggered_event",
     "parse_turn_end_event",

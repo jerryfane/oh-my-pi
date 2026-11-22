@@ -12,6 +12,7 @@ import topicBoardPrompt from "../prompts/system/topic-board.md" with { type: "te
 import type { CustomMessage } from "../session/messages";
 import type { WorkerSummary } from "../vibe/worker-scope";
 import type { TopicsHost } from "./host";
+import type { SuggestionBoard } from "./suggestions";
 
 /** `customType` of the topic board message. */
 export const TOPIC_BOARD_CONTEXT_TYPE = "topic-board";
@@ -69,12 +70,24 @@ function byNewestActivity(a: WorkerSummary, b: WorkerSummary): number {
 }
 
 /**
- * The board text for `topics`, or `undefined` when there are none. One row per
- * topic: open ones first, then closed ones, each newest activity first; past
- * {@link TOPIC_BOARD_FULL_ROWS} rows, title and id only.
+ * The board text for `topics`, or `undefined` when there are none and the
+ * Inbox has no suggestions to list. One row per topic: open ones first, then
+ * closed ones, each newest activity first; past {@link TOPIC_BOARD_FULL_ROWS}
+ * rows, title and id only. The Inbox's board (`suggestions`) also lists the
+ * open suggestions and the latest dismissed titles.
  */
-export function formatTopicBoard(topics: readonly WorkerSummary[], audience: TopicBoardAudience): string | undefined {
-	if (topics.length === 0) return undefined;
+export function formatTopicBoard(
+	topics: readonly WorkerSummary[],
+	audience: TopicBoardAudience,
+	suggestions?: SuggestionBoard,
+): string | undefined {
+	const listed = audience === "inbox" ? suggestions : undefined;
+	const suggested = (listed?.open ?? []).map(
+		suggestion =>
+			`- ${field(suggestion.title)} (suggestion ${field(suggestion.id)}, ${suggestion.messageIds.length} messages): ${field(suggestion.reason)}`,
+	);
+	const dismissed = (listed?.dismissed ?? []).map(title => `- ${field(title)}`);
+	if (topics.length === 0 && suggested.length === 0 && dismissed.length === 0) return undefined;
 	const open = topics.filter(topic => topic.state !== "closed").sort(byNewestActivity);
 	const closed = topics.filter(topic => topic.state === "closed").sort(byNewestActivity);
 	const rows = [...open, ...closed].map((topic, index) => {
@@ -88,6 +101,8 @@ export function formatTopicBoard(topics: readonly WorkerSummary[], audience: Top
 			overflow: rows.length > TOPIC_BOARD_FULL_ROWS,
 			cap: TOPIC_BOARD_FULL_ROWS,
 			rows: rows.join("\n"),
+			suggestions: suggested.join("\n"),
+			dismissed: dismissed.join("\n"),
 		})
 		.trim();
 }
@@ -115,12 +130,14 @@ export function topicBoardMessage(
 /**
  * The board message for a session's next turn ({@link topicBoardMessage}): a
  * topic worker's comes with its prompt (`supplied`, its siblings); the Inbox
- * builds its own from its topics.
+ * builds its own from its topics and suggestions.
  */
 export async function topicBoardForTurn(
 	supplied: string | undefined,
 	topics: () => Promise<TopicsHost | undefined>,
 	history: readonly AgentMessage[],
 ): Promise<CustomMessage | undefined> {
-	return topicBoardMessage(supplied ?? formatTopicBoard((await topics())?.list() ?? [], "inbox"), history);
+	if (supplied !== undefined) return topicBoardMessage(supplied, history);
+	const host = await topics();
+	return topicBoardMessage(host && formatTopicBoard(host.list(), "inbox", host.suggestionBoard()), history);
 }

@@ -20,6 +20,7 @@ import {
 	type TopicsControlEndpoint,
 } from "@oh-my-pi/pi-coding-agent/topics/control";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
+import { TopicsError, type TopicsErrorCode } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
 import type { TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { WorkerChange } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -47,6 +48,14 @@ function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 		reopen: async () => {},
 		rename: async () => {},
 		restore: async () => 0,
+		suggestions: () => [],
+		suggestionBoard: () => ({ open: [], dismissed: [] }),
+		suggest: () => {
+			throw new Error("not in this fake");
+		},
+		acceptSuggestion: async () => ({ topicId: "New", alreadyAccepted: false }),
+		dismissSuggestion: () => ({ alreadyDismissed: false }),
+		organise: () => ({ queued: false }),
 		onChange(listener) {
 			listeners.add(listener);
 			return () => listeners.delete(listener);
@@ -196,6 +205,62 @@ describe("topics control socket", () => {
 		});
 		client.send({ id: "2", type: "topics_list" });
 		expect(await client.next()).toMatchObject({ id: "2", success: true, data: { topics: [{ id: "Diokan" }] } });
+		client.end();
+	});
+
+	it("carries code next to error on refusals with a machine-readable reason", async () => {
+		stop?.();
+		const refusals: Record<string, TopicsErrorCode> = {
+			accept: "suggestion_not_found",
+			dismiss: "already_accepted",
+			seed: "invalid_message_ids",
+			organise: "organise_running",
+		};
+		const host: TopicsHost = {
+			...fakeHost(sent),
+			acceptSuggestion: async () => {
+				throw new TopicsError(refusals.accept!, "Unknown suggestion: sg_x");
+			},
+			dismissSuggestion: () => {
+				throw new TopicsError(refusals.dismiss!, "Suggestion sg_x was already accepted.");
+			},
+			create: async () => {
+				throw new TopicsError(refusals.seed!, "Not user or assistant text messages: e1.");
+			},
+			organise: () => {
+				throw new TopicsError(refusals.organise!, "An Organise turn is already queued or running.");
+			},
+		};
+		let enabled = true;
+		stop = await startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => (enabled ? host : undefined) });
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		await client.next();
+		const frames: Record<string, object> = {
+			accept: { type: "topics_accept_suggestion", suggestionId: "sg_x", by: "owner" },
+			dismiss: { type: "topics_dismiss_suggestion", suggestionId: "sg_x", by: "owner" },
+			seed: { type: "topics_new", title: "T", message: "m", seedMessageIds: ["e1"] },
+			organise: { type: "topics_organise", by: "owner" },
+		};
+		for (const [id, frame] of Object.entries(frames)) {
+			client.send({ id, ...frame });
+			expect(await client.next()).toMatchObject({ id, success: false, code: refusals[id], error: expect.any(String) });
+		}
+		client.send({ id: "plain", type: "topics_send", topicId: "Diokan", message: "" });
+		const plain = await client.next();
+		expect(plain).toMatchObject({ id: "plain", success: false, error: "`message` must be a non-empty string." });
+		expect(plain).not.toHaveProperty("code");
+
+		enabled = false;
+		client.send({ id: "off", type: "topics_list" });
+		expect(await client.next()).toEqual({
+			id: "off",
+			type: "response",
+			command: "topics_list",
+			success: false,
+			error: "Topics are disabled.",
+			code: "topics_disabled",
+		});
 		client.end();
 	});
 

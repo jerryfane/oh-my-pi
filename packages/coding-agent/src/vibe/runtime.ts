@@ -877,10 +877,13 @@ export class VibeSessionRegistry {
 		return restored;
 	}
 
-	/** Spawn a persistent worker session and start its first turn in the background. */
+	/**
+	 * Spawn a persistent worker session and start its first turn in the background.
+	 * `seed` (must not reject) is awaited before that turn starts and put ahead of `prompt`.
+	 */
 	async spawn(
 		session: ToolSession,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: Promise<string> },
 	): Promise<VibeSpawnOutcome> {
 		const scope = this.ownerScope(session);
 		return this.#withTerminationLock(scope, () => this.#spawnLocked(session, scope, args));
@@ -889,7 +892,7 @@ export class VibeSessionRegistry {
 	async #spawnLocked(
 		session: ToolSession,
 		scope: VibeOwnerScope,
-		args: { cli: VibeCli; name?: string; prompt: string; title?: string },
+		args: { cli: VibeCli; name?: string; prompt: string; title?: string; seed?: Promise<string> },
 	): Promise<VibeSpawnOutcome> {
 		if (this.#terminatedScopes.has(scopeKey(scope, ""))) {
 			throw new ToolError("Vibe mode has exited; enter Vibe mode again before spawning a worker.");
@@ -952,7 +955,7 @@ export class VibeSessionRegistry {
 				);
 				if (!spawnPersisted) throw new ToolError("Vibe parent session changed before the worker could start.");
 			}
-			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true });
+			const jobId = this.#registerTurnJob(session, manager, record, args.prompt, { first: true, seed: args.seed });
 			this.#emit(record, "spawned");
 			return { id, jobId };
 		} catch (error) {
@@ -1578,7 +1581,7 @@ export class VibeSessionRegistry {
 		manager: AsyncJobManagerApi,
 		record: VibeRecord,
 		message: string,
-		options: { first: boolean; batch?: readonly QueuedMessage[] },
+		options: { first: boolean; batch?: readonly QueuedMessage[]; seed?: Promise<string> },
 	): string {
 		const turnIndex = record.turnCount + 1;
 		const starters = (options.batch ?? []).filter(entry => entry.from !== undefined && !entry.note);
@@ -1616,6 +1619,7 @@ export class VibeSessionRegistry {
 			"task",
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
 			async ({ jobId: ownJobId, signal }) => {
+				const seed = await options.seed;
 				record.state = "running";
 				record.turnCount = turnIndex;
 				record.lastActivityAt = Date.now();
@@ -1638,7 +1642,13 @@ export class VibeSessionRegistry {
 					);
 					const result = options.first
 						? await runSubprocess({
-								...(await this.#buildSpawnOptions(session, record, message, signal, onProgress)),
+								...(await this.#buildSpawnOptions(
+									session,
+									record,
+									seed ? `${seed}\n\n${message}` : message,
+									signal,
+									onProgress,
+								)),
 								topicBoard,
 							})
 						: await runSubagentFollowUpTurn({

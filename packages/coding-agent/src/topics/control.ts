@@ -32,7 +32,7 @@ import * as path from "node:path";
 import type { Socket, UnixSocketListener } from "bun";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { Settings } from "../config/settings";
-import { isRpcTopicsCommand, runRpcTopicsCommand } from "../modes/rpc/rpc-topics";
+import { isRpcTopicsCommand, runRpcTopicsCommand, TOPICS_DISABLED, topicsFailure } from "../modes/rpc/rpc-topics";
 import type { RpcCommand } from "../modes/rpc/rpc-types";
 import type { TopicsHost } from "./host";
 import { cfgTopicsEnabled } from "./settings";
@@ -261,13 +261,7 @@ async function handleLine(
 	try {
 		await runAuthenticated(socket, state, frame.type, id, frame, options);
 	} catch (error) {
-		send(socket, {
-			id,
-			type: "response",
-			command: frame.type,
-			success: false,
-			error: error instanceof Error ? error.message : String(error),
-		});
+		send(socket, { id, type: "response", command: frame.type, success: false, ...topicsFailure(error) });
 	}
 }
 
@@ -281,7 +275,14 @@ async function runAuthenticated(
 ): Promise<void> {
 	const topics = await options.topics();
 	if (!topics) {
-		send(socket, { id, type: "response", command: type, success: false, error: "Topics are disabled." });
+		send(socket, {
+			id,
+			type: "response",
+			command: type,
+			success: false,
+			error: "Topics are disabled.",
+			code: TOPICS_DISABLED.code,
+		});
 		return;
 	}
 	if (type === "subscribe") {

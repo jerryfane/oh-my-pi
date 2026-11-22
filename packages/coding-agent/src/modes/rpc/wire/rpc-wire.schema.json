@@ -321,18 +321,18 @@
 			},
 			{
 				"name": "topics_list",
-				"doc": "List the owner's topics (persistent workers), newest activity first.",
+				"doc": "List the owner's topics (persistent workers), newest activity first, and the open topic suggestions.",
 				"params": null,
 				"result": "TopicsListResult",
 				"nullable": false,
-				"unwrap": "topics",
+				"unwrap": null,
 				"timeoutMs": null,
 				"completion": null,
 				"clientOmit": []
 			},
 			{
 				"name": "topics_new",
-				"doc": "Start a topic with a title and its first message.",
+				"doc": "Start a topic with a title and its first message, optionally seeded with Inbox messages.",
 				"params": "TopicsNewParams",
 				"result": "TopicsNewResult",
 				"nullable": false,
@@ -390,6 +390,39 @@
 				"doc": "Change a topic's title.",
 				"params": "TopicsRenameParams",
 				"result": null,
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_accept_suggestion",
+				"doc": "Start the suggested topic, seeded with all of its Inbox messages; returns before the seed is ready.",
+				"params": "TopicsAcceptSuggestionParams",
+				"result": "TopicsAcceptSuggestionResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_dismiss_suggestion",
+				"doc": "Dismiss a topic suggestion.",
+				"params": "TopicsDismissSuggestionParams",
+				"result": "TopicsDismissSuggestionResult",
+				"nullable": false,
+				"unwrap": null,
+				"timeoutMs": null,
+				"completion": null,
+				"clientOmit": []
+			},
+			{
+				"name": "topics_organise",
+				"doc": "Queue one Inbox turn that reviews the history and suggests topics; never interrupts a running turn.",
+				"params": "TopicsOrganiseParams",
+				"result": "TopicsOrganiseResult",
 				"nullable": false,
 				"unwrap": null,
 				"timeoutMs": null,
@@ -3582,6 +3615,39 @@
 				"createdAt",
 				"lastActivityAt"
 			]
+		},
+		"TopicSuggestion": {
+			"type": "object",
+			"properties": {
+				"id": {
+					"type": "string",
+					"description": "Suggestion id (`sg_…`)."
+				},
+				"title": {
+					"type": "string"
+				},
+				"reason": {
+					"type": "string"
+				},
+				"messageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Session entry ids of the Inbox messages the suggestion covers."
+				},
+				"createdMs": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"id",
+				"title",
+				"reason",
+				"messageIds",
+				"createdMs"
+			],
+			"description": "An open topic suggestion of the Inbox model."
 		},
 		"SubagentMessages": {
 			"type": "object",
@@ -6779,10 +6845,17 @@
 					"items": {
 						"$ref": "#/$defs/TopicSummary"
 					}
+				},
+				"suggestions": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/TopicSuggestion"
+					}
 				}
 			},
 			"required": [
-				"topics"
+				"topics",
+				"suggestions"
 			]
 		},
 		"TopicsNewParams": {
@@ -6793,6 +6866,13 @@
 				},
 				"message": {
 					"type": "string"
+				},
+				"seedMessageIds": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"description": "Inbox user/assistant message entry ids copied into the topic."
 				}
 			},
 			"required": [
@@ -6895,6 +6975,88 @@
 			"required": [
 				"topicId",
 				"title"
+			]
+		},
+		"TopicsAcceptSuggestionParams": {
+			"type": "object",
+			"properties": {
+				"suggestionId": {
+					"type": "string"
+				},
+				"by": {
+					"type": "string",
+					"description": "Who accepted, as the host names them."
+				}
+			},
+			"required": [
+				"suggestionId",
+				"by"
+			]
+		},
+		"TopicsAcceptSuggestionResult": {
+			"type": "object",
+			"properties": {
+				"topicId": {
+					"type": "string"
+				},
+				"alreadyAccepted": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"topicId",
+				"alreadyAccepted"
+			]
+		},
+		"TopicsDismissSuggestionParams": {
+			"type": "object",
+			"properties": {
+				"suggestionId": {
+					"type": "string"
+				},
+				"by": {
+					"type": "string",
+					"description": "Who dismissed, as the host names them."
+				}
+			},
+			"required": [
+				"suggestionId",
+				"by"
+			]
+		},
+		"TopicsDismissSuggestionResult": {
+			"type": "object",
+			"properties": {
+				"alreadyDismissed": {
+					"type": "boolean"
+				}
+			},
+			"required": [
+				"alreadyDismissed"
+			]
+		},
+		"TopicsOrganiseParams": {
+			"type": "object",
+			"properties": {
+				"by": {
+					"type": "string",
+					"description": "Who asked, as the host names them."
+				}
+			},
+			"required": [
+				"by"
+			]
+		},
+		"TopicsOrganiseResult": {
+			"type": "object",
+			"properties": {
+				"queued": {
+					"type": "boolean",
+					"description": "The Inbox was busy; the turn runs after the current one."
+				}
+			},
+			"required": [
+				"queued"
 			]
 		},
 		"LiveStartParams": {
