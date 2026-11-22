@@ -6,6 +6,7 @@
  * session drops it wherever that epoch has been aborted (its transcript is being
  * or was replaced), so nothing meant for one transcript lands in the next.
  */
+import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
 import type { SessionEntry } from "../session/session-entries";
@@ -66,8 +67,8 @@ export function afterLatestReset(branch: readonly SessionEntry[]): readonly Sess
 interface PendingTurn {
 	/** Waiting for earlier prompts, or its own prompt call has not settled yet. */
 	dispatching: boolean;
-	/** It went onto the follow-up queue. */
-	queued: boolean;
+	/** Its own message, once it went onto the follow-up queue: the token tracked until it is delivered or dropped. */
+	queued: AgentMessage | undefined;
 	/** The turn took the message (its `message_start` was seen). */
 	started: boolean;
 	done(): void;
@@ -114,7 +115,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 			const outcome = Promise.withResolvers<{ queued: boolean }>();
 			const turn: PendingTurn = {
 				dispatching: true,
-				queued: false,
+				queued: undefined,
 				started: false,
 				done() {
 					unsubscribe();
@@ -169,8 +170,8 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 					{
 						streamingBehavior: "followUp",
 						transcriptSignal: epoch.signal,
-						onPromptQueued: () => {
-							turn.queued = true;
+						onPromptQueued: batch => {
+							turn.queued = batch.at(-1);
 							outcome.resolve({ queued: true });
 						},
 					},
@@ -204,10 +205,14 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				return false;
 			}
 			if (turn.dispatching || turn.started) return true;
-			// Queued, then dropped from the follow-up queue without running (an abort, a session switch).
-			const stillQueued = session.agent
-				.peekFollowUpQueue()
-				.some(message => message.role === "custom" && message.customType === customType);
+			// Queued: its own message waits in a queue, or held out of them (an IRC wake parked it) to be put back.
+			// Gone from both without running, it was dropped (an abort, a replaced transcript) or withdrawn.
+			const message = turn.queued;
+			const stillQueued =
+				message !== undefined &&
+				(session.agent.peekFollowUpQueue().includes(message) ||
+					session.agent.peekSteeringQueue().includes(message) ||
+					session.heldQueuedMessages.has(message));
 			if (!stillQueued) turn.done();
 			return stillQueued;
 		},

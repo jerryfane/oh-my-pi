@@ -498,6 +498,13 @@ export interface PromptOptions {
 	 */
 	onPromptAdmitted?: () => void;
 	/**
+	 * Binds the prompt to a transcript (an Inbox epoch's signal, possibly another session's): aborted, the
+	 * prompt is refused before its setup and dropped at its last check before dispatch, so nothing of it is saved or
+	 * sent. Only for a prompt that starts its own turn (no `streamingBehavior`); it is admitted
+	 * ({@link onPromptAdmitted}) only at that last check.
+	 */
+	transcriptSignal?: AbortSignal;
+	/**
 	 * Called synchronously when this prompt is pushed onto the steer or
 	 * follow-up queue, just before {@link onPromptAdmitted}, with the messages it
 	 * pushed (its hidden companions, then the prompt), so a caller can tell them

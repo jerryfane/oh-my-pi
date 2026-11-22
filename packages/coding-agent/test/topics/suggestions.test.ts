@@ -234,7 +234,7 @@ describe("topic suggestions", () => {
 		manager = new AsyncJobManager({});
 		sm = SessionManager.create(tempDir.path(), tempDir.path());
 		inboxSm = sm;
-		inboxEpochs = new InboxEpochs();
+		inboxEpochs = new InboxEpochs(() => {});
 		stateWrite = undefined;
 		user("hello");
 		await sm.ensureOnDisk();
@@ -670,7 +670,7 @@ describe("topic suggestions", () => {
 				name: "Seedless",
 				prompt: "go",
 				title: "Seedless",
-				seed: { build: seed, dispatch: () => {}, firstTurn },
+				seed: { signal: new AbortController().signal, build: seed, firstTurn },
 			});
 			// Two macrotask turns: anything rejected and unowned by now is reported as unhandled.
 			await macrotask();

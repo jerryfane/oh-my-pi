@@ -315,6 +315,55 @@ describe("Inbox notes", () => {
 	});
 });
 
+describe("Organise turn tracked by its own message (#13 review)", () => {
+	it("refuses a second Organise while the first is parked by an IRC wake: organise_running", async () => {
+		const arrived = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const woke = Promise.withResolvers<void>();
+		const wakeRelease = Promise.withResolvers<void>();
+		const inbox = await openInbox(async context => {
+			const text = lastText(context);
+			if (text === "long question") {
+				arrived.resolve();
+				await release.promise;
+				return { content: ["the full answer"] };
+			}
+			if (text.includes("ping")) {
+				woke.resolve();
+				await wakeRelease.promise;
+				return { content: ["pong"] };
+			}
+			return { content: [text.includes(ORGANISE_MARK) ? "organised" : "ok"] };
+		});
+		const running = inbox.session.prompt("long question");
+		await arrived.promise;
+		expect(await inbox.host.organise({ by: "owner" })).toEqual({ queued: true });
+		await inbox.session.abort({ reason: USER_INTERRUPT_LABEL });
+		release.resolve();
+		await running.catch(() => {});
+		await inbox.session.waitForIdle();
+		await inbox.session.deliverIrcMessage({
+			id: "m1",
+			from: "peer",
+			to: "me",
+			body: "ping",
+			ts: Date.now(),
+		} as IrcMessage);
+		await woke.promise;
+		// The first Organise is parked outside the agent queue, not removed.
+		expect(inbox.session.agent.peekFollowUpQueue()).toHaveLength(0);
+		const second = await codeOf(() => inbox.host.organise({ by: "owner" }));
+		wakeRelease.resolve();
+		await inbox.session.waitForIdle();
+
+		expect(second).toBe("organise_running");
+		expect(
+			inbox.manager.getEntries().filter(entry => "customType" in entry && entry.customType === TOPIC_ORGANISE_TYPE),
+		).toHaveLength(0);
+		expect(inbox.session.agent.peekFollowUpQueue()).toHaveLength(1);
+	});
+});
+
 describe("Parked batches and first-turn admission (#12 review)", () => {
 	function conversation(manager: SessionManager): void {
 		manager.appendMessage({ role: "user", content: "first question", timestamp: 1 });
