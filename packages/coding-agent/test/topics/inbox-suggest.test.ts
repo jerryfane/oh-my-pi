@@ -27,9 +27,13 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { CustomMessageEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
+import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { InboxChangedError } from "@oh-my-pi/pi-coding-agent/topics/binding";
 import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import { sessionInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
+import type { SeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import { TopicSuggestTool } from "@oh-my-pi/pi-coding-agent/topics/suggest-tool";
 import { TOPIC_ORGANISE_TYPE, TOPIC_SUGGESTION_TYPE, TopicsError } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
 import { resetTopicsRegistryForTests } from "@oh-my-pi/pi-coding-agent/topics/workers";
@@ -71,11 +75,15 @@ interface Inbox {
 	host: TopicsHost;
 }
 
-/** An Inbox session with topics on, its model answering through `respond`; `persist` = a session file on disk. */
+/**
+ * An Inbox session with topics on, its model answering through `respond`; `persist` = a session file on disk
+ * (and topics persisted next to it); `summarize` condenses older seed messages.
+ */
 async function openInbox(
 	respond: (context: Context) => MockResponse | Promise<MockResponse>,
 	seed: (manager: SessionManager) => void = () => {},
 	persist = false,
+	summarize: SeedSummarizer = async () => "summary",
 ): Promise<Inbox> {
 	const bundled = getBundledModel("anthropic", "claude-sonnet-4-5");
 	if (!bundled) throw new Error("Expected bundled model");
@@ -100,7 +108,7 @@ async function openInbox(
 		sessionManager: manager,
 		getAgentId: () => OWNER,
 		getSessionId: () => manager.getSessionId(),
-		getSessionFile: () => null,
+		getSessionFile: () => (persist ? (manager.getSessionFile() ?? null) : null),
 		getArtifactsDir: () => null,
 		taskDepth: 0,
 		enableLsp: false,
@@ -124,7 +132,7 @@ async function openInbox(
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry: new ModelRegistry(auth),
 		createTopicsHost: () =>
-			createTopicsHost(toolSession, { inbox: sessionInbox(session), summarize: async () => "summary" }),
+			createTopicsHost(toolSession, { inbox: sessionInbox(session), summarize }),
 	});
 	sessions.push(session);
 	const host = await session.getTopicsHost();
@@ -299,6 +307,137 @@ describe("Inbox notes", () => {
 			.getEntries()
 			.some(entry => entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE);
 		expect(inbox.host.suggestions().some(open => open.id === suggestion.id)).toBe(inJournal);
+	});
+});
+
+describe("Inbox generation checked at the point of effect (#8 review)", () => {
+	const OLD = "OLD-INBOX-EXCERPT";
+	function withOldExcerpt(manager: SessionManager): void {
+		manager.appendMessage({ role: "user", content: `${OLD} about the Diokan deal`, timestamp: 1 });
+		manager.appendMessage(createAssistantMessage("noted"));
+	}
+
+	it("refuses an Organise held in the deferred extension loader across /new: nothing of the old Inbox is sent or saved", async () => {
+		const inbox = await openInbox(
+			context => ({ content: [lastText(context).includes(ORGANISE_MARK) ? "organised" : "ok"] }),
+			withOldExcerpt,
+		);
+		const gate = Promise.withResolvers<void>();
+		let pending = true;
+		Object.defineProperty(inbox.session, "hasPendingDeferredExtensions", { configurable: true, get: () => pending });
+		vi.spyOn(inbox.session, "loadDeferredExtensions").mockImplementation(async () => {
+			await gate.promise;
+			pending = false;
+		});
+		const organised = inbox.host.organise({ by: "owner" }).then(
+			result => result,
+			(error: Error) => error,
+		);
+		await Bun.sleep(0);
+		const before = inbox.requests.length;
+		await inbox.session.newSession();
+		gate.resolve();
+		const outcome = await organised;
+		await inbox.session.waitForIdle();
+
+		expect(outcome).toBeInstanceOf(InboxChangedError);
+		expect(JSON.stringify(inbox.manager.getEntries())).not.toContain(OLD);
+		for (const request of inbox.requests.slice(before)) expect(request.map(textOf).join("\n")).not.toContain(OLD);
+	});
+
+	it("refuses a seeded topics_new whose spawn write returns after /new: no summary request, no old seed text saved", async () => {
+		const summarize = vi.fn<SeedSummarizer>(async () => "SUMMARY");
+		const ids: string[] = [];
+		const inbox = await openInbox(
+			() => ({ content: ["ok"] }),
+			manager => {
+				for (let n = 1; n <= 32; n++) {
+					ids.push(
+						n % 2
+							? manager.appendMessage({ role: "user", content: `OLD-SEED-TEXT ${n}`, timestamp: n })
+							: manager.appendMessage(createAssistantMessage(`OLD-SEED-TEXT ${n}`)),
+					);
+				}
+			},
+			true,
+			summarize,
+		);
+		await inbox.manager.ensureOnDisk();
+		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async (options: ExecutorOptions) => ({
+			index: options.index,
+			id: options.id,
+			agent: options.agent.name,
+			agentSource: options.agent.source,
+			task: options.task,
+			exitCode: 0,
+			output: "done",
+			stderr: "",
+			truncated: false,
+			durationMs: 1,
+			tokens: 0,
+			requests: 0,
+		}));
+		// Hold the spawn's durable write (its lifecycle entry) until /new has completed.
+		const flushed = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const flush = inbox.manager.flush.bind(inbox.manager);
+		let held = false;
+		vi.spyOn(inbox.manager, "flush").mockImplementation(async () => {
+			await flush();
+			const spawnWrite = inbox.manager
+				.getEntries()
+				.some(entry => entry.type === "custom" && entry.customType === "vibe-session-lifecycle");
+			if (held || !spawnWrite) return;
+			held = true;
+			flushed.resolve();
+			await release.promise;
+		});
+		const created = inbox.host.create({ title: "Diokan", message: "Go on.", seedMessageIds: ids }).then(
+			result => result,
+			(error: Error) => error,
+		);
+		await flushed.promise;
+		await inbox.session.newSession();
+		release.resolve();
+		const outcome = await created;
+		// The topic's first turn runs in the background; give it a moment to (not) ask for a summary.
+		await Bun.sleep(20);
+
+		expect(outcome).toBeInstanceOf(InboxChangedError);
+		expect(summarize).not.toHaveBeenCalled();
+		expect(JSON.stringify(inbox.manager.getEntries())).not.toContain("OLD-SEED-TEXT");
+	});
+
+	it("builds Organise's index from the conversation after /clear only", async () => {
+		const inbox = await openInbox(
+			context => ({ content: [lastText(context).includes(ORGANISE_MARK) ? "organised" : "ok"] }),
+			manager => {
+				manager.appendMessage({ role: "user", content: "PRE-CLEAR-TEXT secret plans", timestamp: 1 });
+				manager.appendMessage(createAssistantMessage("PRE-CLEAR-TEXT acknowledged"));
+			},
+		);
+		expect(await inbox.session.resetSessionContext()).toBeDefined();
+		expect(await inbox.host.organise({ by: "owner" })).toEqual({ queued: false });
+		await inbox.session.waitForIdle();
+		const sent = inbox.requests.at(-1)!.map(textOf).join("\n");
+		expect(sent).toContain(ORGANISE_MARK);
+		expect(sent).not.toContain("PRE-CLEAR-TEXT");
+	});
+
+	it("refuses a state write bound before a same-file reopen, under the write lock: nothing reaches disk", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }), withOldExcerpt, true);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const file = inbox.manager.getSessionFile()!;
+		const box = sessionInbox(inbox.session);
+		const binding = box.bind();
+		expect(await inbox.session.switchSession(file)).toBe(true);
+
+		await expect(box.appendState(binding, "probe-stale-state", { stale: true })).rejects.toBeInstanceOf(
+			InboxChangedError,
+		);
+		await inbox.manager.flush();
+		expect(await Bun.file(file).text()).not.toContain("probe-stale-state");
 	});
 });
 

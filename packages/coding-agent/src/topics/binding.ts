@@ -1,13 +1,12 @@
 /**
- * The Inbox transcript a topics operation started in. Every mutating topics
- * operation (a suggestion, an accept, a dismissal, Organise, a seeded topic)
- * binds at admission and checks the binding before each read it acts on and
- * each write it makes, so nothing that started in one Inbox transcript lands
- * in another: a `/new`, a `/clear`, a fork, a switch and a reopen of an
- * earlier session all make a different transcript.
+ * The Inbox transcript a topics operation started in: the Inbox session's
+ * transcript generation at admission. The session checks it where an effect
+ * happens (a turn starting or queueing, a row being appended, an atomic
+ * write under its lock), so nothing that started in one transcript lands in
+ * another: `/new`, `/clear`, a fork, and any switch or reload each make a new one.
  */
 
-/** A write or read for an Inbox transcript that is no longer the open one. */
+/** A write or turn for an Inbox transcript that is no longer the open one. */
 export class InboxChangedError extends Error {
 	constructor() {
 		super("The Inbox session changed before the change could be saved.");
@@ -15,38 +14,21 @@ export class InboxChangedError extends Error {
 	}
 }
 
-/** The identity of one Inbox transcript (see {@link InboxBinding.key}). */
-export interface InboxIdentity {
-	sessionId: string;
-	sessionFile: string | undefined;
-	/** Counts every change of the Inbox's session (a new, forked, switched or reopened one). */
-	sessionEpoch: number;
-	/** Counts transcript replacements that keep the session (`/clear`). */
-	transcriptEpoch: number;
-}
-
 /** A topics operation's originating Inbox transcript. */
 export class InboxBinding {
-	/** Unique per transcript: equal keys mean the same open transcript. */
-	readonly key: string;
-	readonly #current: () => InboxIdentity;
+	/**
+	 * @param generation The Inbox session's transcript generation at admission.
+	 * @param sessionId The Inbox session id at admission, for attribution.
+	 * @param currentGeneration The Inbox session's transcript generation now.
+	 */
+	constructor(
+		readonly generation: number,
+		readonly sessionId: string,
+		private readonly currentGeneration: () => number,
+	) {}
 
-	constructor(current: () => InboxIdentity) {
-		this.#current = current;
-		this.key = inboxKey(current());
-	}
-
-	/** Whether the bound transcript is still the open one. */
+	/** Whether the bound transcript is still the open one, for work outside the session (a summary request). */
 	get isCurrent(): boolean {
-		return inboxKey(this.#current()) === this.key;
+		return this.currentGeneration() === this.generation;
 	}
-
-	/** Throw {@link InboxChangedError} unless the bound transcript is still the open one. */
-	assertCurrent(): void {
-		if (!this.isCurrent) throw new InboxChangedError();
-	}
-}
-
-function inboxKey({ sessionId, sessionFile, sessionEpoch, transcriptEpoch }: InboxIdentity): string {
-	return JSON.stringify([sessionId, sessionFile ?? null, sessionEpoch, transcriptEpoch]);
 }

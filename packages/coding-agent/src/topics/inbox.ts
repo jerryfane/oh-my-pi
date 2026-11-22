@@ -2,8 +2,8 @@
  * What the topics host needs from the Inbox (the top-level session): its
  * entries, hidden state entries, visible notes that never start or interrupt a
  * turn, and one queued turn (Organise) that never interrupts a running one.
- * Every read and write goes through an {@link InboxBinding}: it refuses once
- * another transcript is open, so nothing meant for one conversation lands in the next.
+ * Every write and turn carries an {@link InboxBinding}; the session checks it
+ * where the effect happens, so nothing meant for one transcript lands in the next.
  */
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSession } from "../session/agent-session";
@@ -20,36 +20,46 @@ export interface InboxMessage {
 export interface TopicsInbox {
 	/** Bind to the open Inbox transcript. */
 	bind(): InboxBinding;
-	/** Entries of the bound transcript's current branch, root first; throws once it is not open. */
-	branch(binding: InboxBinding): readonly SessionEntry[];
-	/** Every entry of the bound transcript, in file order; throws once it is not open. */
-	entries(binding: InboxBinding): readonly SessionEntry[];
 	/**
-	 * Append a hidden custom entry to the bound transcript, all or nothing: it
-	 * resolves once the entry is on disk; a failed write leaves no entry behind
-	 * and rejects, and so does another open transcript ({@link InboxChangedError},
-	 * checked under the write lock, where `check` runs too).
+	 * The open transcript's conversation as the model has it: the current branch after its latest reset
+	 * (`/clear`), root first. Message indexes and message-id checks use this.
+	 */
+	branch(): readonly SessionEntry[];
+	/** Every entry of the open transcript, in file order (history before a reset included). */
+	entries(): readonly SessionEntry[];
+	/**
+	 * Append a hidden custom entry to the bound transcript, all or nothing: it resolves once the entry is
+	 * on disk; a failed write leaves no entry behind and rejects. Under the write lock the session refuses
+	 * another open transcript ({@link InboxChangedError}) and `check` runs; either refusal writes nothing.
 	 */
 	appendState(binding: InboxBinding, customType: string, data: unknown, check?: () => void): Promise<void>;
 	/**
-	 * Record a visible custom message in the bound transcript that the model sees
-	 * from its next turn on ({@link AgentSession.recordWithoutTurn}): now while
-	 * the Inbox is idle, else at its running turn's boundary. It never starts or
-	 * interrupts a turn. Resolves true once it is on disk; false when another
-	 * transcript is open, or it was dropped or could not be written.
+	 * Record a visible custom message in the bound transcript that the model sees from its next turn on
+	 * ({@link AgentSession.recordWithoutTurn}): now while the Inbox is idle, else at its running turn's
+	 * boundary. It never starts or interrupts a turn. Resolves true once it is on disk; false when another
+	 * transcript is open where it would be appended, or it was dropped or could not be written.
 	 */
 	appendNote(binding: InboxBinding, message: InboxMessage): Promise<boolean>;
 	/**
-	 * Run `render()` (hidden) as one Inbox turn of the bound transcript, never
-	 * overtaking or interrupting other work: behind prompts still in setup, then
-	 * started at once when idle, else queued as a follow-up. `render` runs right
-	 * before dispatch, once the bound transcript is confirmed open; another open
-	 * transcript rejects with {@link InboxChangedError} and dispatches nothing.
-	 * Resolves once the turn started (`queued: false`) or was queued (`queued: true`).
+	 * Run the hidden `customType` message `render()` returns as one Inbox turn of the bound transcript, never
+	 * overtaking or interrupting other work: behind prompts still in setup, then started at once when idle,
+	 * else queued as a follow-up. The session refuses another open transcript where the turn would start or
+	 * queue ({@link InboxChangedError}): nothing is sent or saved. Resolves once the turn started
+	 * (`queued: false`) or was queued (`queued: true`).
 	 */
-	queueTurn(binding: InboxBinding, customType: string, render: () => InboxMessage): Promise<{ queued: boolean }>;
+	queueTurn(
+		binding: InboxBinding,
+		customType: string,
+		render: () => Pick<InboxMessage, "content" | "details">,
+	): Promise<{ queued: boolean }>;
 	/** Whether the turn {@link queueTurn} queued for `customType` is still waiting, queued or running. */
 	turnPending(customType: string): boolean;
+}
+
+/** The entries after the latest reset boundary of `branch` (all of it when there is none). */
+export function afterLatestReset(branch: readonly SessionEntry[]): readonly SessionEntry[] {
+	const reset = branch.findLastIndex(entry => entry.type === "reset_boundary");
+	return reset < 0 ? branch : branch.slice(reset + 1);
 }
 
 interface PendingTurn {
@@ -66,49 +76,32 @@ interface PendingTurn {
 export function sessionInbox(session: AgentSession): TopicsInbox {
 	const turns = new Map<string, PendingTurn>();
 	const manager = session.sessionManager;
-	// Counts every session the Inbox adopts (new, fork, switch, reopen): a reopened session is a new transcript.
-	let sessionEpoch = 0;
-	session.registerSessionChangeCallback(() => {
-		sessionEpoch++;
-	});
-	const identity = () => ({
-		sessionId: manager.getSessionId(),
-		sessionFile: manager.getSessionFile(),
-		sessionEpoch,
-		transcriptEpoch: session.transcriptEpoch,
-	});
 
 	return {
-		bind: () => new InboxBinding(identity),
-		branch(binding) {
-			binding.assertCurrent();
-			return manager.getBranch();
-		},
-		entries(binding) {
-			binding.assertCurrent();
-			return manager.getEntriesView();
-		},
+		bind: () =>
+			new InboxBinding(session.transcriptGeneration, manager.getSessionId(), () => session.transcriptGeneration),
+		branch: () => afterLatestReset(manager.getBranch()),
+		entries: () => manager.getEntriesView(),
 		async appendState(binding, customType, data, check) {
-			binding.assertCurrent();
-			await manager.appendEntriesAtomically(() => {
-				// Checked again under the write lock: a transition may have happened while it waited.
-				binding.assertCurrent();
+			await session.appendEntriesAtomically(() => {
 				check?.();
 				manager.appendCustomEntry(customType, data);
-			});
+			}, binding.generation);
 		},
 		async appendNote(binding, { customType, content, details }) {
-			if (!binding.isCurrent) return false;
 			try {
-				await session.recordWithoutTurn({
-					role: "custom",
-					customType,
-					content,
-					display: true,
-					details,
-					attribution: "agent",
-					timestamp: Date.now(),
-				});
+				await session.recordWithoutTurn(
+					{
+						role: "custom",
+						customType,
+						content,
+						display: true,
+						details,
+						attribution: "agent",
+						timestamp: Date.now(),
+					},
+					binding.generation,
+				);
 				return true;
 			} catch (error) {
 				logger.warn("topics: Inbox note not saved", {
@@ -148,22 +141,20 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				await promise;
 				stopWatching();
 			}
-			let message: InboxMessage;
+			let rendered: Pick<InboxMessage, "content" | "details">;
 			try {
-				// Right before dispatch: the bound transcript must still be the open one, and the message is rendered
-				// from it, so nothing of a replaced transcript reaches the model or the journal.
-				binding.assertCurrent();
-				message = render();
+				rendered = render();
 			} catch (error) {
 				turn.done();
 				throw error;
 			}
-			const { content, details } = message;
+			const { content, details } = rendered;
 			session
 				.promptCustomMessage(
 					{ customType, content, display: false, details, attribution: "user" },
 					{
 						streamingBehavior: "followUp",
+						expectedGeneration: binding.generation,
 						onPromptQueued: () => {
 							turn.queued = true;
 							outcome.resolve({ queued: true });

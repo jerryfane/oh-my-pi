@@ -16,6 +16,7 @@ import { escapeHarnessTags } from "../session/harness-tags";
 import { journalCompletion } from "../session/model-usage-journal";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
+import { type InboxBinding, InboxChangedError } from "./binding";
 import { messageText } from "./suggestions";
 
 /** Chosen messages copied verbatim; older ones are summarised. */
@@ -24,8 +25,11 @@ export const SEED_VERBATIM_MESSAGES = 30;
 const SUMMARY_INPUT_MAX_CHARS = 120_000;
 const SUMMARY_TIMEOUT_MS = 60_000;
 
-/** Condense `transcript` (older messages) into one summary; undefined (or a rejection) = failed. */
-export type SeedSummarizer = (transcript: string) => Promise<string | undefined>;
+/**
+ * Condense `transcript` (older messages of the Inbox transcript `origin`) into one summary; undefined (or a
+ * rejection) = failed. It works for `origin` only: no request once another transcript is open.
+ */
+export type SeedSummarizer = (transcript: string, origin: InboxBinding) => Promise<string | undefined>;
 
 interface SeedMessage {
 	role: "user" | "assistant";
@@ -46,7 +50,7 @@ export async function buildTopicSeed(args: {
 	entries: readonly SessionEntry[];
 	messageIds: readonly string[];
 	reason?: string;
-	summarize: SeedSummarizer;
+	summarize: (transcript: string) => Promise<string | undefined>;
 }): Promise<string> {
 	const wanted = new Set(args.messageIds);
 	const messages: SeedMessage[] = [];
@@ -80,11 +84,12 @@ export async function buildTopicSeed(args: {
 /**
  * The summarizer for `session`'s topics: one call to the `smol` role model,
  * the configured role or else its default priority chain (same provider only
- * when offline), journaled and cost-gated like other auxiliary calls. No
- * usable model counts as a failed summary.
+ * when offline), cost-gated like other auxiliary calls and journaled in the
+ * origin transcript only. No usable model counts as a failed summary.
  */
 export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
-	return async transcript => {
+	return async (transcript, origin) => {
+		if (!origin.isCurrent) throw new InboxChangedError();
 		const registry = session.modelRegistry;
 		if (!registry) return undefined;
 		const offline = cfgOffline.get(session.settings);
@@ -97,7 +102,7 @@ export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 			offline ? available.filter(candidate => candidate.provider === activeProvider) : available,
 		)[0]?.model;
 		if (!model) return undefined;
-		const sessionId = session.getSessionId?.() ?? undefined;
+		const sessionId = origin.sessionId;
 		const journal = journalCompletion(session.sessionManager, { purpose: "topic-seed-summary", role: "smol" });
 		session.costGate?.admit();
 		const message = await completeSimple(
@@ -115,7 +120,8 @@ export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 			},
 		);
 		session.costGate?.record(message.usage.cost.total);
-		journal?.(message, transcript);
+		// Attributed to the origin transcript only: once another is open, the request is not journaled there.
+		if (origin.isCurrent) journal?.(message, transcript);
 		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
 		return message.content
 			.map(block => (block.type === "text" ? block.text : ""))

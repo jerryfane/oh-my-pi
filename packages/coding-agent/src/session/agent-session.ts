@@ -251,6 +251,7 @@ import {
 } from "@oh-my-pi/pi-tui/thinking";
 import { isAttachmentOnlyTitleInput, isLowSignalTitleInput } from "../tiny/text";
 import type { ImageAttachmentEntry, ToolSession } from "../tools";
+import { InboxChangedError } from "../topics/binding";
 import { topicBoardForTurn } from "../topics/board";
 import { SessionTopics, type TopicsHost } from "../topics/host";
 import { resolveApproval } from "../tools/approval";
@@ -1190,7 +1191,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 */
 	#pendingExcludedRows: CustomMessage[] = [];
 	/** {@link recordWithoutTurn} callers waiting for their row to be recorded, by row. */
-	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string>>();
+	readonly #recordedRowWaiters = new Map<AgentMessage, PromiseWithResolvers<string> & { generation?: number }>();
+	/** Changes on every transcript replacement (`/new`, `/clear`, fork, branch into a new session, any switch or reload). */
+	#transcriptGeneration = 0;
 	#scheduledHiddenNextTurnGeneration: number | undefined = undefined;
 	/** Queued messages a session path took out of the agent queues to put back later (follow-ups
 	 *  parked behind an IRC wake turn, a session switch's rollback snapshot), in queue order. */
@@ -1810,8 +1813,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const connected = this.#unsubscribeAgent !== undefined;
 		// Rows land only at a turn boundary: mid-stream, their message_start would replace the live stream message.
 		if (connected && this.agent.state.isStreaming) return;
-		const rows = this.#pendingExcludedRows;
-		this.#pendingExcludedRows = [];
+		// A row meant for another transcript is refused here, where it would be appended.
+		const rows: CustomMessage[] = [];
+		for (const row of this.#pendingExcludedRows.splice(0)) {
+			const expected = this.#recordedRowWaiters.get(row)?.generation;
+			if (expected === undefined || expected === this.#transcriptGeneration) rows.push(row);
+			else this.#settleRecordedRow(row, new InboxChangedError());
+		}
 		if (connected) {
 			this.#recordWithoutTurn(rows);
 			return;
@@ -1862,14 +1870,15 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * custom message, and never steers a turn. Resolves once the entry is on disk; rejects when the session
 	 * is disposed or a transition drops the row first, or when the session file cannot be written.
 	 */
-	async recordWithoutTurn(message: CustomMessage): Promise<void> {
+	async recordWithoutTurn(message: CustomMessage, expectedGeneration?: number): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
+		this.#assertTranscriptGeneration(expectedGeneration);
 		// Decided at admission with the journal's own rule: a row it never saves would never settle.
 		if (!isJournaledCustomMessage(message)) {
 			throw new Error(`A "${message.customType}" message is never saved in the session, so it cannot be recorded.`);
 		}
 		const recorded = Promise.withResolvers<string>();
-		this.#recordedRowWaiters.set(message, recorded);
+		this.#recordedRowWaiters.set(message, { ...recorded, generation: expectedGeneration });
 		this.#pendingExcludedRows.push(message);
 		if (!this.isStreaming) this.#flushExcludedRows();
 		const entryId = await recorded.promise;
@@ -1879,6 +1888,27 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (!this.sessionManager.getEntry(entryId)) {
 			throw new Error("The session's transcript changed before the row was saved.");
 		}
+	}
+
+	/** The transcript generation: it changes on every transcript replacement (see {@link #transcriptGeneration}). */
+	get transcriptGeneration(): number {
+		return this.#transcriptGeneration;
+	}
+
+	/** Throw {@link InboxChangedError} when `expected` is given and another transcript is open. */
+	#assertTranscriptGeneration(expected: number | undefined): void {
+		if (expected !== undefined && expected !== this.#transcriptGeneration) throw new InboxChangedError();
+	}
+
+	/**
+	 * {@link SessionManager.appendEntriesAtomically} for the transcript of `expectedGeneration`: under the
+	 * write lock, another open transcript refuses the batch with {@link InboxChangedError} and nothing is written.
+	 */
+	appendEntriesAtomically<T>(append: () => T, expectedGeneration?: number): Promise<T> {
+		return this.sessionManager.appendEntriesAtomically(() => {
+			this.#assertTranscriptGeneration(expectedGeneration);
+			return append();
+		});
 	}
 
 	/** Re-validates a #sessionGeneration snapshot captured before an aside/SDK call's await.
@@ -7538,6 +7568,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// The cleared context is a new transcript: an aside or held message captured for the old one drops
 		// its record instead of landing here (mirrors newSession()).
 		this.#sessionGeneration++;
+		this.#transcriptGeneration++;
 		this.#pendingNextTurnMessages = [];
 		this.#dropPendingExcludedRows();
 		this.#experimentalContextNotesReminder = undefined;
@@ -9570,6 +9601,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
+			/** The transcript generation it is meant for; another open transcript refuses it where it would start or queue. */
+			expectedGeneration?: number;
 		},
 	): Promise<boolean> {
 		return this.#admitSubmission(() => this.#promptCustomMessage(message, options));
@@ -9581,6 +9614,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			queueChipText?: string;
 			queueOnly?: boolean;
 			onPromptQueued?: PromptOptions["onPromptQueued"];
+			expectedGeneration?: number;
 		},
 	): Promise<boolean> {
 		const followUps = this.#createPromptFollowUps(options?.followUps);
@@ -9631,6 +9665,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					queueChipText?: string;
 					queueOnly?: boolean;
 					onPromptQueued?: PromptOptions["onPromptQueued"];
+					expectedGeneration?: number;
 			  })
 			| undefined,
 		outcome: PromptDispatchOutcome,
@@ -9682,6 +9717,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
 				onPromptQueued: options?.onPromptQueued,
+				expectedGeneration: options?.expectedGeneration,
 			});
 			// Still held only if the message was not queued (an aside whose session changed while it was prepared).
 			this.#reportDroppedCustomPrompt(message, options, followUps);
@@ -9732,6 +9768,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				prependMessages: queuedNotices,
 				onPromptAdmitted: onPromptQueuedAdmitted,
 				onPromptQueued: options?.onPromptQueued,
+				expectedGeneration: options?.expectedGeneration,
 			});
 			// Still held only if the message was not queued (an aside whose session changed while it was prepared).
 			this.#reportDroppedCustomPrompt(message, options, followUps);
@@ -9972,12 +10009,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			acceptTerminalEmptyStop?: boolean;
 			/** Follow-ups held until this run goes live; queued behind it then. */
 			followUpBatch?: PromptFollowUps;
+			/** See {@link promptCustomMessage}'s `expectedGeneration`. */
+			expectedGeneration?: number;
 		},
 	): Promise<boolean> {
 		// Returns false when the prompt was dropped before reaching the agent —
 		// every pre-dispatch bail (generation bump from abort, disposal, usage
 		// preflight denial) exits silently, and prompt() uses the outcome to hand
 		// the typed text back to the host instead of losing it.
+		// The run starts for this transcript: a transition from here on aborts its setup (prompt generation).
+		this.#assertTranscriptGeneration(options?.expectedGeneration);
 		const inFlightEpoch = this.#beginInFlight();
 		// Client ownership is reserved by #prompt before dispatch preprocessing
 		// and released when its bracket settles; callers that reach this
@@ -11290,6 +11331,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			onPromptAdmitted?: () => void;
 			/** Called synchronously with the messages pushed onto the queue. See {@link PromptOptions.onPromptQueued}. */
 			onPromptQueued?: (queued: readonly AgentMessage[]) => void;
+			/** Refuse the push once another transcript is open (see {@link promptCustomMessage}). */
+			expectedGeneration?: number;
 		},
 	): Promise<void> {
 		// Captured before the normalization await below — see #sessionGeneration's doc comment.
@@ -11341,6 +11384,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#resumeStrandedIrcAsides();
 			return;
 		}
+		this.#assertTranscriptGeneration(options?.expectedGeneration);
 		this.#allowQueuedMessageDrainRetry();
 		// Keyword notices and their user message must enter the queue in one synchronous phase.
 		if (deliverAs === "followUp") {
@@ -12927,6 +12971,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// outgoing session also drops its record instead of landing in this new one.
 			this.#irc.clearPending();
 			this.#sessionGeneration++;
+			this.#transcriptGeneration++;
 			this.#scheduledHiddenNextTurnGeneration = undefined;
 			this.#queuedMessageDrainBlocked = false;
 			this.#usagePreflightReadyForNextModelCall = false;
@@ -13053,6 +13098,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// No file means fork() is a no-op. Otherwise invalidate admitted
 				// prompt setup before the asynchronous identity rewrite begins.
 				if (previousSessionFile) this.#promptGeneration++;
+				this.#transcriptGeneration++;
 				forkResult = await this.sessionManager.fork();
 			} catch (error) {
 				this.#bash.finishSessionTransition(bashTransition, false);
@@ -14680,6 +14726,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// record on success but stays valid if the switch is rolled back to this same session.
 		const previousIrcPending = this.#irc.clearPending();
 		const previousSessionGeneration = this.#sessionGeneration++;
+		// Every switch, a reload of the same file included; a rolled-back one too (callers bound to it re-bind).
+		this.#transcriptGeneration++;
 		const generationSettled = Promise.withResolvers<void>();
 		const previousSessionGenerationSettled = this.#sessionGenerationSettled;
 		this.#sessionGenerationSettled = generationSettled.promise;
@@ -15127,6 +15175,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// A prompt admitted during the drain awaits above belongs to the history
 				// being replaced; the generation bump drops its pending setup.
 				this.#promptGeneration++;
+				this.#transcriptGeneration++;
 				if (!leafId) {
 					const title = this.sessionManager.getSessionName();
 					const titleSource = this.sessionManager.titleSource;

@@ -114,7 +114,7 @@ interface Admission {
 
 /** An operation on a suggestion while it runs, and the transcript it runs in. */
 interface InFlight<T> {
-	bindingKey: string;
+	bindingKey: number;
 	promise: Promise<T>;
 }
 
@@ -142,14 +142,14 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		for (const listener of suggestionListeners) listener({ id, reason, ...scope });
 	};
 	/** Suggestions made but not recorded yet (the Inbox turn that made them is still running), by transcript. */
-	const unsaved: Array<{ bindingKey: string; suggestion: TopicSuggestion }> = [];
+	const unsaved: Array<{ bindingKey: number; suggestion: TopicSuggestion }> = [];
 	/** The whole accept of a suggestion (topic, accepted state, note) while it runs, by suggestion id. */
 	const accepting = new Map<string, InFlight<string>>();
 	/**
 	 * Topics started for accepts whose accepted state was not saved, by suggestion id: a retry in the same
 	 * transcript saves the state for that topic instead of starting another, while that Inbox still lists it.
 	 */
-	const startedFor = new Map<string, { bindingKey: string; topicId: string }>();
+	const startedFor = new Map<string, { bindingKey: number; topicId: string }>();
 	/** Dismissals being saved, by suggestion id. */
 	const dismissing = new Map<string, InFlight<void>>();
 
@@ -160,24 +160,24 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	};
 	const notInThisInbox = (suggestionId: string): TopicsError =>
 		new TopicsError("suggestion_not_found", `Suggestion ${suggestionId} belongs to an Inbox session that is no longer open.`);
-	/** Whether the open Inbox's topics list `topicId`. */
-	const listed = (topicId: string): boolean => registry.describe(session).some(topic => topic.id === topicId);
+	/** Whether the open Inbox's topics include `topicId` (the scoped lookup: closed ones count, dead ones do not). */
+	const listed = (topicId: string): boolean => registry.worker(session, topicId) !== undefined;
 	/** The in-flight operation on `suggestionId`, if it runs in this transcript; one of another transcript refuses. */
 	const inFlight = <T>(map: Map<string, InFlight<T>>, { binding }: Admission, suggestionId: string) => {
 		const running = map.get(suggestionId);
-		if (running && running.bindingKey !== binding.key) throw notInThisInbox(suggestionId);
+		if (running && running.bindingKey !== binding.generation) throw notInThisInbox(suggestionId);
 		return running?.promise;
 	};
 
 	/** The suggestions of the bound transcript: its journal, plus those still being recorded there. */
 	const folded = ({ box, binding }: Admission) =>
 		foldSuggestions(
-			box.entries(binding),
-			unsaved.filter(entry => entry.bindingKey === binding.key).map(entry => entry.suggestion),
+			box.entries(),
+			unsaved.filter(entry => entry.bindingKey === binding.generation).map(entry => entry.suggestion),
 		);
 	/** Whether `suggestionId` is being accepted in the bound transcript. */
 	const acceptingHere = ({ binding }: Admission, suggestionId: string): boolean =>
-		accepting.get(suggestionId)?.bindingKey === binding.key;
+		accepting.get(suggestionId)?.bindingKey === binding.generation;
 
 	/**
 	 * Save a state change in the bound transcript (all or nothing; `check` runs under the write lock too) and
@@ -196,13 +196,16 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 
 	/**
 	 * Spawn a topic; with `seed`, the chosen messages of `seed.entries` are prepended to its first turn. The
-	 * seed is built lazily inside that turn, so its failure fails the turn and is never left unhandled.
+	 * seed is built lazily inside that turn, so its failure fails the turn and is never left unhandled; it is
+	 * built only while the Inbox transcript it came from is still open, so no summary is requested for (or
+	 * saved in) another one. A seeded topic that the bound Inbox does not list once spawned is refused with
+	 * {@link InboxChangedError}, never returned.
 	 */
 	const spawnTopic = async (args: {
 		title: string;
 		message: string;
 		name?: string;
-		seed?: { entries: readonly SessionEntry[]; messageIds: string[]; reason?: string };
+		seed?: { binding: InboxBinding; entries: readonly SessionEntry[]; messageIds: string[]; reason?: string };
 	}): Promise<string> => {
 		const title = args.title.trim();
 		if (!title) throw new Error("Topic title must not be empty.");
@@ -214,16 +217,19 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			title,
 			...(seed
 				? {
-						seed: () =>
-							buildTopicSeed({
+						seed: () => {
+							if (!seed.binding.isCurrent) throw new InboxChangedError();
+							return buildTopicSeed({
 								entries: seed.entries,
 								messageIds: seed.messageIds,
 								reason: seed.reason,
-								summarize,
-							}),
+								summarize: transcript => summarize(transcript, seed.binding),
+							});
+						},
 					}
 				: {}),
 		});
+		if (seed && !(seed.binding.isCurrent && listed(id))) throw new InboxChangedError();
 		return id;
 	};
 
@@ -246,18 +252,28 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const started = startedFor.get(suggestion.id);
 		let topicId: string;
 		if (started) {
-			if (started.bindingKey !== binding.key || !listed(started.topicId)) {
+			if (started.bindingKey !== binding.generation || !listed(started.topicId)) {
 				startedFor.delete(suggestion.id);
 				throw notInThisInbox(suggestion.id);
 			}
 			topicId = started.topicId;
 		} else {
-			topicId = await spawnTopic({
-				title: suggestion.title,
-				message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
-				seed: { entries: [...box.entries(binding)], messageIds: suggestion.messageIds, reason: suggestion.reason },
-			});
-			startedFor.set(suggestion.id, { bindingKey: binding.key, topicId });
+			try {
+				topicId = await spawnTopic({
+					title: suggestion.title,
+					message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
+					seed: {
+						binding,
+						entries: [...box.entries()],
+						messageIds: suggestion.messageIds,
+						reason: suggestion.reason,
+					},
+				});
+			} catch (error) {
+				if (error instanceof InboxChangedError) throw notInThisInbox(suggestion.id);
+				throw error;
+			}
+			startedFor.set(suggestion.id, { bindingKey: binding.generation, topicId });
 		}
 		const linked = topicId;
 		await commitState(admission, { id: suggestion.id, state: "accepted", topicId, by, atMs: Date.now() }, () => {
@@ -282,12 +298,12 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			if (!seedMessageIds?.length) return { id: await spawnTopic({ title, message, name }) };
 			const admission = admit();
 			const { box, binding } = admission;
-			requireEligibleMessageIds(seedMessageIds, box.branch(binding));
+			requireEligibleMessageIds(seedMessageIds, box.branch());
 			const id = await spawnTopic({
 				title,
 				message,
 				name,
-				seed: { entries: [...box.entries(binding)], messageIds: seedMessageIds },
+				seed: { binding, entries: [...box.entries()], messageIds: seedMessageIds },
 			});
 			noteContinued(admission, {
 				topicId: id,
@@ -338,7 +354,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			const trimmedReason = reason.trim();
 			if (!trimmedTitle) throw new Error("Suggestion title must not be empty.");
 			if (!trimmedReason) throw new Error("Suggestion reason must not be empty.");
-			const branch = box.branch(binding);
+			const branch = box.branch();
 			const index = formatMessageIndex(branch, SUGGEST_INDEX_MESSAGES);
 			if (messageIds.length === 0) {
 				throw new TopicsError(
@@ -359,7 +375,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				messageIds: [...new Set(messageIds)],
 				createdMs: Date.now(),
 			};
-			const pending = { bindingKey: binding.key, suggestion };
+			const pending = { bindingKey: binding.generation, suggestion };
 			unsaved.push(pending);
 			void box
 				.appendNote(binding, {
@@ -384,7 +400,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				return { topicId: suggestion.topicId, alreadyAccepted: true };
 			}
 			const operation = acceptOnce(admission, suggestion, by);
-			accepting.set(suggestionId, { bindingKey: admission.binding.key, promise: operation });
+			accepting.set(suggestionId, { bindingKey: admission.binding.generation, promise: operation });
 			try {
 				return { topicId: await operation, alreadyAccepted: false };
 			} finally {
@@ -404,14 +420,14 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			if (
 				suggestion.state === "accepted" ||
 				acceptingHere(admission, suggestionId) ||
-				started?.bindingKey === admission.binding.key
+				started?.bindingKey === admission.binding.generation
 			) {
 				throw new TopicsError("already_accepted", `Suggestion ${suggestionId} was already accepted.`);
 			}
 			// The journal keeps only saved states: a dismissal whose write failed left nothing, so it is retried.
 			if (suggestion.state === "dismissed") return { alreadyDismissed: true };
 			const operation = commitState(admission, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
-			dismissing.set(suggestionId, { bindingKey: admission.binding.key, promise: operation });
+			dismissing.set(suggestionId, { bindingKey: admission.binding.generation, promise: operation });
 			try {
 				await operation;
 				return { alreadyDismissed: false };
@@ -424,11 +440,10 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			if (box.turnPending(TOPIC_ORGANISE_TYPE)) {
 				throw new TopicsError("organise_running", "An Organise turn is already queued or running.");
 			}
-			// Rendered right before dispatch, from the bound transcript only.
+			// Rendered right before dispatch; the session refuses the turn if the bound transcript is gone by then.
 			return box.queueTurn(binding, TOPIC_ORGANISE_TYPE, () => {
-				const index = formatMessageIndex(box.branch(binding), ORGANISE_INDEX_MESSAGES);
+				const index = formatMessageIndex(box.branch(), ORGANISE_INDEX_MESSAGES);
 				return {
-					customType: TOPIC_ORGANISE_TYPE,
 					content: prompt.render(topicOrganiseTemplate, { index: index || "(none)" }).trim(),
 					details: { by },
 				};
