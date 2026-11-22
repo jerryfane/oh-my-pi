@@ -65,10 +65,10 @@ import type {
 	WorkerView,
 } from "./worker-scope";
 
-/** A first-turn seed: built inside the turn; `stillWanted` is checked again where the turn dispatches. */
+/** A first-turn seed: built inside the turn; `dispatch` runs where the turn dispatches and throws to cancel it. */
 export interface VibeSeed {
 	build(): Promise<string>;
-	stillWanted(): boolean;
+	dispatch(): void;
 }
 
 /** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
@@ -886,7 +886,7 @@ export class VibeSessionRegistry {
 	/**
 	 * Spawn a persistent worker session and start its first turn in the background.
 	 * `seed` is built inside that turn, before it runs, and put ahead of `prompt`; a failed seed fails that turn,
-	 * and a seed no longer wanted when the turn would dispatch cancels it.
+	 * and so does a seed whose `dispatch` refuses the turn.
 	 */
 	async spawn(
 		session: ToolSession,
@@ -1657,10 +1657,8 @@ export class VibeSessionRegistry {
 								onProgress,
 							)
 						: undefined;
-					// At dispatch: a seed whose source is gone cancels the first turn before anything runs.
-					if (options.seed && !options.seed.stillWanted()) {
-						throw new ToolError(`Vibe session "${record.id}" was cancelled: its seed's source was replaced.`);
-					}
+					// At dispatch: the seed's owner may still cancel the first turn before anything runs.
+					options.seed?.dispatch();
 					const result = spawnOptions
 						? await runSubprocess({ ...spawnOptions, topicBoard })
 						: await runSubagentFollowUpTurn({

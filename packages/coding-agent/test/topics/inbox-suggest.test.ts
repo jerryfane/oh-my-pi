@@ -31,7 +31,7 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import type { ExecutorOptions } from "@oh-my-pi/pi-coding-agent/task/executor";
 import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
-import { InboxChangedError } from "@oh-my-pi/pi-coding-agent/topics/binding";
+import { StaleTranscriptError } from "@oh-my-pi/pi-coding-agent/session/inbox-epoch";
 import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import { sessionInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import type { SeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
@@ -49,6 +49,7 @@ const managers: AsyncJobManager[] = [];
 const temps: TempDir[] = [];
 
 afterEach(async () => {
+	vi.restoreAllMocks();
 	for (const session of sessions.splice(0)) await session.dispose();
 	for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 100 });
 	resetTopicsRegistryForTests();
@@ -200,8 +201,8 @@ describe("Inbox notes", () => {
 	it("saves two notes appended one after the other, each awaited", async () => {
 		const inbox = await openInbox(() => ({ content: ["ok"] }));
 		const box = sessionInbox(inbox.session);
-		expect(await box.appendNote(box.bind(), { customType: "note-a", content: "first", details: {} })).toBe(true);
-		expect(await box.appendNote(box.bind(), { customType: "note-b", content: "second", details: {} })).toBe(true);
+		expect(await box.appendNote(box.capture(), { customType: "note-a", content: "first", details: {} })).toBe(true);
+		expect(await box.appendNote(box.capture(), { customType: "note-b", content: "second", details: {} })).toBe(true);
 		expect(notesOf(inbox.manager, "note-a")).toHaveLength(1);
 		expect(notesOf(inbox.manager, "note-b")).toHaveLength(1);
 	});
@@ -218,7 +219,7 @@ describe("Inbox notes", () => {
 		const inbox = await openInbox(() => ({ content: ["the answer"] }));
 		const box = sessionInbox(inbox.session);
 		const turn = inbox.session.prompt("a question");
-		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.capture(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		expect(await saved).toBe(true);
 		await turn;
 		await inbox.session.waitForIdle();
@@ -244,7 +245,7 @@ describe("Inbox notes", () => {
 		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
 		await setup.promise;
 		expect(inbox.session.isStreaming).toBe(true);
-		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.capture(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		failWake.reject(new Error("wake setup failed"));
 
 		expect(await saved).toBe(true);
@@ -263,7 +264,7 @@ describe("Inbox notes", () => {
 		});
 		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
 		await setup.promise;
-		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.capture(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		await inbox.session.dispose({ drainTimeoutMs: 10 });
 		sessions.splice(sessions.indexOf(inbox.session), 1);
 
@@ -280,7 +281,7 @@ describe("Inbox notes", () => {
 			}
 		});
 		const box = sessionInbox(inbox.session);
-		expect(await box.appendNote(box.bind(), { customType: "note-live", content: "x", details: {} })).toBe(true);
+		expect(await box.appendNote(box.capture(), { customType: "note-live", content: "x", details: {} })).toBe(true);
 		expect(events).toEqual(["message_start:note-live", "message_end:note-live"]);
 	});
 
@@ -299,7 +300,7 @@ describe("Inbox notes", () => {
 		inbox.host.onChange(change => changes.push(change.reason));
 
 		const box = sessionInbox(inbox.session);
-		expect(await box.appendNote(box.bind(), { customType: "note-fail", content: "x", details: {} })).toBe(false);
+		expect(await box.appendNote(box.capture(), { customType: "note-fail", content: "x", details: {} })).toBe(false);
 		const suggestion = inbox.host.suggest({ title: "Offsite", reason: "Its own project.", messageIds: [ask] });
 		await expect(record.mock.results[1]!.value).rejects.toThrow("disk full");
 		// The host settles the suggestion in the continuation of that rejected write.
@@ -310,6 +311,185 @@ describe("Inbox notes", () => {
 			.getEntries()
 			.some(entry => entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE);
 		expect(inbox.host.suggestions().some(open => open.id === suggestion.id)).toBe(inJournal);
+	});
+});
+
+describe("Inbox epochs: bound work is aborted when the transcript is replaced (#11 review)", () => {
+	function conversation(manager: SessionManager): void {
+		manager.appendMessage({ role: "user", content: "OLD-INBOX-EXCERPT first question", timestamp: 1 });
+		manager.appendMessage(createAssistantMessage("first answer"));
+		manager.appendMessage({ role: "user", content: "second question", timestamp: 2 });
+		manager.appendMessage(createAssistantMessage("second answer"));
+	}
+
+	function rows(manager: SessionManager, customType: string): unknown[] {
+		return manager.getEntries().filter(entry => "customType" in entry && entry.customType === customType);
+	}
+
+	it("drops an Organise queued behind a running turn when /tree moves the branch: never sent, never saved", async () => {
+		const arrived = Promise.withResolvers<void>();
+		const release = Promise.withResolvers<void>();
+		const inbox = await openInbox(async context => {
+			const text = lastText(context);
+			if (text === "long question") {
+				arrived.resolve();
+				await release.promise;
+				return { content: ["the full answer"] };
+			}
+			return { content: [text.includes(ORGANISE_MARK) ? "organised" : "ok"] };
+		}, conversation);
+		const firstAnswer = inbox.manager
+			.getEntries()
+			.find(entry => entry.type === "message" && textOf(entry.message as Message) === "first answer")!;
+		const running = inbox.session.prompt("long question");
+		await arrived.promise;
+		expect(await inbox.host.organise({ by: "owner" })).toEqual({ queued: true });
+		// While the Organise waits in the queue, /tree moves the branch.
+		const navigating = inbox.session.navigateTree(firstAnswer.id);
+		release.resolve();
+		await running;
+		expect((await navigating).cancelled).toBe(false);
+		await inbox.session.waitForIdle();
+
+		expect(inbox.requests.some(request => request.map(textOf).join("\n").includes(ORGANISE_MARK))).toBe(false);
+		expect(rows(inbox.manager, TOPIC_ORGANISE_TYPE)).toEqual([]);
+		expect(await inbox.host.organise({ by: "owner" })).toEqual({ queued: false });
+		await inbox.session.waitForIdle();
+	});
+
+	it("keeps outgoing work aborted after a /new whose install failed: it never writes into the successor", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }), conversation, true);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const box = sessionInbox(inbox.session);
+		const outgoing = box.capture();
+		const install = inbox.manager.newSession.bind(inbox.manager);
+		vi.spyOn(inbox.manager, "newSession").mockImplementationOnce(async (...args) => {
+			await install(...args);
+			throw new Error("disk full after install");
+		});
+		await expect(inbox.session.newSession()).rejects.toThrow("disk full after install");
+
+		await expect(box.appendState(outgoing, "probe-outgoing", {})).rejects.toBeInstanceOf(StaleTranscriptError);
+		expect(rows(inbox.manager, "probe-outgoing")).toEqual([]);
+		expect(box.capture().id).not.toBe(outgoing.id);
+	});
+
+	it("keeps outgoing work aborted after a fork whose install failed", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }), conversation, true);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const box = sessionInbox(inbox.session);
+		const outgoing = box.capture();
+		const fork = inbox.manager.fork.bind(inbox.manager);
+		vi.spyOn(inbox.manager, "fork").mockImplementationOnce(async () => {
+			await fork();
+			throw new Error("disk full after install");
+		});
+		await expect(inbox.session.fork()).rejects.toThrow("disk full after install");
+
+		await expect(box.appendState(outgoing, "probe-outgoing", {})).rejects.toBeInstanceOf(StaleTranscriptError);
+		expect(rows(inbox.manager, "probe-outgoing")).toEqual([]);
+	});
+
+	it("reopens a suggestion whose seed was cancelled after accept; a repeat accept starts a fresh, linked topic", async () => {
+		const summaryAsked = Promise.withResolvers<void>();
+		const summary = Promise.withResolvers<string | undefined>();
+		let held = true;
+		const summarize = vi.fn<SeedSummarizer>(async () => {
+			if (!held) return "SUMMARY";
+			summaryAsked.resolve();
+			return summary.promise;
+		});
+		const ids: string[] = [];
+		const inbox = await openInbox(
+			() => ({ content: ["ok"] }),
+			manager => {
+				for (let n = 1; n <= 32; n++) {
+					ids.push(
+						n % 2
+							? manager.appendMessage({ role: "user", content: `SEED-TEXT ${n}`, timestamp: n })
+							: manager.appendMessage(createAssistantMessage(`SEED-TEXT ${n}`)),
+					);
+				}
+			},
+			true,
+			summarize,
+		);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const firstTurns = vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => ({
+			index: options.index,
+			id: options.id,
+			agent: options.agent.name,
+			agentSource: options.agent.source,
+			task: options.task,
+			exitCode: 0,
+			output: "done",
+			stderr: "",
+			truncated: false,
+			durationMs: 1,
+			tokens: 0,
+			requests: 0,
+		}));
+		const suggested = Promise.withResolvers<void>();
+		inbox.host.onChange(change => {
+			if (change.reason === "suggested") suggested.resolve();
+		});
+		const { id } = inbox.host.suggest({ title: "Long", reason: "r", messageIds: ids });
+		await suggested.promise;
+
+		const first = await inbox.host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await summaryAsked.promise;
+		expect(await inbox.session.switchSession(inbox.manager.getSessionFile()!)).toBe(true);
+		summary.resolve("LATE SUMMARY");
+		await inbox.jobs.getJob(`${first.topicId}-t1`)?.promise.catch(() => {});
+		await Bun.sleep(0);
+		expect(firstTurns).not.toHaveBeenCalled();
+		expect(rows(inbox.manager, "topic-suggestion-state")).toEqual([]);
+		expect(inbox.host.suggestions().map(open => open.id)).toEqual([id]);
+
+		held = false;
+		const retried = await inbox.host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		expect(retried.alreadyAccepted).toBe(false);
+		expect(retried.topicId).not.toBe(first.topicId);
+		await inbox.jobs.getJob(`${retried.topicId}-t1`)?.promise.catch(() => {});
+		await Bun.sleep(0);
+		expect(firstTurns).toHaveBeenCalledTimes(1);
+		expect(rows(inbox.manager, "topic-suggestion-state")).toMatchObject([
+			{ data: { id, state: "accepted", topicId: retried.topicId } },
+		]);
+	});
+
+	it("refuses at once a bound write a transition's own callback awaits: no deadlock", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }), conversation, true);
+		await inbox.manager.ensureOnDisk();
+		await inbox.manager.flush();
+		const box = sessionInbox(inbox.session);
+		const original = inbox.manager.getSessionFile()!;
+		const bound = box.capture();
+		const elsewhere = path.join(path.dirname(original), "elsewhere");
+		fs.mkdirSync(elsewhere, { recursive: true });
+		const target = SessionManager.create(elsewhere, path.dirname(original));
+		target.appendMessage({ role: "user", content: "target", timestamp: 3 });
+		await target.ensureOnDisk();
+		await target.flush();
+		let outcome: unknown;
+		const switched = await inbox.session
+			.switchSession(target.getSessionFile()!, {
+				onCwdChange: async () => {
+					outcome = await box.appendState(bound, "probe-in-callback", {}).then(
+						() => "written",
+						(error: Error) => error,
+					);
+					return false;
+				},
+			})
+			.catch(() => false);
+
+		expect(switched).toBe(false);
+		expect(outcome).toBeInstanceOf(StaleTranscriptError);
+		expect(rows(inbox.manager, "probe-in-callback")).toEqual([]);
 	});
 });
 
@@ -332,11 +512,11 @@ describe("Transcript identity across every replacement (#9 review)", () => {
 		return manager.getEntries().filter(entry => entry.type === "custom" && entry.customType === customType);
 	}
 
-	it("holds bound writes through a switch and keeps them valid when it rolls back; a binding taken mid-switch matches nothing", async () => {
+	it("aborts work bound before a switch, refuses capture during it at once, and starts a new epoch after its rollback", async () => {
 		const inbox = await persistedInbox();
 		const box = sessionInbox(inbox.session);
 		const original = inbox.manager.getSessionFile()!;
-		const early = box.bind();
+		const early = box.capture();
 		// A session recorded in another directory: the switch asks to change cwd, and that is refused.
 		const elsewhere = path.join(path.dirname(original), "elsewhere");
 		fs.mkdirSync(elsewhere, { recursive: true });
@@ -354,20 +534,24 @@ describe("Transcript identity across every replacement (#9 review)", () => {
 		});
 		await asked.promise;
 		expect(inbox.session.isSessionTransitioning).toBe(true);
-		const late = box.bind();
-		const earlyWrite = box.appendState(early, "probe-early", {});
-		const lateWrite = box.appendState(late, "probe-late", {}).then(
+		// The switch began: work bound before it is aborted, and nothing can bind until it settles.
+		expect(early.signal.aborted).toBe(true);
+		expect(() => box.capture()).toThrow(StaleTranscriptError);
+		const earlyWrite = box.appendState(early, "probe-early", {}).then(
 			() => "written",
 			(error: Error) => error,
 		);
 		decide.resolve(false);
 		await switched.catch(() => false);
 
-		await earlyWrite;
 		expect(inbox.manager.getSessionFile()).toBe(original);
-		expect(stateRows(inbox.manager, "probe-early")).toHaveLength(1);
-		expect(await lateWrite).toBeInstanceOf(InboxChangedError);
-		expect(stateRows(inbox.manager, "probe-late")).toEqual([]);
+		expect(await earlyWrite).toBeInstanceOf(StaleTranscriptError);
+		expect(stateRows(inbox.manager, "probe-early")).toEqual([]);
+		// Rolled back to the original transcript: a new epoch, never the aborted one revived.
+		const after = box.capture();
+		expect(after.id).not.toBe(early.id);
+		await box.appendState(after, "probe-after", {});
+		expect(stateRows(inbox.manager, "probe-after")).toHaveLength(1);
 	});
 
 	it("refuses an Organise held in deferred loading across a /btw promotion", async () => {
@@ -394,7 +578,7 @@ describe("Transcript identity across every replacement (#9 review)", () => {
 		);
 		expect(promoted.cancelled).toBe(false);
 		gate.resolve();
-		expect(await organised).toBeInstanceOf(InboxChangedError);
+		expect(await organised).toBeInstanceOf(StaleTranscriptError);
 		await inbox.session.waitForIdle();
 		expect(inbox.requests.some(request => request.map(textOf).join("\n").includes(ORGANISE_MARK))).toBe(false);
 	});
@@ -414,7 +598,7 @@ describe("Transcript identity across every replacement (#9 review)", () => {
 			await release.promise;
 			await ensureOnDisk();
 		});
-		const write = box.appendState(box.bind(), "probe-tree", {}).then(
+		const write = box.appendState(box.capture(), "probe-tree", {}).then(
 			() => "written",
 			(error: Error) => error,
 		);
@@ -422,18 +606,18 @@ describe("Transcript identity across every replacement (#9 review)", () => {
 		const navigated = await inbox.session.navigateTree(firstAnswer.id);
 		expect(navigated.cancelled).toBe(false);
 		release.resolve();
-		expect(await write).toBeInstanceOf(InboxChangedError);
+		expect(await write).toBeInstanceOf(StaleTranscriptError);
 		await inbox.manager.flush();
 		expect(await Bun.file(file).text()).not.toContain("probe-tree");
 	});
 
 	it("keeps the transcript identity on a fork that does nothing (no session file)", async () => {
 		const inbox = await openInbox(() => ({ content: ["ok"] }), conversation);
-		const generation = inbox.session.transcriptGeneration;
+		const epoch = inbox.session.captureInboxEpoch();
 		expect(await inbox.session.fork()).toBe(false);
-		expect(inbox.session.transcriptGeneration).toBe(generation);
+		expect(epoch.signal.aborted).toBe(false);
+		expect(inbox.session.captureInboxEpoch().id).toBe(epoch.id);
 	});
-
 	it("no longer offers or accepts a suggestion whose messages /clear removed", async () => {
 		let ask = "";
 		const inbox = await openInbox(
@@ -524,7 +708,7 @@ describe("Inbox generation checked at the point of effect (#8 review)", () => {
 		const outcome = await organised;
 		await inbox.session.waitForIdle();
 
-		expect(outcome).toBeInstanceOf(InboxChangedError);
+		expect(outcome).toBeInstanceOf(StaleTranscriptError);
 		expect(JSON.stringify(inbox.manager.getEntries())).not.toContain(OLD);
 		for (const request of inbox.requests.slice(before)) expect(request.map(textOf).join("\n")).not.toContain(OLD);
 	});
@@ -587,7 +771,7 @@ describe("Inbox generation checked at the point of effect (#8 review)", () => {
 		// The topic's first turn runs in the background; give it a moment to (not) ask for a summary.
 		await Bun.sleep(20);
 
-		expect(outcome).toBeInstanceOf(InboxChangedError);
+		expect(outcome).toBeInstanceOf(StaleTranscriptError);
 		expect(summarize).not.toHaveBeenCalled();
 		expect(JSON.stringify(inbox.manager.getEntries())).not.toContain("OLD-SEED-TEXT");
 	});
@@ -614,11 +798,11 @@ describe("Inbox generation checked at the point of effect (#8 review)", () => {
 		await inbox.manager.flush();
 		const file = inbox.manager.getSessionFile()!;
 		const box = sessionInbox(inbox.session);
-		const binding = box.bind();
+		const binding = box.capture();
 		expect(await inbox.session.switchSession(file)).toBe(true);
 
 		await expect(box.appendState(binding, "probe-stale-state", { stale: true })).rejects.toBeInstanceOf(
-			InboxChangedError,
+			StaleTranscriptError,
 		);
 		await inbox.manager.flush();
 		expect(await Bun.file(file).text()).not.toContain("probe-stale-state");

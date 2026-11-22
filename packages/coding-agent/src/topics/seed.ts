@@ -16,7 +16,7 @@ import { escapeHarnessTags } from "../session/harness-tags";
 import { journalCompletion } from "../session/model-usage-journal";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
-import { type InboxBinding, InboxChangedError } from "./binding";
+import { StaleTranscriptError, throwIfStale } from "../session/inbox-epoch";
 import { messageText } from "./suggestions";
 
 /** Chosen messages copied verbatim; older ones are summarised. */
@@ -25,11 +25,17 @@ export const SEED_VERBATIM_MESSAGES = 30;
 const SUMMARY_INPUT_MAX_CHARS = 120_000;
 const SUMMARY_TIMEOUT_MS = 60_000;
 
+/** The Inbox transcript a seed comes from: its session id, and its epoch's signal (aborted once it is replaced). */
+export interface SeedOrigin {
+	sessionId: string;
+	signal: AbortSignal;
+}
+
 /**
  * Condense `transcript` (older messages of the Inbox transcript `origin`) into one summary; undefined (or a
- * rejection) = failed. It works for `origin` only: no request once another transcript is open.
+ * rejection) = failed. It works for `origin` only: an aborted origin cancels it ({@link StaleTranscriptError}).
  */
-export type SeedSummarizer = (transcript: string, origin: InboxBinding) => Promise<string | undefined>;
+export type SeedSummarizer = (transcript: string, origin: SeedOrigin) => Promise<string | undefined>;
 
 interface SeedMessage {
 	role: "user" | "assistant";
@@ -67,7 +73,7 @@ export async function buildTopicSeed(args: {
 			summary = (await args.summarize(transcriptOf(older).slice(-SUMMARY_INPUT_MAX_CHARS)))?.trim() || undefined;
 		} catch (error) {
 			// A replaced transcript cancels the seed; it is not a failed summary to fall back from.
-			if (error instanceof InboxChangedError) throw error;
+			if (error instanceof StaleTranscriptError) throw error;
 			logger.warn("topics: seed summary failed", { error: error instanceof Error ? error.message : String(error) });
 		}
 	}
@@ -91,7 +97,7 @@ export async function buildTopicSeed(args: {
  */
 export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 	return async (transcript, origin) => {
-		if (!origin.isCurrent) throw new InboxChangedError();
+		throwIfStale(origin.signal);
 		const registry = session.modelRegistry;
 		if (!registry) return undefined;
 		const offline = cfgOffline.get(session.settings);
@@ -118,12 +124,13 @@ export function smolSeedSummarizer(session: ToolSession): SeedSummarizer {
 				sessionId,
 				maxTokens: 1024,
 				disableReasoning: true,
-				signal: AbortSignal.timeout(SUMMARY_TIMEOUT_MS),
+				signal: AbortSignal.any([origin.signal, AbortSignal.timeout(SUMMARY_TIMEOUT_MS)]),
 			},
 		);
 		session.costGate?.record(message.usage.cost.total);
-		// Attributed to the origin transcript only: once another is open, the request is not journaled there.
-		if (origin.isCurrent) journal?.(message, transcript);
+		// The origin was replaced while it ran: cancelled, and not journaled in the successor.
+		throwIfStale(origin.signal);
+		journal?.(message, transcript);
 		if (message.stopReason === "error" || message.stopReason === "aborted") return undefined;
 		return message.content
 			.map(block => (block.type === "text" ? block.text : ""))
