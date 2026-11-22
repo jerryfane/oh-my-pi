@@ -548,11 +548,13 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 		} finally {
 			process.chdir(cwd);
 		}
+		stop = result.stop;
 		expect(result.notices).toEqual([]);
 		const endpoint = currentTopicsControl()!;
 		expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(path.join(root!, "rt"));
 		await expectHelloAnswered(endpoint);
-		result.stop?.();
+		stop?.();
+		stop = undefined;
 		expect(currentTopicsControl()).toBeUndefined();
 		expect(fs.readdirSync(path.join(root!, "rt"))).toEqual([]);
 	});
@@ -568,12 +570,15 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 			} finally {
 				process.chdir(cwd);
 			}
+			// Owned by teardown at once: a failed assertion below still stops the listener and clears the endpoint.
+			stop = result.stop;
 			expect(result.notices).toEqual([]);
 			const endpoint = currentTopicsControl()!;
 			// Another process (another cwd) must reach the advertised path.
 			expect(path.dirname(path.dirname(endpoint.socketPath))).toBe(root!);
 			await expectHelloAnswered(endpoint);
-			result.stop?.();
+			stop?.();
+			stop = undefined;
 			expect(fs.readdirSync(root!)).toEqual([]);
 		},
 	);
@@ -645,5 +650,33 @@ describe.skipIf(process.getuid === undefined)("topics control socket path", () =
 		// No listener left behind (nothing keeps the process alive): the moved socket refuses connections.
 		await expect(Bun.connect({ unix: moved, socket: { data() {} } })).rejects.toThrow();
 		expect(fs.readdirSync(root!).filter(name => name.startsWith("omp-topics-"))).toEqual([]);
+	});
+
+	itShort("rolls back a failed publication fully even when the bus unsubscribe throws (#16 review)", async () => {
+		// Publication fails, and so does the bus callback that unsubscribes the request handler.
+		const moved = path.join(root!, "moved.sock");
+		let published: TopicsControlEndpoint | undefined;
+		const bus = {
+			on: () => () => {
+				throw new Error("injected unsubscribe failure");
+			},
+			emit: () => {
+				if (published) return;
+				published = currentTopicsControl();
+				// Keep the socket's inode reachable to see whether its listener still accepts.
+				if (published) fs.renameSync(published.socketPath, moved);
+				throw new Error("injected publication failure");
+			},
+		};
+		const notices: string[] = [];
+		stop = await offerTopicsControl(bus, async () => fakeHost([]), root!, message => notices.push(message));
+
+		expect(stop).toBeUndefined();
+		expect(published).toBeDefined();
+		expect(currentTopicsControl()).toBeUndefined();
+		expect(notices).toHaveLength(1);
+		expect(notices[0]).toContain("injected publication failure");
+		await expect(Bun.connect({ unix: moved, socket: { data() {} } })).rejects.toThrow();
+		expect(fs.existsSync(path.dirname(published!.socketPath))).toBe(false);
 	});
 });

@@ -6,10 +6,11 @@
  * topic by hand) adds a visible `topic-continued` note.
  */
 import * as crypto from "node:crypto";
+import type { TextContent } from "@oh-my-pi/pi-ai";
 import { escapeXmlText } from "@oh-my-pi/pi-utils";
 import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
 import { escapeHarnessTags } from "../session/harness-tags";
-import type { CustomEntry, CustomMessageEntry, SessionEntry } from "../session/session-entries";
+import type { CustomEntry, CustomMessageEntry, SessionEntry, SessionMessageEntry } from "../session/session-entries";
 
 /** `customType` of the visible suggestion message (`details` = {@link TopicSuggestionDetails}). */
 export const TOPIC_SUGGESTION_TYPE = "topic-suggestion";
@@ -175,20 +176,41 @@ export function suggestionSummary(suggestion: TopicSuggestion): TopicSuggestion 
 	return { id, title, reason, messageIds: [...messageIds], createdMs };
 }
 
-/** The text of a user or assistant message entry (text blocks only), or undefined for any other entry. */
-export function messageText(entry: SessionEntry): { role: "user" | "assistant"; text: string } | undefined {
+type TextMessage = Extract<SessionMessageEntry["message"], { role: "user" | "assistant" }>;
+
+/** The one selection rule: a user or assistant message entry's message; undefined for any other entry. */
+function textMessageOf(entry: SessionEntry): TextMessage | undefined {
 	if (entry.type !== "message") return undefined;
 	const message = entry.message;
-	if (message.role !== "user" && message.role !== "assistant") return undefined;
-	const content = message.content;
+	return message.role === "user" || message.role === "assistant" ? message : undefined;
+}
+
+/** Of a message's content, only text blocks count as its text. */
+function isTextBlock(block: TextMessage["content"][number] | string): block is TextContent {
+	return typeof block !== "string" && block.type === "text";
+}
+
+const NONBLANK = /\S/;
+
+/** Whether `message` has nonblank text (the one nonblank rule); nothing is assembled. */
+function hasText({ content }: TextMessage): boolean {
+	if (typeof content === "string") return NONBLANK.test(content);
+	return content.some(block => isTextBlock(block) && NONBLANK.test(block.text));
+}
+
+/** The text of a user or assistant message entry (text blocks only), or undefined for any other entry. */
+export function messageText(entry: SessionEntry): { role: "user" | "assistant"; text: string } | undefined {
+	const message = textMessageOf(entry);
+	if (!message || !hasText(message)) return undefined;
+	const { content } = message;
 	const text =
 		typeof content === "string"
 			? content
 			: content
-					.map(block => (block.type === "text" ? block.text : ""))
+					.map(block => (isTextBlock(block) ? block.text : ""))
 					.filter(Boolean)
 					.join("\n");
-	return text.trim() ? { role: message.role, text } : undefined;
+	return { role: message.role, text };
 }
 
 /**
@@ -197,20 +219,11 @@ export function messageText(entry: SessionEntry): { role: "user" | "assistant"; 
  */
 export function eligibleMessageIds(branch: readonly SessionEntry[]): Set<string> {
 	const ids = new Set<string>();
-	for (const entry of branch) if (hasMessageText(entry)) ids.add(entry.id);
+	for (const entry of branch) {
+		const message = textMessageOf(entry);
+		if (message && hasText(message)) ids.add(entry.id);
+	}
 	return ids;
-}
-
-const NONBLANK = /\S/;
-
-/** Whether {@link messageText} has text for `entry` (a user or assistant message with nonblank text), without building it. */
-function hasMessageText(entry: SessionEntry): boolean {
-	if (entry.type !== "message") return false;
-	const message = entry.message;
-	if (message.role !== "user" && message.role !== "assistant") return false;
-	const content = message.content;
-	if (typeof content === "string") return NONBLANK.test(content);
-	return content.some(block => block.type === "text" && NONBLANK.test(block.text));
 }
 
 /** Check that every id in `ids` is in `eligible` ({@link eligibleMessageIds}); throws `invalid_message_ids` otherwise. */

@@ -1852,10 +1852,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** Settle the {@link recordWithoutTurn} caller of `row`, if any: recorded as entry `outcome`, or dropped. */
 	#settleRecordedRow(row: AgentMessage, outcome: string | Error): void {
 		const waiter = this.#recordedRowWaiters.get(row);
-		if (!waiter) return;
 		this.#recordedRowWaiters.delete(row);
-		if (outcome instanceof Error) waiter.reject(outcome);
-		else waiter.resolve(outcome);
+		if (outcome instanceof Error) waiter?.reject(outcome);
+		else waiter?.resolve(outcome);
 	}
 
 	/** Drop the queued rows with the transcript they were sent to (a transition, disposal). */
@@ -1868,13 +1867,12 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	 * Record `message` in the transcript and the model's context without starting or interrupting a turn:
 	 * now while no run is live, else at the run's boundary (it ends, the next prompt starts, a transition
 	 * saves it), with the rows a live run keeps out of context. It is drawn and saved like any recorded
-	 * custom message, and never steers a turn. Resolves once the entry is on disk; rejects when the session
-	 * is disposed or a transition drops the row first, or when the session file cannot be written.
+	 * custom message, and never steers a turn. Resolves once the entry is on disk; rejects for a row the journal
+	 * never saves, when disposal or a transition drops the row first, or when the file cannot be written.
 	 */
 	async recordWithoutTurn(message: CustomMessage, transcriptSignal?: AbortSignal): Promise<void> {
 		if (this.#isDisposed) throw new Error("The session is disposed.");
 		throwIfStale(transcriptSignal);
-		// Decided at admission with the journal's own rule: a row it never saves would never settle.
 		if (!isJournaledCustomMessage(message)) {
 			throw new Error(`A "${message.customType}" message is never saved in the session, so it cannot be recorded.`);
 		}
@@ -10028,7 +10026,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const setupAbort = new AbortController();
 		this.#promptSetupAbortController = setupAbort;
 		try {
-			// A transcript-bound prompt is admitted at its last transcript check, right before dispatch.
 			if (!options?.transcriptSignal) options?.onPromptAdmitted?.();
 			await this.#recovery.maybeRestoreRetryFallbackPrimary();
 			// Auto-prewalk: return from the previous task's handoff before the usage preflight checks the model,
@@ -10230,7 +10227,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
-			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt.
+			// Synchronous from here to dispatch: a replacement begun during setup drops a bound prompt; else admitted.
 			if (options?.transcriptSignal?.aborted) return false;
 			if (options?.transcriptSignal) options.onPromptAdmitted?.();
 			// Consume the xd:// notice only when its previewed revision still holds.
@@ -12051,12 +12048,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Take the queued messages of replaced transcripts out of the agent queues; they are never delivered. */
 	#dropStaleQueuedMessages(): void {
-		const { isLive } = this.#epochs;
 		const steering = this.agent.peekSteeringQueue();
 		const followUp = this.agent.peekFollowUpQueue();
-		if (steering.every(isLive) && followUp.every(isLive)) return;
-		logger.debug("Dropped queued messages of a replaced transcript");
-		this.agent.replaceQueues(steering.filter(isLive), followUp.filter(isLive));
+		if (steering.every(this.#epochs.isLive) && followUp.every(this.#epochs.isLive)) return;
+		this.agent.replaceQueues(steering.filter(this.#epochs.isLive), followUp.filter(this.#epochs.isLive));
+	}
+
+	/** Whether `message` still waits for delivery: in the steering or follow-up queue, or held to be put back. */
+	hasQueuedMessage(message: AgentMessage): boolean {
+		if (this.#heldQueuedMessages.has(message)) return true;
+		return this.agent.peekSteeringQueue().includes(message) || this.agent.peekFollowUpQueue().includes(message);
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {
