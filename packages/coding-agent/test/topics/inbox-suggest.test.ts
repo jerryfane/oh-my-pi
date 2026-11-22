@@ -25,7 +25,7 @@ import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry
 import { createAgentSession } from "@oh-my-pi/pi-coding-agent/sdk";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
-import type { CustomMessageEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
+import type { CustomMessageEntry, SessionEntry } from "@oh-my-pi/pi-coding-agent/session/session-entries";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
@@ -175,6 +175,48 @@ describe("topic_suggest registration", () => {
 		expect(await toolNames({ "topics.enabled": false }, false)).not.toContain("topic_suggest");
 		expect(await toolNames({ "topics.enabled": true }, true)).not.toContain("topic_suggest");
 	}, 60_000);
+});
+
+describe("Inbox notes", () => {
+	function notesOf(manager: SessionManager, customType: string): CustomMessageEntry[] {
+		return manager
+			.getEntries()
+			.filter(
+				(entry): entry is CustomMessageEntry => entry.type === "custom_message" && entry.customType === customType,
+			);
+	}
+
+	it("saves two notes appended one after the other, each awaited", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }));
+		const box = sessionInbox(inbox.session);
+		expect(await box.appendNote({ customType: "note-a", content: "first", details: {} })).toBe(true);
+		expect(await box.appendNote({ customType: "note-b", content: "second", details: {} })).toBe(true);
+		expect(notesOf(inbox.manager, "note-a")).toHaveLength(1);
+		expect(notesOf(inbox.manager, "note-b")).toHaveLength(1);
+	});
+
+	/** Index of `predicate`'s first entry; -1 when none. */
+	function indexOf(manager: SessionManager, predicate: (entry: SessionEntry) => boolean): number {
+		return manager.getEntries().findIndex(predicate);
+	}
+	const isAnswer = (entry: SessionEntry): boolean =>
+		entry.type === "message" && entry.message.role === "assistant" && textOf(entry.message) === "the answer";
+	const isNote = (entry: SessionEntry): boolean => entry.type === "custom_message" && entry.customType === "note-race";
+
+	it("holds a note appended while a turn is starting until that turn ends, and never steers it", async () => {
+		const inbox = await openInbox(() => ({ content: ["the answer"] }));
+		const box = sessionInbox(inbox.session);
+		const turn = inbox.session.prompt("a question");
+		const saved = box.appendNote({ customType: "note-race", content: "NOTE-TEXT", details: {} });
+		expect(await saved).toBe(true);
+		await turn;
+		await inbox.session.waitForIdle();
+
+		expect(inbox.requests).toHaveLength(1);
+		expect(inbox.requests[0]!.map(textOf).join("\n")).not.toContain("NOTE-TEXT");
+		expect(indexOf(inbox.manager, isAnswer)).toBeGreaterThan(-1);
+		expect(indexOf(inbox.manager, isNote)).toBeGreaterThan(indexOf(inbox.manager, isAnswer));
+	});
 });
 
 describe("Inbox suggestions and Organise", () => {

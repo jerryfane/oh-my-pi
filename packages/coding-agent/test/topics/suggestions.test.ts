@@ -22,7 +22,9 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
+import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -36,7 +38,7 @@ import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { InboxMessage, TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
-import { buildTopicSeed, type SeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
+import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
 	foldSuggestions,
 	TOPIC_CONTINUED_TYPE,
@@ -550,5 +552,22 @@ describe("topic suggestions", () => {
 		expect(await codeOf(() => host.organise({ by: "owner" }))).toBe("organise_running");
 		turnPending = false;
 		expect(host.organise({ by: "owner" })).toEqual({ queued: false });
+	});
+});
+
+describe("seed summary model", () => {
+	it("uses the smol role's default priority chain when no smol role is configured", async () => {
+		registerMockApi();
+		const mock = createMockModel({ id: "claude-haiku-4-5", handler: { content: ["CONDENSED"] } });
+		const registry = {
+			getAvailable: () => [mock.model],
+			resolver: () => async () => "test-key",
+		} as unknown as ModelRegistry;
+		const settings = Settings.isolated();
+		expect(settings.getModelRole("smol")).toBeUndefined();
+		const session = { settings, modelRegistry: registry } as unknown as ToolSession;
+
+		expect(await smolSeedSummarizer(session)("<message>older</message>")).toBe("CONDENSED");
+		expect(mock.calls).toHaveLength(1);
 	});
 });
