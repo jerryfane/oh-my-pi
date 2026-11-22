@@ -469,6 +469,8 @@ export interface ExecutorOptions {
 	steps?: string[];
 	/** Topic board sent ahead of the first prompt (topic workers; see {@link PromptOptions.topicBoard}). */
 	topicBoard?: string;
+	/** Called once the child session admits the first prompt (see {@link PromptOptions.onPromptAdmitted}). */
+	onFirstPromptAdmitted?: () => void;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -2692,9 +2694,11 @@ async function driveSessionToResult(
 		stepReports?: StepReportRoute;
 		/** Topic board for the initial prompt; see {@link PromptOptions.topicBoard}. */
 		topicBoard?: string;
+		/** Called once the session admits the initial prompt. */
+		onFirstPromptAdmitted?: () => void;
 	} = {},
 ): Promise<DriveOutcome> {
-	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard } = options;
+	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted } = options;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2807,7 +2811,12 @@ async function driveSessionToResult(
 			for (;;) {
 				try {
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
-					else await dispatchPrompt(task, { attribution: "agent", solutionSpace, topicBoard }, "initial prompt");
+					else
+						await dispatchPrompt(
+							task,
+							{ attribution: "agent", solutionSpace, topicBoard, onPromptAdmitted: onFirstPromptAdmitted },
+							"initial prompt",
+						);
 					return;
 				} catch (error) {
 					promptAttempts++;
@@ -5547,6 +5556,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 				steps: options.steps?.length ? { prompts: options.steps, sent: 1 } : undefined,
 				stepReports: options.parentAgentId ? { from: id, to: options.parentAgentId } : undefined,
 				topicBoard: options.topicBoard,
+				onFirstPromptAdmitted: options.onFirstPromptAdmitted,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left

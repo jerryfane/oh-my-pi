@@ -31,9 +31,9 @@ export interface TopicsInbox {
 	/**
 	 * Append a hidden custom entry to the bound transcript, all or nothing: it resolves once the entry is
 	 * on disk; a failed write leaves no entry behind and rejects. An aborted `epoch` is refused
-	 * ({@link StaleTranscriptError}) before and under the write lock, where `check` runs too; refusals write nothing.
+	 * ({@link StaleTranscriptError}) before and under the write lock; refusals write nothing.
 	 */
-	appendState(epoch: InboxEpoch, customType: string, data: unknown, check?: () => void): Promise<void>;
+	appendState(epoch: InboxEpoch, customType: string, data: unknown): Promise<void>;
 	/**
 	 * Record a visible custom message in the bound transcript that the model sees from its next turn on
 	 * ({@link AgentSession.recordWithoutTurn}): now while the Inbox is idle, else at its running turn's
@@ -82,9 +82,8 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 		capture: () => session.captureInboxEpoch(),
 		branch: () => afterLatestReset(manager.getBranch()),
 		entries: () => manager.getEntriesView(),
-		async appendState(epoch, customType, data, check) {
+		async appendState(epoch, customType, data) {
 			await session.appendEntriesAtomically(() => {
-				check?.();
 				manager.appendCustomEntry(customType, data);
 			}, epoch.signal);
 		},
@@ -119,8 +118,15 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				started: false,
 				done() {
 					unsubscribe();
+					epoch.signal.removeEventListener("abort", onAbort);
 					if (turns.get(customType) === turn) turns.delete(customType);
 				},
+			};
+			// A replaced transcript ends a turn that has not started at once: its slot frees, its caller is refused.
+			const onAbort = () => {
+				if (turn.started) return;
+				turn.done();
+				outcome.reject(new StaleTranscriptError());
 			};
 			const unsubscribe = session.subscribe(event => {
 				if (event.type === "message_start" && event.message.role === "custom") {
@@ -132,14 +138,22 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 				}
 			});
 			turns.set(customType, turn);
+			epoch.signal.addEventListener("abort", onAbort, { once: true });
 			// A prompt admitted but still in setup (no run open yet) goes first: starting ahead of it would make it
-			// fail as busy. Wake when its run opens, or when it dispatched, queued or bailed.
-			while (session.hasAdmittedSubmission && !session.isRunActive && !session.isDisposed) {
+			// fail as busy. Wake when its run opens, or when it dispatched, queued or bailed, or the epoch aborted.
+			while (session.hasAdmittedSubmission && !session.isRunActive && !session.isDisposed && !epoch.signal.aborted) {
 				const { promise, resolve } = Promise.withResolvers<void>();
-				const stopWatching = session.subscribeRunState(() => resolve());
-				void session.waitForAdmittedSubmissions().then(resolve);
+				const wake = () => resolve();
+				const stopWatching = session.subscribeRunState(wake);
+				void session.waitForAdmittedSubmissions().then(wake);
+				epoch.signal.addEventListener("abort", wake, { once: true });
 				await promise;
 				stopWatching();
+				epoch.signal.removeEventListener("abort", wake);
+			}
+			if (epoch.signal.aborted) {
+				onAbort();
+				return outcome.promise;
 			}
 			let rendered: Pick<InboxMessage, "content" | "details">;
 			try {

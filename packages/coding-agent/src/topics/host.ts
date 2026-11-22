@@ -26,6 +26,7 @@ import { sessionInbox, type TopicsInbox } from "./inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "./seed";
 import { cfgTopicsEnabled } from "./settings";
 import {
+	eligibleMessageIds,
 	type FoldedSuggestion,
 	foldSuggestions,
 	formatMessageIndex,
@@ -119,10 +120,10 @@ interface InFlight<T> {
 	promise: Promise<T>;
 }
 
-/** A spawned topic, and when its first turn was admitted (it rejects when that turn was cancelled or failed). */
+/** A spawned topic, and whether the child admitted its first prompt (the runtime reports it on every exit). */
 interface StartedTopic {
 	id: string;
-	admitted: Promise<void>;
+	firstTurn: Promise<"admitted" | "refused">;
 }
 
 function requireInbox(inbox: TopicsInbox | undefined): TopicsInbox {
@@ -178,6 +179,10 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const running = map.get(suggestionId);
 		return running?.epochId === epoch.id ? running.promise : undefined;
 	};
+	/** Forget `operation` on `suggestionId` unless a newer one (another epoch's) replaced it meanwhile. */
+	const settleInFlight = <T>(map: Map<string, InFlight<T>>, suggestionId: string, operation: InFlight<T>) => {
+		if (map.get(suggestionId) === operation) map.delete(suggestionId);
+	};
 
 	/** The suggestions of the open transcript: its journal, plus those still being recorded in epoch `epochId`. */
 	const folded = (box: TopicsInbox, epochId: number | undefined) =>
@@ -185,8 +190,6 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			box.entries(),
 			unsaved.filter(entry => entry.epochId === epochId).map(entry => entry.suggestion),
 		);
-	/** The message ids a seed may copy: the current branch after the latest `/clear` (one set per listing). */
-	const eligibleIds = (box: TopicsInbox): Set<string> => new Set(box.branch().map(entry => entry.id));
 	/** Whether `suggestion` is offered for acceptance: open, not being accepted here, and all its messages eligible. */
 	const offered = (suggestion: FoldedSuggestion, eligible: ReadonlySet<string>, epochId: number | undefined): boolean =>
 		suggestion.state === "open" &&
@@ -236,10 +239,8 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const title = args.title.trim();
 		if (!title) throw new Error("Topic title must not be empty.");
 		const seed = args.seed;
-		const admitted = Promise.withResolvers<void>();
-		// Observed by the caller later; never an unhandled rejection meanwhile.
-		admitted.promise.catch(() => {});
-		if (!seed) admitted.resolve();
+		const firstTurn = Promise.withResolvers<"admitted" | "refused">();
+		if (!seed) firstTurn.resolve("admitted");
 		const signal = seed?.admission.epoch.signal;
 		const { id, jobId } = await registry.spawn(session, {
 			cli: "good",
@@ -250,43 +251,28 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				? {
 						seed: {
 							build: async () => {
-								try {
-									throwIfStale(signal);
-									const origin = { sessionId: session.getSessionId?.() ?? "", signal };
-									const text = await buildTopicSeed({
-										entries: seed.entries,
-										messageIds: seed.messageIds,
-										reason: seed.reason,
-										summarize: transcript => summarize(transcript, origin),
-									});
-									throwIfStale(signal);
-									return text;
-								} catch (error) {
-									admitted.reject(error);
-									throw error;
-								}
+								throwIfStale(signal);
+								const origin = { sessionId: session.getSessionId?.() ?? "", signal };
+								const text = await buildTopicSeed({
+									entries: seed.entries,
+									messageIds: seed.messageIds,
+									reason: seed.reason,
+									summarize: transcript => summarize(transcript, origin),
+								});
+								throwIfStale(signal);
+								return text;
 							},
-							dispatch: () => {
-								try {
-									throwIfStale(signal);
-								} catch (error) {
-									admitted.reject(error);
-									throw error;
-								}
-								admitted.resolve();
-							},
+							dispatch: () => throwIfStale(signal),
+							firstTurn: firstTurn.resolve,
 						},
 					}
 				: {}),
 		});
-		// A first turn that fails before it dispatches (its options, its lifecycle write) settles `admitted` too.
-		const turn = session.asyncJobManager?.getJob(jobId)?.promise;
-		turn?.catch(error => admitted.reject(error));
 		if (signal?.aborted) {
-			void endTopic(id, seed?.admission, turn);
+			void endTopic(id, seed?.admission, session.asyncJobManager?.getJob(jobId)?.promise);
 			throw new StaleTranscriptError();
 		}
-		return { id, admitted: admitted.promise };
+		return { id, firstTurn: firstTurn.promise };
 	};
 
 	/**
@@ -295,7 +281,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 */
 	const afterAdmission = async (admission: Admission, started: StartedTopic, commit: () => Promise<void>) => {
 		try {
-			await started.admitted;
+			if ((await started.firstTurn) !== "admitted") throw new Error("The topic's first turn was not admitted.");
 			await commit();
 		} catch (error) {
 			logger.debug("topics: topic not linked; its first turn was cancelled or failed", {
@@ -319,14 +305,21 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 * Accept `suggestion` of the admitted transcript: spawn its topic and return its id at once; the accepted
 	 * state and the note follow once its first turn is admitted. Until then the accept is pending in memory (a
 	 * repeat joins it); if the first turn is cancelled or fails, the suggestion stays open and the topic is ended.
+	 * `entries` is the branch its eligibility was checked on; `settle` ends the pending accept once it is linked or not.
 	 */
-	const accept = async (admission: Admission, suggestion: TopicSuggestion, by: string): Promise<string> => {
+	const accept = async (
+		admission: Admission,
+		suggestion: TopicSuggestion,
+		by: string,
+		entries: readonly SessionEntry[],
+		settle: () => void,
+	): Promise<string> => {
 		const started = await spawnTopic({
 			title: suggestion.title,
 			message: prompt.render(topicAcceptedTemplate, { title: suggestion.title }).trim(),
 			seed: {
 				admission,
-				entries: [...admission.box.branch()],
+				entries: [...entries],
 				messageIds: suggestion.messageIds,
 				reason: suggestion.reason,
 			},
@@ -342,9 +335,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			});
 		})
 			.catch(() => {})
-			.finally(() => {
-				if (accepting.get(suggestion.id)?.epochId === admission.epoch.id) accepting.delete(suggestion.id);
-			});
+			.finally(settle);
 		return topicId;
 	};
 
@@ -354,7 +345,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			if (!seedMessageIds?.length) return { id: (await spawnTopic({ title, message, name })).id };
 			const admission = admit();
 			const entries = admission.box.branch();
-			requireEligibleMessageIds(seedMessageIds, entries);
+			requireEligibleMessageIds(seedMessageIds, eligibleMessageIds(entries));
 			const started = await spawnTopic({
 				title,
 				message,
@@ -386,7 +377,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		suggestions() {
 			if (!inbox) return [];
 			const epochId = openEpochId(inbox);
-			const eligible = eligibleIds(inbox);
+			const eligible = eligibleMessageIds(inbox.branch());
 			return [...folded(inbox, epochId).values()]
 				.filter(suggestion => offered(suggestion, eligible, epochId))
 				.map(suggestionSummary);
@@ -394,7 +385,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		suggestionBoard() {
 			if (!inbox) return { open: [], dismissed: [] };
 			const epochId = openEpochId(inbox);
-			const eligible = eligibleIds(inbox);
+			const eligible = eligibleMessageIds(inbox.branch());
 			const all = [...folded(inbox, epochId).values()];
 			return {
 				open: all.filter(suggestion => offered(suggestion, eligible, epochId)).map(suggestionSummary),
@@ -421,7 +412,7 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 				);
 			}
 			try {
-				requireEligibleMessageIds(messageIds, branch);
+				requireEligibleMessageIds(messageIds, eligibleMessageIds(branch));
 			} catch (error) {
 				if (!(error instanceof TopicsError)) throw error;
 				throw new TopicsError(error.code, `${error.message} Latest messages of this conversation:\n${index}`);
@@ -450,26 +441,32 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		},
 		async acceptSuggestion({ suggestionId, by }) {
 			const admission = admit();
-			const running = inFlight(accepting, admission, suggestionId);
-			if (running) return { topicId: await running, alreadyAccepted: true };
+			const joined = inFlight(accepting, admission, suggestionId);
+			if (joined) return { topicId: await joined, alreadyAccepted: true };
 			const suggestion = folded(admission.box, admission.epoch.id).get(suggestionId);
 			if (!suggestion) throw new TopicsError("suggestion_not_found", `Unknown suggestion: ${suggestionId}`);
 			if (suggestion.state === "accepted" && suggestion.topicId) {
 				return { topicId: suggestion.topicId, alreadyAccepted: true };
 			}
-			const eligible = eligibleIds(admission.box);
+			const entries = admission.box.branch();
+			const eligible = eligibleMessageIds(entries);
 			if (!suggestion.messageIds.every(id => eligible.has(id))) {
 				throw new TopicsError(
 					"suggestion_not_found",
 					`Suggestion ${suggestionId} names messages this conversation no longer has (cleared).`,
 				);
 			}
-			const operation = accept(admission, suggestion, by);
-			accepting.set(suggestionId, { epochId: admission.epoch.id, promise: operation });
+			// `settle` runs only after `accept` first awaits, so `running` is set by then.
+			const settle = () => settleInFlight(accepting, suggestionId, running);
+			const running: InFlight<string> = {
+				epochId: admission.epoch.id,
+				promise: accept(admission, suggestion, by, entries, settle),
+			};
+			accepting.set(suggestionId, running);
 			try {
-				return { topicId: await operation, alreadyAccepted: false };
+				return { topicId: await running.promise, alreadyAccepted: false };
 			} catch (error) {
-				accepting.delete(suggestionId);
+				settle();
 				throw error;
 			}
 		},
@@ -487,13 +484,16 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 			}
 			// The journal keeps only saved states: a dismissal whose write failed left nothing, so it is retried.
 			if (suggestion.state === "dismissed") return { alreadyDismissed: true };
-			const operation = commitState(admission, { id: suggestionId, state: "dismissed", by, atMs: Date.now() });
-			dismissing.set(suggestionId, { epochId: admission.epoch.id, promise: operation });
+			const operation: InFlight<void> = {
+				epochId: admission.epoch.id,
+				promise: commitState(admission, { id: suggestionId, state: "dismissed", by, atMs: Date.now() }),
+			};
+			dismissing.set(suggestionId, operation);
 			try {
-				await operation;
+				await operation.promise;
 				return { alreadyDismissed: false };
 			} finally {
-				dismissing.delete(suggestionId);
+				settleInFlight(dismissing, suggestionId, operation);
 			}
 		},
 		async organise({ by }) {

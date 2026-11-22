@@ -65,10 +65,16 @@ import type {
 	WorkerView,
 } from "./worker-scope";
 
-/** A first-turn seed: built inside the turn; `dispatch` runs where the turn dispatches and throws to cancel it. */
+/**
+ * A first-turn seed: built inside the turn; `dispatch` runs where the turn dispatches and throws to cancel it.
+ * `firstTurn` reports, exactly once and on every exit, whether the child admitted the first prompt into its own
+ * session (`admitted`) or the turn ended before that (`refused`: a failed seed or setup, a cancelled job, a
+ * refused launch).
+ */
 export interface VibeSeed {
 	build(): Promise<string>;
 	dispatch(): void;
+	firstTurn(outcome: "admitted" | "refused"): void;
 }
 
 /** Types of the registry's own API ({@link VibeSessionRegistry.describe}, `onChange`). */
@@ -1622,6 +1628,12 @@ export class VibeSessionRegistry {
 			record.lastActivityAt = Date.now();
 		};
 
+		let firstTurnReported = !options.seed;
+		const reportFirstTurn = (outcome: "admitted" | "refused") => {
+			if (firstTurnReported) return;
+			firstTurnReported = true;
+			options.seed?.firstTurn(outcome);
+		};
 		const jobId = manager.register(
 			"task",
 			`vibe ${record.cli} ${record.id}: ${firstLine(message, 60)}`,
@@ -1660,7 +1672,11 @@ export class VibeSessionRegistry {
 					// At dispatch: the seed's owner may still cancel the first turn before anything runs.
 					options.seed?.dispatch();
 					const result = spawnOptions
-						? await runSubprocess({ ...spawnOptions, topicBoard })
+						? await runSubprocess({
+								...spawnOptions,
+								topicBoard,
+								onFirstPromptAdmitted: () => reportFirstTurn("admitted"),
+							})
 						: await runSubagentFollowUpTurn({
 								id: record.id,
 								agent: record.agent,
@@ -1683,10 +1699,20 @@ export class VibeSessionRegistry {
 					throw new VibeTurnError(
 						`[vibe:${record.id} cli=${record.cli} turn=${turnIndex}] turn failed: ${reason}`,
 					);
+				} finally {
+					reportFirstTurn("refused");
 				}
 			},
 			{ id: `${record.id}-t${turnIndex}`, agentId: record.id, ownerId: record.ownerId },
 		);
+		// A job the manager never ran, or whose failure it recorded on the job, still ends the first turn.
+		const settled = manager.getJob(jobId)?.promise;
+		if (settled) {
+			void settled.then(
+				() => reportFirstTurn("refused"),
+				() => reportFirstTurn("refused"),
+			);
+		} else reportFirstTurn("refused");
 		// Topic results are read by the owner from the topic itself; they must not land in the parent conversation.
 		if (!this.policy.deliverResults) manager.acknowledgeDeliveries([jobId]);
 		turn.jobId = jobId;

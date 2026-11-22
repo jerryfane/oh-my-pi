@@ -2582,6 +2582,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			unexpectedStopJudgeTimeoutMs: config.unexpectedStopJudgeTimeoutMs,
 		});
 		this.#detachUsageBeforeQueueDequeue = this.agent.addBeforeQueuedMessageDequeueHook(async signal => {
+			this.#dropStaleQueuedMessages();
 			if (
 				!cfgRetryUsageAwareFallback.get(this.settings) ||
 				(this.#usagePreflightReadyForNextModelCall && this.#usagePreflightReadyModel === this.model)
@@ -11398,19 +11399,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (descriptionNotice) this.agent.steer(descriptionNotice);
 			this.agent.steer(normalizedAppMessage);
 		}
-		// Bound to its transcript: a replacement beginning while it waits drops it before it is ever delivered.
-		transcriptSignal?.addEventListener(
-			"abort",
-			() => {
-				const queue = deliverAs === "followUp" ? "followUp" : "steering";
-				const queued = queue === "followUp" ? this.agent.peekFollowUpQueue() : this.agent.peekSteeringQueue();
-				if (!queued.includes(normalizedAppMessage)) return;
-				logger.debug("Dropped a queued message of a replaced transcript", { customType: message.customType });
-				this.agent.replaceQueue(queue, queued.filter(queuedMessage => queuedMessage !== normalizedAppMessage));
-			},
-			{ once: true },
-		);
-		onPromptQueued?.([...prependMessages, ...(descriptionNotice ? [descriptionNotice] : []), normalizedAppMessage]);
+		// Bound to its transcript: a replacement drops the whole batch from the queues at once, and from wherever
+		// it is held (an IRC wake parked it) when that puts it back or the agent dequeues it.
+		const batch = [...prependMessages, ...(descriptionNotice ? [descriptionNotice] : []), normalizedAppMessage];
+		if (transcriptSignal) this.#epochs.bindQueued(batch, transcriptSignal, () => this.#dropStaleQueuedMessages());
+		onPromptQueued?.(batch);
 		onPromptAdmitted?.();
 		this.#scheduleIdleQueueDrain();
 	}
@@ -12051,7 +12044,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	/** End the hold on `messages`; returns those the editor did not take back meanwhile. */
 	#releaseHeldQueuedMessages(messages: readonly AgentMessage[]): AgentMessage[] {
 		for (const message of messages) this.#heldQueuedMessages.delete(message);
-		return messages.filter(message => !this.#withdrawnHeldMessages.has(message));
+		return messages.filter(message => !this.#withdrawnHeldMessages.has(message) && this.#epochs.isLive(message));
+	}
+
+	/** Take the queued messages of replaced transcripts out of the agent queues; they are never delivered. */
+	#dropStaleQueuedMessages(): void {
+		const { isLive } = this.#epochs;
+		const steering = this.agent.peekSteeringQueue();
+		const followUp = this.agent.peekFollowUpQueue();
+		if (steering.every(isLive) && followUp.every(isLive)) return;
+		logger.debug("Dropped queued messages of a replaced transcript");
+		this.agent.replaceQueues(steering.filter(isLive), followUp.filter(isLive));
 	}
 
 	get skillsSettings(): SkillsSettings | undefined {

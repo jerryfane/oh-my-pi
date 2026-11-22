@@ -192,11 +192,15 @@ export function messageText(entry: SessionEntry): { role: "user" | "assistant"; 
 }
 
 /**
- * Check that every id in `ids` names a user or assistant text message on
- * `branch` (the Inbox's current branch); throws `invalid_message_ids` otherwise.
+ * The ids a suggestion or a seed may name: the user and assistant text messages of `branch` (the Inbox's
+ * current branch, after its latest `/clear`). Build it once per branch read; listing, accept and create share it.
  */
-export function requireEligibleMessageIds(ids: readonly string[], branch: readonly SessionEntry[]): void {
-	const eligible = new Set(branch.filter(entry => messageText(entry) !== undefined).map(entry => entry.id));
+export function eligibleMessageIds(branch: readonly SessionEntry[]): Set<string> {
+	return new Set(branch.filter(entry => messageText(entry) !== undefined).map(entry => entry.id));
+}
+
+/** Check that every id in `ids` is in `eligible` ({@link eligibleMessageIds}); throws `invalid_message_ids` otherwise. */
+export function requireEligibleMessageIds(ids: readonly string[], eligible: ReadonlySet<string>): void {
 	const invalid = ids.filter(id => !eligible.has(id));
 	if (invalid.length > 0) {
 		throw new TopicsError(

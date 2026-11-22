@@ -33,6 +33,9 @@ export class InboxEpochs {
 	#nextId = 1;
 	#current: { id: number; controller: AbortController } | undefined = { id: 0, controller: new AbortController() };
 
+	/** Queued messages bound to an epoch's signal, by message. */
+	readonly #boundMessages = new WeakMap<object, AbortSignal>();
+
 	/** The current epoch; throws {@link StaleTranscriptError} at once while a replacement runs. */
 	capture(): InboxEpoch {
 		const current = this.#current;
@@ -50,4 +53,13 @@ export class InboxEpochs {
 	start(): void {
 		this.#current ??= { id: this.#nextId++, controller: new AbortController() };
 	}
+
+	/** Bind `messages` (one queued batch) to `signal`; `onAbort` runs when it aborts. */
+	bindQueued(messages: readonly object[], signal: AbortSignal, onAbort: () => void): void {
+		for (const message of messages) this.#boundMessages.set(message, signal);
+		signal.addEventListener("abort", onAbort, { once: true });
+	}
+
+	/** Whether a queued `message` may still be delivered: unbound, or its transcript was not replaced. */
+	readonly isLive = (message: object): boolean => this.#boundMessages.get(message)?.aborted !== true;
 }

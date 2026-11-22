@@ -139,11 +139,10 @@ describe("topic suggestions", () => {
 			capture: () => inboxEpochs.capture(),
 			branch: () => afterLatestReset(inboxSm.getBranch()),
 			entries: () => inboxSm.getEntriesView(),
-			appendState: async (epoch, customType, data, check) => {
+			appendState: async (epoch, customType, data) => {
 				throwIfStale(epoch.signal);
 				await stateWrite?.();
 				throwIfStale(epoch.signal);
-				check?.();
 				inboxSm.appendCustomEntry(customType, data);
 			},
 			appendNote: async (epoch, { customType, content, details }) => {
@@ -168,10 +167,13 @@ describe("topic suggestions", () => {
 		return host;
 	}
 
-	/** Run every topic's first turn the way the executor leaves it (child transcript, idle ref). */
+	/** Run every topic's first turn the way the executor does (admits its prompt; leaves a child transcript, idle ref). */
 	function mockFirstTurns(): void {
 		vi.spyOn(executorModule, "runSubprocess").mockImplementation(async options => {
 			firstTurns.push(options);
+			// As the executor: a job aborted before it starts is refused before its first prompt.
+			if (options.signal?.aborted) return { ...resultFor(options), exitCode: 1, aborted: true };
+			options.onFirstPromptAdmitted?.();
 			const childFile = path.join(
 				path.dirname(sm.getSessionFile()!),
 				path.basename(sm.getSessionFile()!, ".jsonl"),
@@ -662,12 +664,13 @@ describe("topic suggestions", () => {
 				await ensureOnDisk();
 			});
 			const seed = vi.fn(() => Promise.reject(new Error("seed failed")));
+			const firstTurn = vi.fn();
 			const spawning = registry.spawn(parent(), {
 				cli: "good",
 				name: "Seedless",
 				prompt: "go",
 				title: "Seedless",
-				seed: { build: seed, dispatch: () => {} },
+				seed: { build: seed, dispatch: () => {}, firstTurn },
 			});
 			// Two macrotask turns: anything rejected and unowned by now is reported as unhandled.
 			await macrotask();
@@ -682,6 +685,7 @@ describe("topic suggestions", () => {
 			expect(topic?.state).not.toBe("starting");
 			expect(topic?.turnStartedAt).toBeUndefined();
 			expect(firstTurns).toEqual([]);
+			expect(firstTurn.mock.calls).toEqual([["refused"]]);
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
@@ -750,6 +754,107 @@ describe("topic suggestions", () => {
 		expect(topicsRegistry().worker(parent(), retried.topicId)).toBeDefined();
 	});
 
+
+	it("leaves the suggestion open and links nothing when the first turn fails before dispatch, outside the seed (#12 review)", async () => {
+		// The spawn resolves the worker's model; building its first turn's options then fails, after the
+		// seed, before dispatch: the job records the failure and fulfils its promise.
+		let modelReads = 0;
+		const failing = {
+			...parent(),
+			getActiveModelString: () => {
+				if (modelReads++ > 0) throw new Error("no active model");
+				return undefined;
+			},
+		} as unknown as ToolSession;
+		const host = createTopicsHost(failing, { inbox: inbox(), summarize: async () => "SUMMARY" });
+		hosts.push(host);
+		const ask = user("Plan the offsite");
+		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
+		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		await manager.getJob(`${topicId}-t1`)?.promise;
+		await macrotask();
+		await macrotask();
+
+		expect(firstTurns).toEqual([]);
+		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toEqual([]);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+		expect(topicsRegistry().worker(failing, topicId)).toBeUndefined();
+	});
+
+	it("never links a worker cancelled before its first prompt was admitted; the suggestion stays open (#12 review)", async () => {
+		const summary = Promise.withResolvers<string | undefined>();
+		const host = hostWith(() => summary.promise);
+		const ids = Array.from({ length: 33 }, (_, n) => user(`numbered ${n + 1}`));
+		const { id } = host.suggest({ title: "Cancelled", reason: "r", messageIds: ids });
+		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
+		// The worker is cancelled while its seed is built; the executor then refuses the aborted job.
+		const killing = topicsRegistry().kill(parent(), topicId);
+		summary.resolve("SUMMARY");
+		await killing;
+		await manager.getJob(`${topicId}-t1`)?.promise;
+		await macrotask();
+		await macrotask();
+
+		expect(firstTurns.map(turn => turn.signal?.aborted)).toEqual([true]);
+		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toEqual([]);
+		expect(host.suggestions().map(open => open.id)).toEqual([id]);
+	});
+
+	it("clears only its own in-flight dismissal: an older epoch's ending never drops a newer one (#12 review)", async () => {
+		const host = hostWith();
+		const ask = user("Plan the offsite");
+		const { id } = host.suggest({ title: "Offsite", reason: "r", messageIds: [ask] });
+		const writes = [Promise.withResolvers<void>(), Promise.withResolvers<void>(), Promise.withResolvers<void>()];
+		let started = 0;
+		stateWrite = () => writes[started++]!.promise;
+
+		const older = host.dismissSuggestion({ suggestionId: id, by: "owner" }).catch((error: Error) => error);
+		// The same Inbox reopened: a new epoch, where the same suggestion is dismissed again.
+		switchInbox(sm);
+		const newer = host.dismissSuggestion({ suggestionId: id, by: "owner" });
+		writes[0]!.resolve();
+		expect(await older).toBeInstanceOf(Error);
+		const repeat = host.dismissSuggestion({ suggestionId: id, by: "guest Anna" });
+		for (const write of writes) write.resolve();
+
+		expect(await newer).toEqual({ alreadyDismissed: false });
+		expect(await repeat).toEqual({ alreadyDismissed: true });
+		expect(started).toBe(2);
+		expect(customEntries("custom", TOPIC_SUGGESTION_STATE_TYPE)).toHaveLength(1);
+	});
+
+	it("offers only suggestions whose messages are user or assistant text, as create and suggest require (#12 review)", async () => {
+		const host = hostWith();
+		const ask = user("what is in the file?");
+		const output = sm.appendMessage({
+			role: "toolResult",
+			toolCallId: "call-1",
+			toolName: "read",
+			content: [{ type: "text", text: "TOOL-OUTPUT-BODY" }],
+			isError: false,
+			timestamp: Date.now(),
+		});
+		// Saved by an older build, or edited: it names a tool output.
+		sm.appendCustomMessageEntry(TOPIC_SUGGESTION_TYPE, "Suggested topic: File", true, {
+			id: "sg-tool",
+			title: "File",
+			reason: "r",
+			messageIds: [ask, output],
+			createdMs: 1,
+		});
+		expect(await codeOf(() => host.create({ title: "File", message: "go", seedMessageIds: [ask, output] }))).toBe(
+			"invalid_message_ids",
+		);
+
+		expect(host.suggestions()).toEqual([]);
+		expect(host.suggestionBoard().open).toEqual([]);
+		expect(await codeOf(() => host.acceptSuggestion({ suggestionId: "sg-tool", by: "owner" }))).toBe(
+			"suggestion_not_found",
+		);
+		expect(topicsRegistry().describe(parent())).toEqual([]);
+	});
 
 	it("queues one Organise turn naming the Inbox messages, and refuses another while it is pending", async () => {
 		const host = hostWith();
