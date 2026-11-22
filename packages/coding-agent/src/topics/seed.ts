@@ -42,9 +42,20 @@ interface SeedMessage {
 	text: string;
 }
 
+/** `<` of a tag of the seed's own block (`inbox-history`, `message`), opening or closing. */
+const SEED_TAG_START_RE = /<(?=\s*\/?\s*(?:inbox-history|message)(?![\w-]))/gi;
+
+/**
+ * Inbox text as it goes into the seed: no text can close or open the seed's block or a message of it (or a
+ * harness block): the `<` of such a tag becomes `&lt;`, which the model still reads as the text it was.
+ */
+function seedText(text: string): string {
+	return escapeHarnessTags(text).replace(SEED_TAG_START_RE, "&lt;");
+}
+
 function transcriptOf(messages: readonly SeedMessage[]): string {
 	return messages
-		.map(message => `<message role="${message.role}">\n${escapeHarnessTags(message.text)}\n</message>`)
+		.map(message => `<message role="${message.role}">\n${seedText(message.text)}\n</message>`)
 		.join("\n\n");
 }
 
@@ -79,8 +90,8 @@ export async function buildTopicSeed(args: {
 	}
 	const header = prompt
 		.render(seedTemplate, {
-			reason: args.reason?.trim() ? escapeHarnessTags(args.reason.trim()) : "",
-			summary: summary ? escapeHarnessTags(summary) : "",
+			reason: args.reason?.trim() ? seedText(args.reason.trim()) : "",
+			summary: summary ? seedText(summary) : "",
 			older: older.length,
 			unsummarised: older.length > 0 && !summary ? older.length : 0,
 		})

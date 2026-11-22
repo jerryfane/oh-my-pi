@@ -477,8 +477,10 @@ export interface ExecutorOptions {
 	 */
 	launchSignal?: AbortSignal;
 	/**
-	 * Text put ahead of {@link task} in the first prompt only (a topic's seed): never in the run's metadata
-	 * (`session_init`, its task, progress), so a launch refused before its first prompt is admitted keeps none of it.
+	 * Text put ahead of {@link task} in the first prompt only (a topic's seed), and only when that prompt is admitted
+	 * (with {@link launchSignal}; see {@link PromptOptions.transcriptPreamble}): never in the run's metadata
+	 * (`session_init`, its task, progress) nor in what prompt setup reads (auto-thinking, hooks, mentions), so a
+	 * launch refused before its first prompt is admitted keeps none of it.
 	 */
 	launchPreamble?: string;
 	assignment?: string;
@@ -2714,7 +2716,6 @@ async function driveSessionToResult(
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted, launchSignal } =
 		options;
-	const firstPrompt = options.launchPreamble ? `${options.launchPreamble}\n\n${task}` : task;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2829,13 +2830,14 @@ async function driveSessionToResult(
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
 					else
 						await dispatchPrompt(
-							firstPrompt,
+							task,
 							{
 								attribution: "agent",
 								solutionSpace,
 								topicBoard,
 								onPromptAdmitted: onFirstPromptAdmitted,
 								transcriptSignal: launchSignal,
+								transcriptPreamble: options.launchPreamble,
 							},
 							"initial prompt",
 						);
