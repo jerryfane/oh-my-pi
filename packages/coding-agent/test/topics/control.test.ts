@@ -54,7 +54,7 @@ function fakeHost(sent: Array<{ id: string; message: string }>): TopicsHost {
 			throw new Error("not in this fake");
 		},
 		acceptSuggestion: async () => ({ topicId: "New", alreadyAccepted: false }),
-		dismissSuggestion: () => ({ alreadyDismissed: false }),
+		dismissSuggestion: async () => ({ alreadyDismissed: false }),
 		organise: () => ({ queued: false }),
 		onChange(listener) {
 			listeners.add(listener);
@@ -221,7 +221,7 @@ describe("topics control socket", () => {
 			acceptSuggestion: async () => {
 				throw new TopicsError(refusals.accept!, "Unknown suggestion: sg_x");
 			},
-			dismissSuggestion: () => {
+			dismissSuggestion: async () => {
 				throw new TopicsError(refusals.dismiss!, "Suggestion sg_x was already accepted.");
 			},
 			create: async () => {
