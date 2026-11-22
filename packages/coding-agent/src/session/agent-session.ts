@@ -10224,6 +10224,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					if (eager >= 0) messages.splice(eager, 1);
 				}
 			}
+			const deliverNotices = bound && this.#tools.holdNoticeDelivery(); // Delivered only if `admit` takes the batch.
 			// Consume the xd:// notice only when its previewed revision still holds.
 			// A mount delta or catalog rebuild during the await invalidates it: any
 			// additions carried by the delivered base are recorded as announced,
@@ -10255,7 +10256,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				);
 			}
 			// The batch is final and synchronous to dispatch: a replaced transcript drops a bound prompt; else admitted.
-			if (bound && !bound.admit(messages)) return false;
+			if (bound && !bound.admit(messages, deliverNotices)) return false;
 
 			const agentPromptOptions = options?.toolChoice ? { toolChoice: options.toolChoice } : undefined;
 			const nonMessageTokens = computeNonMessageTokens(this, this.agent.tokenizer, this.settings.revision);

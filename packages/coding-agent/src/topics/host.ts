@@ -277,8 +277,10 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 	 * is built inside that turn (its failure fails the turn), under the admitted transcript's epoch: aborted, it
 	 * cancels the summary request, the seed and the child's launch, whose first prompt is admitted only while the
 	 * epoch is live (the child saves and sends nothing of it otherwise).
-	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused. One whose seed
-	 * fits no model its child can use even at its floor is refused before it is spawned (`seed_too_large`).
+	 * A seeded topic whose transcript was replaced by the time it is spawned is ended and refused; one replaced while
+	 * its seed's room is checked is refused before anything is spawned, and the spawn itself refuses a replaced
+	 * transcript before it writes a thing. One whose seed fits no model its child can use even at its floor is
+	 * refused before it is spawned (`seed_too_large`).
 	 */
 	const spawnTopic = async (args: {
 		title: string;
@@ -289,10 +291,13 @@ export function createTopicsHost(session: ToolSession, options: TopicsHostOption
 		const title = args.title.trim();
 		if (!title) throw new Error("Topic title must not be empty.");
 		const seed = args.seed;
-		if (seed) requireSeedRoom(session, await registry.workerStartModel(session, TOPIC_CLI), topicSeedFloor(seed));
+		const signal = seed?.admission.epoch.signal;
+		if (seed) {
+			requireSeedRoom(session, await registry.workerStartModel(session, TOPIC_CLI), topicSeedFloor(seed));
+			throwIfStale(signal);
+		}
 		const firstTurn = Promise.withResolvers<FirstTurnOutcome>();
 		if (!seed) firstTurn.resolve({ kind: "started" });
-		const signal = seed?.admission.epoch.signal;
 		const { id, jobId } = await registry.spawn(session, {
 			cli: TOPIC_CLI,
 			name: args.name ?? title,

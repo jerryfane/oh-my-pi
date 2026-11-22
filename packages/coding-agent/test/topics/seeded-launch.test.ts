@@ -16,7 +16,7 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { Effort } from "@oh-my-pi/pi-ai";
 import { unregisterCustomApis } from "@oh-my-pi/pi-ai/api-registry";
-import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
+import { createMockModel, type MockResponse, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { closeModelCache } from "@oh-my-pi/pi-catalog/model-cache";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -126,8 +126,8 @@ type Gate = "creation" | "credentials" | "judge";
  * An Inbox whose branch holds `excerptText`, a topics host on it, and a real child launch held at `gate`. With
  * `autoThinking`, the child's model reasons and its thinking level is `auto`: its first prompt is classified by
  * the judge role, a second mock model whose requests are recorded at the provider boundary. The main model (the
- * Inbox's and the child's) has a `contextWindow`-token window (default 200,000); with `refuseFirst`, it refuses
- * its first request with that error. The Inbox's system prompt is `inboxPrompt`. With `unauthenticatedStart`,
+ * Inbox's and the child's) has a `contextWindow`-token window (default 200,000); with `firstResponse`, it answers
+ * its first request so (a refusal, a dropped stream). The Inbox's system prompt is `inboxPrompt`. With `unauthenticatedStart`,
  * topics are configured onto a model of that window whose provider has no credentials, and the parent's active
  * model is the main one (the executor falls back to it).
  */
@@ -137,14 +137,14 @@ async function openLaunch(
 		excerptText = EXCERPT,
 		autoThinking = false,
 		contextWindow,
-		refuseFirst,
+		firstResponse,
 		inboxPrompt = "Inbox",
 		unauthenticatedStart,
 	}: {
 		excerptText?: string;
 		autoThinking?: boolean;
 		contextWindow?: number;
-		refuseFirst?: string;
+		firstResponse?: MockResponse;
 		inboxPrompt?: string;
 		unauthenticatedStart?: number;
 	} = {},
@@ -161,7 +161,7 @@ async function openLaunch(
 		reasoning: autoThinking,
 		handler: context => {
 			requests.push(JSON.stringify(context.messages));
-			if (refuseFirst && requests.length === 1) return { throw: refuseFirst };
+			if (firstResponse && requests.length === 1) return firstResponse;
 			return { content: [{ type: "toolCall", name: "yield", arguments: { type: "result", data: "done" } }] };
 		},
 	});
@@ -613,7 +613,7 @@ describe("a topic started from a suggestion is accepted only once its first requ
 	it("the provider refuses the first request as too long: the topic did not start; it ends, the suggestion stays open", async () => {
 		const launch = await openLaunch("credentials", {
 			contextWindow: 12_000,
-			refuseFirst: "prompt is too long: 13520 tokens > 12000 maximum",
+			firstResponse: { throw: "prompt is too long: 13520 tokens > 12000 maximum" },
 		});
 		const run = await acceptExcerpt(launch);
 
@@ -624,6 +624,30 @@ describe("a topic started from a suggestion is accepted only once its first requ
 			[
 				'Topic "Diokan" could not start',
 				"The copied history is too large for the available models: limit 12000 tokens.",
+				"The suggestion is open again.",
+			].join("\n"),
+		);
+	});
+
+	it("a first answer that only opens a tool call before its stream drops did not start the topic: it ends, the suggestion stays open (#21 review)", async () => {
+		// The block's opening marker (and an empty argument delta, then its closing marker) carries no content.
+		const launch = await openLaunch("credentials", {
+			firstResponse: {
+				content: [{ type: "toolCall", name: "yield", arguments: "" }],
+				stopReason: "error",
+				errorMessage: "socket hang up",
+			},
+		});
+		const run = await acceptExcerpt(launch);
+
+		const change = await expectStartFailed(launch, run);
+		expect(change).toMatchObject({ code: "start_failed" });
+		expect(change).not.toHaveProperty("tokens");
+		expect(change).not.toHaveProperty("limit");
+		expect(noteOf(launch).content).toBe(
+			[
+				'Topic "Diokan" could not start',
+				"Its first request failed: socket hang up",
 				"The suggestion is open again.",
 			].join("\n"),
 		);

@@ -13,6 +13,7 @@ import type { AgentMessage, Tokenizer } from "@oh-my-pi/pi-agent-core";
 import { invalidateMessageCache, promptBudgetTokens } from "@oh-my-pi/pi-agent-core/compaction";
 import type { AssistantMessage, Model, UserMessage } from "@oh-my-pi/pi-ai";
 import * as AIError from "@oh-my-pi/pi-ai/error";
+import { isMeaningfulCompletionEvent } from "@oh-my-pi/pi-ai/utils/empty-completion-retry";
 import type { Settings } from "../config/settings";
 import type { AgentSessionEvent } from "./agent-session-events";
 import { cfgContextPromotionEnabled } from "./context-settings";
@@ -111,9 +112,9 @@ export class PreambleTooLargeError extends Error {
 export type StartFailedCode = "seed_too_large" | "start_failed";
 
 /**
- * How a launch's first request went: `started` once the provider answered it; `start-failed` when its turn ended
- * before that, with the `error` and, for a size cause, the request's `tokens` and the `limit` it exceeded where
- * known; `cancelled` when the launch was aborted first.
+ * How a launch's first request went: `started` once the provider answered it with content; `start-failed` when its
+ * turn ended before that, with the `error` and, for a size cause, the request's `tokens` and the `limit` it exceeded
+ * where known; `cancelled` when the launch was aborted first.
  */
 export type FirstTurnOutcome =
 	| { kind: "started" }
@@ -127,11 +128,12 @@ export interface FirstTurnSession {
 }
 
 /**
- * Watch `session`'s first turn and `report` how its request went, once. It started when the provider answered:
- * the first response content streams in, or an answer ends that is not an error. Retries inside the turn
- * (compaction or context promotion after an overflow) count: a later answer still starts it. The returned function
- * takes the turn and reports when it settles unstarted: `cancelled` once `signal` (the run's) aborted, else
- * `start-failed` ({@link startFailure}). Without `report`, nothing is watched.
+ * Watch `session`'s first turn and `report` how its request went, once. It started when the provider answered with
+ * content: a streamed event that commits a provider attempt ({@link isMeaningfulCompletionEvent}: text, thinking or
+ * tool-call argument content, not a block's opening marker), or an answer that ends without an error. Retries inside
+ * the turn (compaction or context promotion after an overflow) count: a later answer still starts it. The returned
+ * function takes the turn and reports when it settles unstarted: `cancelled` once `signal` (the run's) aborted,
+ * else `start-failed` ({@link startFailure}). Without `report`, nothing is watched.
  */
 export function watchFirstTurn(
 	session: FirstTurnSession,
@@ -145,7 +147,7 @@ export function watchFirstTurn(
 		if (started || (event.type !== "message_update" && event.type !== "message_end")) return;
 		if (event.message.role !== "assistant") return;
 		if (event.type === "message_update") {
-			started = event.assistantMessageEvent.type !== "start";
+			started = isMeaningfulCompletionEvent(event.assistantMessageEvent);
 		} else if (event.message.stopReason === "error" || event.message.stopReason === "aborted") {
 			failure = event.message;
 		} else {
@@ -313,8 +315,19 @@ export class BoundPrompt {
 	 * goes to, joins the prompt in place, so the prompt keeps its identity (turn observation, queued-message
 	 * bookkeeping), with its cached token estimate and conversion invalidated; then the prompt is reported admitted.
 	 * When even the shortest preamble does not fit, the prompt is refused ({@link PreambleTooLargeError}).
+	 * `deliver` is told whether the batch was admitted, so the notices it carries are marked delivered only then.
 	 */
-	admit(messages: AgentMessage[]): boolean {
+	admit(messages: AgentMessage[], deliver?: (admitted: boolean) => void): boolean {
+		let admitted = false;
+		try {
+			admitted = this.#admit(messages);
+			return admitted;
+		} finally {
+			deliver?.(admitted);
+		}
+	}
+
+	#admit(messages: AgentMessage[]): boolean {
 		if (this.#signal.aborted) return false;
 		if (this.#preamble) {
 			const { model, settings } = this.#session;

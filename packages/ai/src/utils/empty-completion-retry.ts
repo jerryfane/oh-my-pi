@@ -38,7 +38,7 @@ export function hasVisibleAssistantContent(message: AssistantMessage): boolean {
 }
 
 /** A streamed event that delivers content worth committing the attempt for. `toolcall_start` and `toolcall_end` markers are excluded: they carry no argument data, so a stream that dies after the start but before any delta content should be retried rather than committed. A `toolcall_delta` with a non-empty delta string is what commits a tool call — string-arg hosts emit `{}` itself as a delta, so completed zero-argument calls commit on their args. Object-arg hosts merge `{}` delta-free (the flush is suppressed and both sweeps finalize through the same `finishToolCallBlock`), so a completed call there is event-identical to an unfilled one and bounded-retries instead. Committing on `toolcall_end` would also commit mid-args transport failures that today recover invisibly via retry. Safe either way: buffered output never reached the consumer and the tool never executed. */
-function isMeaningfulCompletionEvent(event: AssistantMessageEvent): boolean {
+export function isMeaningfulCompletionEvent(event: AssistantMessageEvent): boolean {
 	switch (event.type) {
 		case "text_delta":
 		case "thinking_delta":

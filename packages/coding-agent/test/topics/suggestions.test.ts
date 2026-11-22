@@ -24,7 +24,7 @@ import * as path from "node:path";
 import type { AssistantMessage } from "@oh-my-pi/pi-ai";
 import { createMockModel, registerMockApi } from "@oh-my-pi/pi-ai/providers/mock";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
+import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { InternalUrlRouter } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import { IrcBus } from "@oh-my-pi/pi-coding-agent/irc/bus";
@@ -37,7 +37,7 @@ import * as executorModule from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { formatTopicBoard } from "@oh-my-pi/pi-coding-agent/topics/board";
 import { createTopicsHost, type TopicChange, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
-import { InboxEpochs, throwIfStale } from "@oh-my-pi/pi-coding-agent/session/inbox-epoch";
+import { InboxEpochs, StaleTranscriptError, throwIfStale } from "@oh-my-pi/pi-coding-agent/session/inbox-epoch";
 import { afterLatestReset, type InboxMessage, type TopicsInbox } from "@oh-my-pi/pi-coding-agent/topics/inbox";
 import { buildTopicSeed, type SeedSummarizer, smolSeedSummarizer } from "@oh-my-pi/pi-coding-agent/topics/seed";
 import {
@@ -53,7 +53,8 @@ import { resetTopicsRegistryForTests, topicsRegistry } from "@oh-my-pi/pi-coding
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import { createAssistantMessage } from "../helpers/agent-session-setup";
+import { VIBE_LIFECYCLE_CUSTOM_TYPE } from "@oh-my-pi/pi-coding-agent/vibe/lifecycle";
+import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const OWNER = "Main";
 
@@ -661,6 +662,93 @@ describe("topic suggestions", () => {
 			expect(written).toEqual([]);
 		}
 		expect(changes.some(change => change.reason === "suggestion-accepted")).toBe(false);
+	});
+
+	it("never writes a stale accept into the Inbox that replaced its own while the seed's room was checked (#21 review)", async () => {
+		const authStorage = createInMemoryAuthStorage();
+		authStorage.keys.setRuntime("mock", "test-key");
+		const modelRegistry = new ModelRegistry(authStorage);
+		vi.spyOn(modelRegistry, "getAvailable").mockReturnValue([createMockModel({})]);
+		const lookup = Promise.withResolvers<void>();
+		const looking = Promise.withResolvers<void>();
+		const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+		vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+			looking.resolve();
+			await lookup.promise;
+			return getApiKey(...args);
+		});
+		// The Inbox's tool session follows the open transcript, as the real one does across `/new`.
+		const live = {
+			...parent(),
+			settings: Settings.isolated({ modelRoles: { default: "mock/mock-model", task: "mock/mock-model" } }),
+			modelRegistry,
+			getActiveModelString: () => "mock/mock-model",
+			getSessionId: () => inboxSm.getSessionId(),
+			getSessionFile: () => inboxSm.getSessionFile() ?? null,
+			get sessionManager() {
+				return inboxSm;
+			},
+		} as unknown as ToolSession;
+		const host = createTopicsHost(live, { inbox: inbox(), summarize: async () => "SUMMARY" });
+		hosts.push(host);
+		const changes: TopicChange[] = [];
+		host.onChange(change => changes.push(change));
+		const { id } = host.suggest({ title: "Stale venue", reason: "r", messageIds: [user("Book the venue")] });
+		// Accept waits in the seed's room check (the start model's credential lookup) while `/new` lands.
+		const accepting = codeOf(() => host.acceptSuggestion({ suggestionId: id, by: "owner" }));
+		await looking.promise;
+		const next = SessionManager.create(tempDir.path(), tempDir.path());
+		await next.ensureOnDisk();
+		switchInbox(next);
+		lookup.resolve();
+
+		expect(await accepting).toBe("suggestion_not_found");
+		await macrotask();
+		await macrotask();
+		expect(firstTurns).toEqual([]);
+		expect(changes.filter(change => change.reason === "spawned")).toEqual([]);
+		for (const journal of [sm, next]) {
+			const lifecycle = journal
+				.getEntries()
+				.filter(entry => entry.type === "custom" && entry.customType === VIBE_LIFECYCLE_CUSTOM_TYPE);
+			expect(lifecycle).toEqual([]);
+		}
+		const nextFile = next.getSessionFile();
+		expect(nextFile && fs.existsSync(nextFile) ? fs.readFileSync(nextFile, "utf8") : "").not.toContain("Stale venue");
+		expect(topicsRegistry().describe(live)).toEqual([]);
+	});
+
+	it("watches the first turn of seeded launches only (#21 review)", async () => {
+		const host = hostWith();
+		const plain = await host.create({ title: "Plain", message: "go" });
+		const seeded = await host.create({ title: "Seeded", message: "go", seedMessageIds: [user("Plan the offsite")] });
+		for (const { id } of [plain, seeded]) await manager.getJob(`${id}-t1`)?.promise;
+
+		const watched = (id: string) => firstTurns.find(turn => turn.id === id)?.onFirstTurn !== undefined;
+		expect({ plain: watched(plain.id), seeded: watched(seeded.id) }).toEqual({ plain: false, seeded: true });
+	});
+
+	it("spawns nothing for a seed whose transcript was already replaced: no worker, journal entry or first turn (#21 review)", async () => {
+		const replaced = new AbortController();
+		replaced.abort();
+		const firstTurn = vi.fn();
+		const spawning = topicsRegistry().spawn(parent(), {
+			cli: "good",
+			name: "Stale",
+			prompt: "go",
+			title: "Stale title",
+			seed: {
+				signal: replaced.signal,
+				build: async () => ({ text: "", fit: () => ({ text: "", tokens: 0 }) }),
+				firstTurn,
+			},
+		});
+
+		await expect(spawning).rejects.toBeInstanceOf(StaleTranscriptError);
+		expect(topicsRegistry().describe(parent())).toEqual([]);
+		expect(customEntries("custom", VIBE_LIFECYCLE_CUSTOM_TYPE)).toEqual([]);
+		expect(firstTurns).toEqual([]);
+		expect(firstTurn).not.toHaveBeenCalled();
 	});
 
 	it("settles a topic whose seed fails, never leaving the rejection unhandled, even while the spawn write waits", async () => {
