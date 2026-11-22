@@ -66,7 +66,8 @@ import type {
 } from "./worker-scope";
 
 /**
- * A first-turn seed: built inside the turn, from the transcript `signal` is bound to. The child's launch is bound
+ * A first-turn seed: built inside the turn, from the transcript `signal` is bound to, and put ahead of the first
+ * prompt only ({@link ExecutorOptions.launchPreamble}), never in the worker's metadata. The child's launch is bound
  * to it too ({@link ExecutorOptions.launchSignal}): aborted before the child admitted its first prompt, the launch
  * is cancelled and nothing of it is saved or sent. `firstTurn` reports, exactly once and on every exit, whether the
  * child admitted the first prompt into its own session (`admitted`) or the turn ended before that (`refused`: a
@@ -1662,13 +1663,7 @@ export class VibeSessionRegistry {
 						this.describe(session).filter(topic => topic.id !== record.id),
 					);
 					const spawnOptions = options.first
-						? await this.#buildSpawnOptions(
-								session,
-								record,
-								seed ? `${seed}\n\n${message}` : message,
-								signal,
-								onProgress,
-							)
+						? await this.#buildSpawnOptions(session, record, message, signal, onProgress)
 						: undefined;
 					const result = spawnOptions
 						? await runSubprocess({
@@ -1676,6 +1671,7 @@ export class VibeSessionRegistry {
 								topicBoard,
 								onFirstPromptAdmitted: () => reportFirstTurn("admitted"),
 								launchSignal: options.seed?.signal,
+								launchPreamble: seed,
 							})
 						: await runSubagentFollowUpTurn({
 								id: record.id,

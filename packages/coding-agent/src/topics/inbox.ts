@@ -207,12 +207,7 @@ export function sessionInbox(session: AgentSession): TopicsInbox {
 			if (turn.dispatching || turn.started) return true;
 			// Queued: its own message waits in a queue, or held out of them (an IRC wake parked it) to be put back.
 			// Gone from both without running, it was dropped (an abort, a replaced transcript) or withdrawn.
-			const message = turn.queued;
-			const stillQueued =
-				message !== undefined &&
-				(session.agent.peekFollowUpQueue().includes(message) ||
-					session.agent.peekSteeringQueue().includes(message) ||
-					session.heldQueuedMessages.has(message));
+			const stillQueued = turn.queued !== undefined && session.hasQueuedMessage(turn.queued);
 			if (!stillQueued) turn.done();
 			return stillQueued;
 		},

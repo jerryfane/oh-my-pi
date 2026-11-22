@@ -196,6 +196,16 @@ describe("topic suggestions", () => {
 		});
 	}
 
+	/**
+	 * The first prompt `topicId`'s child was sent, once it ran: the seed (`launchPreamble`) ahead of its task, as the
+	 * executor sends it. The seed is never in the task itself (the run's metadata).
+	 */
+	async function firstPromptOf(topicId: string): Promise<string> {
+		const { task, launchPreamble } = await firstTurnOf(topicId);
+		if (launchPreamble) expect(task).not.toContain(launchPreamble);
+		return launchPreamble ? `${launchPreamble}\n\n${task}` : task;
+	}
+
 	/** The first turn of `topicId`, once it ran. */
 	async function firstTurnOf(topicId: string): Promise<ExecutorOptions> {
 		await manager.getJob(`${topicId}-t1`)?.promise;
@@ -359,7 +369,7 @@ describe("topic suggestions", () => {
 		const { id } = host.suggest({ title: "Pricing", reason: "r", messageIds: [first, second] });
 
 		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
-		const task = (await firstTurnOf(topicId)).task;
+		const task = await firstPromptOf(topicId);
 		expect(task).toContain("first point about pricing");
 		expect(task).toContain("second point about pricing");
 		expect(task).not.toContain("unrelated question");
@@ -394,7 +404,7 @@ describe("topic suggestions", () => {
 		}
 		const { id } = host.suggest({ title: "Long thread", reason: "REASON-TEXT", messageIds: ids });
 		const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
-		const task = (await firstTurnOf(topicId)).task;
+		const task = await firstPromptOf(topicId);
 
 		expect(summarize).toHaveBeenCalledTimes(1);
 		const summarised = summarize.mock.calls[0]![0];
@@ -439,7 +449,7 @@ describe("topic suggestions", () => {
 			const ids = Array.from({ length: 33 }, (_, n) => user(`numbered ${String(n + 1).padStart(2, "0")}`));
 			const { id } = host.suggest({ title: `Fallback ${firstTurns.length}`, reason: "r", messageIds: ids });
 			const { topicId } = await host.acceptSuggestion({ suggestionId: id, by: "owner" });
-			const task = (await firstTurnOf(topicId)).task;
+			const task = await firstPromptOf(topicId);
 			expect(task).toContain("3 earlier messages not summarised.");
 			for (const n of ["01", "02", "03"]) expect(task).not.toContain(`numbered ${n}`);
 			for (const n of ["04", "33"]) expect(task).toContain(`numbered ${n}`);
@@ -460,7 +470,7 @@ describe("topic suggestions", () => {
 		expect(topicsRegistry().describe(parent())).toMatchObject([{ id: accepted.topicId, state: "starting" }]);
 
 		summary.resolve("LATE SUMMARY");
-		expect((await firstTurnOf(accepted.topicId)).task).toContain("LATE SUMMARY");
+		expect(await firstPromptOf(accepted.topicId)).toContain("LATE SUMMARY");
 	});
 
 	it("notes in the Inbox where an accepted suggestion continues", async () => {
@@ -508,7 +518,7 @@ describe("topic suggestions", () => {
 			message: "Write the first draft.",
 			seedMessageIds: [ask],
 		});
-		const task = (await firstTurnOf(topicId)).task;
+		const task = await firstPromptOf(topicId);
 		expect(task).toMatch(/^<inbox-history>\n[\s\S]*Draft the newsletter[\s\S]*<\/inbox-history>\n\nWrite the first draft\.$/);
 		await Bun.sleep(0);
 		expect(customEntries<CustomMessageEntry>("custom_message", TOPIC_CONTINUED_TYPE)).toMatchObject([
@@ -516,7 +526,7 @@ describe("topic suggestions", () => {
 		]);
 
 		const plain = await host.create({ title: "Plain", message: "just this" });
-		expect((await firstTurnOf(plain.id)).task).toBe("just this");
+		expect((await firstPromptOf(plain.id))).toBe("just this");
 		expect(customEntries("custom_message", TOPIC_CONTINUED_TYPE)).toHaveLength(1);
 	});
 

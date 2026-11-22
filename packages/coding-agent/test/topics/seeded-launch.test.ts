@@ -1,11 +1,13 @@
 /**
  * Contract: a seeded topic's child launch is bound to the Inbox transcript its
- * seed was read from (#13 review). The real executor creates the child (the SDK
- * session, a mock provider); when `/tree` moves the Inbox off the seed's source
- * message while that child is still being created, the launch is cancelled:
- * no provider request carries the abandoned excerpt, the child's session file
- * holds none of it (no `session_init`, no prompt row), nothing links the topic
- * in the Inbox, and an accepted suggestion stays open.
+ * seed was read from (#13, #15 review). The real executor creates the child (the
+ * SDK session, a mock provider); when `/tree` moves the Inbox off the seed's
+ * source message while the child is still being set up (its creation, or its
+ * first prompt's credential lookup, after `session_init` was written), the
+ * launch is cancelled: no provider request carries the abandoned excerpt, the
+ * child's session file holds none of it (the seed is only ever part of the
+ * admitted first prompt, never of `session_init`), nothing links the topic in
+ * the Inbox, and an accepted suggestion stays open.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -93,15 +95,21 @@ interface Launch {
 	/** The id of the first answer (before the excerpt) and of the excerpt message. */
 	firstAnswer: string;
 	excerpt: string;
-	/** Resolves once the real SDK child creation started; it waits for `release`. */
-	creating: Promise<void>;
+	/** Resolves once the gated setup step started; it waits for `release`. */
+	gated: Promise<void>;
 	release(): void;
 	/** The options the real executor was called with (its artifacts dir holds the child's session file). */
 	launched: ExecutorOptions[];
 }
 
-/** An Inbox whose branch holds `EXCERPT`, a topics host on it, and a gated real child launch. */
-async function openLaunch(): Promise<Launch> {
+/**
+ * A child setup step held until `release`: the SDK session's creation, or the credential lookup of the child's
+ * first prompt (after `session_init` and extension start, before the prompt's last check).
+ */
+type Gate = "creation" | "credentials";
+
+/** An Inbox whose branch holds `EXCERPT`, a topics host on it, and a real child launch held at `gate`. */
+async function openLaunch(gate: Gate = "creation"): Promise<Launch> {
 	const cwd = path.join(root, "home", "work");
 	const authStorage = createInMemoryAuthStorage();
 	authStorage.keys.setRuntime("mock", "test-key");
@@ -177,13 +185,26 @@ async function openLaunch(): Promise<Launch> {
 		launched.push(options);
 		return runSubprocess({ ...options, enableMCP: false, enableIrc: false });
 	});
-	const creating = Promise.withResolvers<void>();
-	const gate = Promise.withResolvers<void>();
+	const gated = Promise.withResolvers<void>();
+	const held = Promise.withResolvers<void>();
+	let created = false;
 	const createAgentSession = sdkModule.createAgentSession;
 	vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async options => {
-		creating.resolve();
-		await gate.promise;
-		return createAgentSession(options);
+		if (gate === "creation") {
+			gated.resolve();
+			await held.promise;
+		}
+		const result = await createAgentSession(options);
+		created = true;
+		return result;
+	});
+	const getApiKey = modelRegistry.getApiKey.bind(modelRegistry);
+	vi.spyOn(modelRegistry, "getApiKey").mockImplementation(async (...args) => {
+		if (gate === "credentials" && created) {
+			gated.resolve();
+			await held.promise;
+		}
+		return getApiKey(...args);
 	});
 	return {
 		inbox,
@@ -193,18 +214,34 @@ async function openLaunch(): Promise<Launch> {
 		requests,
 		firstAnswer,
 		excerpt,
-		creating: creating.promise,
-		release: () => gate.resolve(),
+		gated: gated.promise,
+		release: () => held.resolve(),
 		launched,
 	};
 }
 
-/** Everything the child's session file (if it was written) holds. */
-function childFile(launch: Launch, topicId: string): string {
+/**
+ * Everything the child's session file (if it was written) holds, once the child was released: its session is
+ * closed then, so the file is complete and no longer rewritten (an idle child is released as its run ends).
+ */
+async function childFile(launch: Launch, topicId: string): Promise<string> {
+	await AgentLifecycleManager.global().dispose();
 	const dir = launch.launched[0]?.artifactsDir;
 	if (!dir) return "";
 	const file = path.join(dir, `${topicId}.jsonl`);
 	return fs.existsSync(file) ? fs.readFileSync(file, "utf8") : "";
+}
+
+/** Resolves once the Inbox recorded the "Continued in" note (the accepted state is saved before it). */
+function linked(launch: Launch): Promise<void> {
+	const { promise, resolve } = Promise.withResolvers<void>();
+	const unsubscribe = launch.inbox.subscribe(event => {
+		if (event.type !== "message_end" || event.message.role !== "custom") return;
+		if (event.message.customType !== TOPIC_CONTINUED_TYPE) return;
+		unsubscribe();
+		resolve();
+	});
+	return promise;
 }
 
 function rows(manager: SessionManager, customType: string): unknown[] {
@@ -216,55 +253,67 @@ async function settled(launch: Launch, topicId: string): Promise<void> {
 	for (let n = 0; n < 5; n++) await Bun.sleep(1);
 }
 
-describe("seeded child launch bound to the Inbox transcript (#13 review)", () => {
-	it("Accept: /tree during the child's creation cancels the launch; nothing is sent, saved or linked", async () => {
-		const launch = await openLaunch();
-		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
-		await Bun.sleep(1);
-		const { topicId } = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
-		await launch.creating;
-		const leaf = launch.manager.getLeafId();
-		expect((await launch.inbox.navigateTree(launch.firstAnswer)).cancelled).toBe(false);
-		expect(launch.manager.getBranch().some(entry => entry.id === launch.excerpt)).toBe(false);
-		launch.release();
-		await settled(launch, topicId);
+describe("seeded child launch bound to the Inbox transcript (#13, #15 review)", () => {
+	describe.each(["creation", "credentials"] as const)("/tree while the child's %s is held", gate => {
+		it("Accept: the launch is cancelled; nothing of the seed is sent or saved, nothing is linked", async () => {
+			const launch = await openLaunch(gate);
+			const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
+			const { topicId } = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+			await launch.gated;
+			const leaf = launch.manager.getLeafId();
+			expect((await launch.inbox.navigateTree(launch.firstAnswer)).cancelled).toBe(false);
+			expect(launch.manager.getBranch().some(entry => entry.id === launch.excerpt)).toBe(false);
+			launch.release();
+			await settled(launch, topicId);
 
-		expect(launch.launched).toHaveLength(1);
-		expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
-		expect(childFile(launch, topicId)).not.toContain(EXCERPT);
-		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
-		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
-		// Back on the branch that holds its message, the suggestion is offered again.
-		if (!leaf) throw new Error("Expected a leaf");
-		await launch.inbox.navigateTree(leaf);
-		expect(launch.host.suggestions().map(open => open.id)).toEqual([suggestion.id]);
+			expect(launch.launched).toHaveLength(1);
+			expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
+			expect(await childFile(launch, topicId)).not.toContain(EXCERPT);
+			expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toEqual([]);
+			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
+			// Back on the branch that holds its message, the suggestion is offered again.
+			if (!leaf) throw new Error("Expected a leaf");
+			await launch.inbox.navigateTree(leaf);
+			expect(launch.host.suggestions().map(open => open.id)).toEqual([suggestion.id]);
+		});
+
+		it("Create: the launch is cancelled; nothing of the seed is sent or saved, nothing is linked", async () => {
+			const launch = await openLaunch(gate);
+			const { id } = await launch.host.create({ title: "Diokan", message: "go", seedMessageIds: [launch.excerpt] });
+			await launch.gated;
+			expect((await launch.inbox.navigateTree(launch.firstAnswer)).cancelled).toBe(false);
+			launch.release();
+			await settled(launch, id);
+
+			expect(launch.launched).toHaveLength(1);
+			expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
+			expect(await childFile(launch, id)).not.toContain(EXCERPT);
+			expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
+		});
 	});
 
 	it("Accept without a replacement: the child admits its seeded prompt, then the topic is linked", async () => {
-		const launch = await openLaunch();
+		const launch = await openLaunch("credentials");
+		const isLinked = linked(launch);
 		const suggestion = launch.host.suggest({ title: "Diokan", reason: "r", messageIds: [launch.excerpt] });
-		await Bun.sleep(1);
 		const { topicId } = await launch.host.acceptSuggestion({ suggestionId: suggestion.id, by: "owner" });
+		await launch.gated;
 		launch.release();
 		await settled(launch, topicId);
+		await isLinked;
 
 		expect(launch.requests.some(request => request.includes(EXCERPT))).toBe(true);
-		expect(childFile(launch, topicId)).toContain(EXCERPT);
+		const file = await childFile(launch, topicId);
+		// The seed is in the child's first prompt only, never in its launch metadata.
+		const init = file
+			.split("\n")
+			.filter(Boolean)
+			.map(line => JSON.parse(line) as { type: string })
+			.filter(entry => entry.type === "session_init");
+		expect(init.length).toBeGreaterThan(0);
+		expect(JSON.stringify(init)).not.toContain(EXCERPT);
+		expect(file).toContain(EXCERPT);
 		expect(rows(launch.manager, TOPIC_SUGGESTION_STATE_TYPE)).toHaveLength(1);
 		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toHaveLength(1);
-	});
-
-	it("Create: /tree during the child's creation cancels the launch; nothing is sent, saved or linked", async () => {
-		const launch = await openLaunch();
-		const { id } = await launch.host.create({ title: "Diokan", message: "go", seedMessageIds: [launch.excerpt] });
-		await launch.creating;
-		expect((await launch.inbox.navigateTree(launch.firstAnswer)).cancelled).toBe(false);
-		launch.release();
-		await settled(launch, id);
-
-		expect(launch.launched).toHaveLength(1);
-		expect(launch.requests.filter(request => request.includes(EXCERPT))).toEqual([]);
-		expect(childFile(launch, id)).not.toContain(EXCERPT);
-		expect(rows(launch.manager, TOPIC_CONTINUED_TYPE)).toEqual([]);
 	});
 });

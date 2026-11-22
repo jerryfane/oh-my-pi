@@ -476,6 +476,11 @@ export interface ExecutorOptions {
 	 * its abort cancels the run, and nothing of the launch (`session_init`, the prompt) is saved or sent after it.
 	 */
 	launchSignal?: AbortSignal;
+	/**
+	 * Text put ahead of {@link task} in the first prompt only (a topic's seed): never in the run's metadata
+	 * (`session_init`, its task, progress), so a launch refused before its first prompt is admitted keeps none of it.
+	 */
+	launchPreamble?: string;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -2703,10 +2708,13 @@ async function driveSessionToResult(
 		onFirstPromptAdmitted?: () => void;
 		/** The initial prompt's transcript signal (see {@link PromptOptions.transcriptSignal}). */
 		launchSignal?: AbortSignal;
+		/** Put ahead of `task` in the initial prompt only (see {@link ExecutorOptions.launchPreamble}). */
+		launchPreamble?: string;
 	} = {},
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted, launchSignal } =
 		options;
+	const firstPrompt = options.launchPreamble ? `${options.launchPreamble}\n\n${task}` : task;
 	const structured = options.structured !== false;
 	const abortSignal = monitor.abortSignal;
 	let exitCode = 0;
@@ -2821,7 +2829,7 @@ async function driveSessionToResult(
 					if (restore) await awaitAbortable(session.restoreInterruptedTurn());
 					else
 						await dispatchPrompt(
-							task,
+							firstPrompt,
 							{
 								attribution: "agent",
 								solutionSpace,
@@ -5582,6 +5590,7 @@ async function runSubprocessOnThisThread(options: ExecutorOptions): Promise<Sing
 					options.onFirstPromptAdmitted?.();
 				},
 				launchSignal: options.launchSignal,
+				launchPreamble: options.launchPreamble,
 			});
 			// Acceptance boundary (#11079): the run's final result is settled, so
 			// stamp the lifecycle and terminalize a ref the run-state mirror left
