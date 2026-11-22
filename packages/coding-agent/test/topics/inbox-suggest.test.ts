@@ -105,7 +105,6 @@ async function openInbox(
 		taskDepth: 0,
 		enableLsp: false,
 	} as unknown as ToolSession;
-	let session!: AgentSession;
 	const agent = new Agent({
 		getApiKey: () => "test-key",
 		initialState: {
@@ -119,7 +118,7 @@ async function openInbox(
 	});
 	const auth = createInMemoryAuthStorage();
 	auth.keys.setRuntime("anthropic", "test-key");
-	session = new AgentSession({
+	const session: AgentSession = new AgentSession({
 		agent,
 		sessionManager: manager,
 		settings: Settings.isolated({ "compaction.enabled": false }),
@@ -190,8 +189,8 @@ describe("Inbox notes", () => {
 	it("saves two notes appended one after the other, each awaited", async () => {
 		const inbox = await openInbox(() => ({ content: ["ok"] }));
 		const box = sessionInbox(inbox.session);
-		expect(await box.appendNote(inbox.manager.getSessionId(), { customType: "note-a", content: "first", details: {} })).toBe(true);
-		expect(await box.appendNote(inbox.manager.getSessionId(), { customType: "note-b", content: "second", details: {} })).toBe(true);
+		expect(await box.appendNote(box.bind(), { customType: "note-a", content: "first", details: {} })).toBe(true);
+		expect(await box.appendNote(box.bind(), { customType: "note-b", content: "second", details: {} })).toBe(true);
 		expect(notesOf(inbox.manager, "note-a")).toHaveLength(1);
 		expect(notesOf(inbox.manager, "note-b")).toHaveLength(1);
 	});
@@ -208,7 +207,7 @@ describe("Inbox notes", () => {
 		const inbox = await openInbox(() => ({ content: ["the answer"] }));
 		const box = sessionInbox(inbox.session);
 		const turn = inbox.session.prompt("a question");
-		const saved = box.appendNote(inbox.manager.getSessionId(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		expect(await saved).toBe(true);
 		await turn;
 		await inbox.session.waitForIdle();
@@ -234,7 +233,7 @@ describe("Inbox notes", () => {
 		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
 		await setup.promise;
 		expect(inbox.session.isStreaming).toBe(true);
-		const saved = box.appendNote(inbox.manager.getSessionId(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		failWake.reject(new Error("wake setup failed"));
 
 		expect(await saved).toBe(true);
@@ -253,7 +252,7 @@ describe("Inbox notes", () => {
 		});
 		await inbox.session.deliverIrcMessage({ id: "m1", from: "Helper", to: OWNER, body: "ping", ts: Date.now() });
 		await setup.promise;
-		const saved = box.appendNote(inbox.manager.getSessionId(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
+		const saved = box.appendNote(box.bind(), { customType: "note-race", content: "NOTE-TEXT", details: {} });
 		await inbox.session.dispose({ drainTimeoutMs: 10 });
 		sessions.splice(sessions.indexOf(inbox.session), 1);
 
@@ -269,9 +268,8 @@ describe("Inbox notes", () => {
 				events.push(`${event.type}:${event.message.customType}`);
 			}
 		});
-		expect(await sessionInbox(inbox.session).appendNote(inbox.manager.getSessionId(), { customType: "note-live", content: "x", details: {} })).toBe(
-			true,
-		);
+		const box = sessionInbox(inbox.session);
+		expect(await box.appendNote(box.bind(), { customType: "note-live", content: "x", details: {} })).toBe(true);
 		expect(events).toEqual(["message_start:note-live", "message_end:note-live"]);
 	});
 
@@ -289,13 +287,8 @@ describe("Inbox notes", () => {
 		const changes: string[] = [];
 		inbox.host.onChange(change => changes.push(change.reason));
 
-		expect(
-			await sessionInbox(inbox.session).appendNote(inbox.manager.getSessionId(), {
-				customType: "note-fail",
-				content: "x",
-				details: {},
-			}),
-		).toBe(false);
+		const box = sessionInbox(inbox.session);
+		expect(await box.appendNote(box.bind(), { customType: "note-fail", content: "x", details: {} })).toBe(false);
 		const suggestion = inbox.host.suggest({ title: "Offsite", reason: "Its own project.", messageIds: [ask] });
 		await expect(record.mock.results[1]!.value).rejects.toThrow("disk full");
 		// The host settles the suggestion in the continuation of that rejected write.
@@ -306,6 +299,66 @@ describe("Inbox notes", () => {
 			.getEntries()
 			.some(entry => entry.type === "custom_message" && entry.customType === TOPIC_SUGGESTION_TYPE);
 		expect(inbox.host.suggestions().some(open => open.id === suggestion.id)).toBe(inJournal);
+	});
+});
+
+describe("Inbox binding (#7 review)", () => {
+	it("refuses an Organise whose Inbox was replaced while it waited behind a prompt in setup", async () => {
+		const inbox = await openInbox(
+			context => ({ content: [lastText(context).includes(ORGANISE_MARK) ? "organised" : "the answer"] }),
+			manager => {
+				manager.appendMessage({ role: "user", content: "OLD-INBOX-EXCERPT about the Diokan deal", timestamp: 1 });
+				manager.appendMessage(createAssistantMessage("noted"));
+			},
+		);
+		// An earlier prompt is held in setup, before its run opens.
+		const gate = Promise.withResolvers<void>();
+		const agentPrompt = inbox.session.agent.prompt.bind(inbox.session.agent) as (...args: unknown[]) => Promise<void>;
+		vi.spyOn(inbox.session.agent, "prompt").mockImplementationOnce((async (...args: unknown[]) => {
+			await gate.promise;
+			return agentPrompt(...args);
+		}) as typeof inbox.session.agent.prompt);
+		const question = inbox.session.prompt("a question").catch(() => false);
+		await Bun.sleep(0);
+		expect(inbox.session.hasAdmittedSubmission).toBe(true);
+		const organised = inbox.host.organise({ by: "owner" }).then(
+			result => result,
+			(error: Error) => error,
+		);
+		const before = inbox.requests.length;
+		const replaced = inbox.session.newSession();
+		await Bun.sleep(0);
+		gate.resolve();
+		await replaced;
+		await question;
+		const outcome = await organised;
+		await inbox.session.waitForIdle();
+
+		expect(outcome).toBeInstanceOf(Error);
+		expect(JSON.stringify(inbox.manager.getEntries())).not.toContain("OLD-INBOX-EXCERPT");
+		for (const request of inbox.requests.slice(before)) {
+			expect(request.map(textOf).join("\n")).not.toContain("OLD-INBOX-EXCERPT");
+		}
+	});
+
+	it("rejects a row the session never saves at once, instead of leaving it pending", async () => {
+		const inbox = await openInbox(() => ({ content: ["ok"] }));
+		const recorded = inbox.session.recordWithoutTurn({
+			role: "custom",
+			customType: "vibe-mode-context",
+			content: "vibe",
+			display: false,
+			attribution: "agent",
+			timestamp: Date.now(),
+		});
+		const settled = await Promise.race([
+			recorded.then(
+				() => "resolved",
+				(error: Error) => error.message,
+			),
+			Bun.sleep(50).then(() => "pending"),
+		]);
+		expect(settled).toContain("never saved");
 	});
 });
 
