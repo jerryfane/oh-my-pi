@@ -24,7 +24,7 @@ import {
 } from "@oh-my-pi/pi-coding-agent/topics/control";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { TopicsError, type TopicsErrorCode } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
-import type { TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
+import type { StartFailedChange, TopicChange, TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import type { WorkerChange } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
@@ -208,6 +208,41 @@ describe("topics control socket", () => {
 		});
 		client.send({ id: "2", type: "topics_list" });
 		expect(await client.next()).toMatchObject({ id: "2", success: true, data: { topics: [{ id: "Diokan" }] } });
+		client.end();
+	});
+
+	it("streams a seeded topic that could not start as one topic_update frame (#19 review)", async () => {
+		stop?.();
+		const listeners = new Set<(change: TopicChange) => void>();
+		const failed: StartFailedChange = {
+			id: "Diokan",
+			ownerId: "Main",
+			parentSessionId: "p",
+			reason: "start-failed",
+			suggestionId: "sg_1",
+			code: "seed_too_large",
+			tokens: 6329,
+			limit: 3400,
+		};
+		const host: TopicsHost = {
+			...fakeHost(sent),
+			onChange(listener) {
+				listeners.add(listener);
+				return () => listeners.delete(listener);
+			},
+		};
+		stop = await startTopicsControl({ path: socketPath, token: TOKEN, topics: async () => host });
+		const client = await connect(socketPath);
+		client.send({ type: "hello", token: TOKEN });
+		await client.next();
+		client.send({ id: "1", type: "subscribe" });
+		expect(await client.next()).toMatchObject({ id: "1", success: true });
+		for (const listener of listeners) listener(failed);
+		client.send({ id: "2", type: "topics_list" });
+		expect([await client.next(), await client.next()]).toEqual([
+			{ type: "topic_update", change: failed },
+			expect.objectContaining({ id: "2", success: true }),
+		]);
 		client.end();
 	});
 

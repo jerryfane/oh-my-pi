@@ -95,6 +95,7 @@ import type { AgentSessionDisposeOptions } from "../session/agent-session-types"
 import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
+import type { TranscriptPreamble } from "../session/inbox-epoch";
 import { type CostCapRefusal, CostCapError, type CostGateApi } from "../session/cost-gate";
 import { INTERRUPTED_TURN_ERROR } from "../session/exit-diagnostics";
 import { SKILL_PROMPT_MESSAGE_TYPE, usageContextTokens } from "../session/messages";
@@ -482,7 +483,7 @@ export interface ExecutorOptions {
 	 * (`session_init`, its task, progress) nor in what prompt setup reads (auto-thinking, hooks, mentions), so a
 	 * launch refused before its first prompt is admitted keeps none of it.
 	 */
-	launchPreamble?: string;
+	launchPreamble?: TranscriptPreamble;
 	assignment?: string;
 	/** Shared background from the task call (`task.batch`), rendered into the subagent's system prompt. */
 	context?: string;
@@ -2711,7 +2712,7 @@ async function driveSessionToResult(
 		/** The initial prompt's transcript signal (see {@link PromptOptions.transcriptSignal}). */
 		launchSignal?: AbortSignal;
 		/** Put ahead of `task` in the initial prompt only (see {@link ExecutorOptions.launchPreamble}). */
-		launchPreamble?: string;
+		launchPreamble?: TranscriptPreamble;
 	} = {},
 ): Promise<DriveOutcome> {
 	const { solutionSpace, onPromptBusy, restore, steps, stepReports, topicBoard, onFirstPromptAdmitted, launchSignal } =

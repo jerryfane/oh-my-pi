@@ -11,3 +11,7 @@ Summary of {{older}} earlier messages:
 
 {{unsummarised}} earlier messages not summarised.
 {{/if}}
+{{#if omitted}}
+
+{{omitted}} earlier messages left out: they do not fit the topic's model.
+{{/if}}

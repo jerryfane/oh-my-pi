@@ -2,7 +2,8 @@
  * Wire definitions of the `topics_*` commands (owner-facing topics; see
  * `topics/host`), spread into the command table and the state definitions.
  * Refusals with a machine-readable reason carry `code` (`suggestion_not_found`,
- * `already_accepted`, `invalid_message_ids`, `organise_running`, `topics_disabled`).
+ * `already_accepted`, `invalid_message_ids`, `organise_running`, `topics_disabled`,
+ * `seed_too_large`).
  */
 import type { RpcCommandSpec } from "./commands";
 import { doc, type WireDefs } from "./dsl";
