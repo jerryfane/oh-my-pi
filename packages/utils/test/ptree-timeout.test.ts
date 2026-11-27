@@ -602,27 +602,90 @@ ${createLinuxSubreaperScript()}
 				await Bun.sleep(550);
 				expect(await Bun.file(streamSentinel).exists()).toBe(false);
 
-				// 5. Late readStdout() registered after the post-exit drain deadline expires immediately (no fresh budget)
+				// 5. Late readStdout() registered after the post-exit drain deadline preserves ready stdout, expires immediately, and kills helper
 				const lateSentinel = path.join(dir, "late-helper.txt");
 				const cp5 = spawn(
 					[
 						"/bin/sh",
 						"-c",
-						`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(lateSentinel)}) 2>/dev/null & echo late-ok; exit 0`,
+						`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(lateSentinel)}) 2>/dev/null & printf late-ok; exit 0`,
 					],
-					{ detached: true, subreaper: false, descendantDrainMs: 80 },
+					{ detached: true, subreaper: false, descendantDrainMs: 60 },
 				);
 				expect(await cp5.exited).toBe(0);
-				await Bun.sleep(160);
-				const tLate = Date.now();
-				await cp5.readStdout(() => {});
-				expect(Date.now() - tLate).toBeLessThan(60);
+				await Bun.sleep(140);
+				const tLate = performance.now();
+				let lateOut = "";
+				const lateDec = new TextDecoder();
+				await cp5.readStdout(chunk => {
+					lateOut += lateDec.decode(chunk, { stream: true });
+				});
+				lateOut += lateDec.decode();
+				expect(lateOut).toBe("late-ok");
+				expect(performance.now() - tLate).toBeLessThan(60);
 				await Bun.sleep(550);
 				expect(await Bun.file(lateSentinel).exists()).toBe(false);
+
+				// 6. Late readStdout(), wait(), and bytes() after deadline with NO descendants preserve ready stdout
+				for (const mode of ["readStdout", "wait", "bytes"] as const) {
+					const cpNoHelper = spawn(["/bin/sh", "-c", "printf normal-output; exit 0"], {
+						detached: true,
+						subreaper: false,
+						descendantDrainMs: 40,
+					});
+					expect(await cpNoHelper.exited).toBe(0);
+					await Bun.sleep(100);
+					if (mode === "readStdout") {
+						let out = "";
+						const d = new TextDecoder();
+						await cpNoHelper.readStdout(c => {
+							out += d.decode(c, { stream: true });
+						});
+						out += d.decode();
+						expect(out).toBe("normal-output");
+					} else if (mode === "wait") {
+						const r = await cpNoHelper.wait();
+						expect(r.stdout).toBe("normal-output");
+					} else {
+						const b = await cpNoHelper.bytes();
+						expect(new TextDecoder().decode(b)).toBe("normal-output");
+					}
+				}
+
+				// 7. Backward wall-clock jump (Date.now) does not extend the monotonic post-exit drain deadline
+				const clockSentinel = path.join(dir, "clock-helper.txt");
+				const cpClock = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(clockSentinel)}) 2>/dev/null & printf clock-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 50 },
+				);
+				expect(await cpClock.exited).toBe(0);
+				await Bun.sleep(120);
+				const realDateNow = Date.now;
+				const dateNowSpy = spyOn(Date, "now").mockImplementation(() => realDateNow() - 10_000);
+				try {
+					const tClock = performance.now();
+					let clockOut = "";
+					const d = new TextDecoder();
+					await cpClock.readStdout(c => {
+						clockOut += d.decode(c, { stream: true });
+					});
+					clockOut += d.decode();
+					expect(clockOut).toBe("clock-ok");
+					expect(performance.now() - tClock).toBeLessThan(60);
+				} finally {
+					dateNowSpy.mockRestore();
+				}
+				await Bun.sleep(450);
+				expect(await Bun.file(clockSentinel).exists()).toBe(false);
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}
 		},
+		30_000,
 	);
 });
 

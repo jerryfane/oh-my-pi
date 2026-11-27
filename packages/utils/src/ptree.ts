@@ -109,8 +109,10 @@ const child = Bun.spawn(command, {
 
 async function relay(stream, destination) {
 	const writer = destination.writer();
-	for await (const chunk of stream) writer.write(chunk);
-	await writer.flush();
+	for await (const chunk of stream) {
+		writer.write(chunk);
+		await writer.flush();
+	}
 }
 
 function hasLiveChildren() {
@@ -372,7 +374,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			.catch(() => null)
 			.then(async exitCode => {
 				if (!this.#hardKillTree && this.#descendantDrainMs !== undefined && this.#drainDeadlineMs === undefined) {
-					this.#drainDeadlineMs = Date.now() + this.#descendantDrainMs;
+					this.#drainDeadlineMs = performance.now() + this.#descendantDrainMs;
 				}
 				this.#syncAbortListeners();
 				if (this.#exitReasonPending) {
@@ -873,13 +875,18 @@ export class ChildProcess<In extends InMask = InMask> {
 				this.#windowsRootProcess.killTree();
 			} catch {}
 		}
-		this.#cutoffOutput();
+		// Cancel only currently blocked readers without permanently setting `#cutoff`, so a
+		// later reader can still drain already-buffered ready stdout bytes and EOF cleanly.
+		for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
 	}
 
 	/**
 	 * On non-subreaper spawns with `descendantDrainMs`, run one post-exit timer
-	 * anchored at process exit covering all tracked pipe readers (stderr + any
-	 * tracked stdout reader) and cancel it only once every pipe reader has finished.
+	 * anchored at process exit (monotonic clock) covering all tracked pipe readers
+	 * (stderr + any tracked stdout reader) and cancel it only once every pipe reader
+	 * has finished. Even when the deadline has already passed (`remainingMs === 0`),
+	 * schedule via `setTimeout(..., 0)` so ready buffered bytes and EOF drain first
+	 * and only blocking I/O on a lingering descendant is cut off.
 	 */
 	#syncDrainTimer(): void {
 		if (this.#hardKillTree || this.#descendantDrainMs === undefined) return;
@@ -894,11 +901,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			return;
 		}
 		if (this.#drainTimer) return;
-		const remainingMs = Math.max(0, deadline - Date.now());
-		if (remainingMs === 0) {
-			this.#expireDrain();
-			return;
-		}
+		const remainingMs = Math.max(0, deadline - performance.now());
 		const timer = setTimeout(() => {
 			this.#drainTimer = undefined;
 			this.#expireDrain();

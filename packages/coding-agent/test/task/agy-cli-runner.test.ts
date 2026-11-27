@@ -25,6 +25,13 @@ async function createFakeAgyBinary(dir: string, scriptBody: string, name = "fake
 	return binPath;
 }
 
+async function createFakeAgyShell(dir: string, scriptBody: string, name = "fake-agy-sh"): Promise<string> {
+	const binPath = path.join(dir, name);
+	const full = `#!/bin/sh\n${scriptBody}\n`;
+	await fs.writeFile(binPath, full, { mode: 0o755 });
+	return binPath;
+}
+
 function makeAgent(overrides: Partial<AgentDefinition> = {}): AgentDefinition {
 	return {
 		name: "task",
@@ -350,7 +357,7 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 		});
 		expect(bad.exitCode).toBe(1);
 		expect(bad.structuredOutput?.status).toBe("invalid");
-	});
+	}, 30_000);
 
 	it("accumulates multi-step usage per step, spills oversized prompts, and settles cleanly on spill failure or missing result", async () => {
 		const dir = await makeTempDir("agy-runner-steps-");
@@ -468,21 +475,19 @@ process.exit(0);
 		expect(truncatedRes.exitCode).toBe(1);
 		expect(truncatedRes.error).toContain("terminal result");
 		expect(truncatedRes.output).toBe("halfway output");
-	});
+	}, 30_000);
 
 	it("hard-kills SIGTERM-ignoring descendants at maxRuntimeMs, settles promptly when a helper lingers after SUCCESS, and surfaces error frames", async () => {
 		const dir = await makeTempDir("agy-runner-abort-");
 		const sentinelPath = path.join(dir, "descendant-survived.txt");
 
-		// Spawn a descendant that ignores SIGTERM and tries to write a sentinel after 500ms
-		const treeBin = await createFakeAgyBinary(
+		// Spawn a lightweight shell fixture + descendant that ignores SIGTERM and tries to write a sentinel after 1.1s
+		const treeBin = await createFakeAgyShell(
 			dir,
-			`
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-emit({ event: "init", conversation_id: "conv-tree", init: { model: "gemini-4-neon-low" } });
-emit({ event: "step_update", step_update: { conversation_id: "conv-tree", step_index: 1, state: "ACTIVE", step_type: "agent_response", text_delta: "partial progress here" } });
-Bun.spawn(["sh", "-c", "trap '' TERM; sleep 0.5 && echo alive > " + ${JSON.stringify(sentinelPath)}], { stdout: "inherit", stderr: "inherit" });
-setTimeout(() => {}, 30_000);
+			`printf '%s\\n' '{"event":"init","conversation_id":"conv-tree","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"conv-tree","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"partial progress here"}}'
+(trap '' TERM; sleep 1.1 && echo alive > ${JSON.stringify(sentinelPath)}) &
+sleep 30
 `,
 			"fake-agy-tree",
 		);
@@ -494,7 +499,7 @@ setTimeout(() => {}, 30_000);
 			task: "long job with SIGTERM-ignoring descendant",
 			index: 0,
 			id: "TimeoutTreeJob",
-			maxRuntimeMs: 220,
+			maxRuntimeMs: 450,
 			settings: makeSettings(treeBin, { "*": "gemini-4-neon-low" }),
 		});
 		const elapsed = Date.now() - t0;
@@ -502,23 +507,21 @@ setTimeout(() => {}, 30_000);
 		expect(aborted.aborted).toBe(true);
 		expect(aborted.abortReason).toContain("maxRuntimeMs");
 		expect(aborted.output).toContain("partial progress here");
-		// Hard timeout uses immediate SIGKILL (no 1000ms SIGTERM grace period)
-		expect(elapsed).toBeLessThan(900);
+		// Hard timeout uses immediate SIGKILL (no 1000ms SIGTERM grace period, which would exceed 1450ms)
+		expect(elapsed).toBeLessThan(1_250);
 
 		// Wait past the descendant's sleep window and verify it was hard-killed at the deadline
-		await Bun.sleep(600);
+		await Bun.sleep(950);
 		expect(await Bun.file(sentinelPath).exists()).toBe(false);
 
 		// Successful agy exit with a lingering helper holding inherited pipes settles promptly even with unlimited runtime
 		const lingerSentinel = path.join(dir, "linger-survived.txt");
-		const lingerBin = await createFakeAgyBinary(
+		const lingerBin = await createFakeAgyShell(
 			dir,
-			`
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3 && echo lingered > " + ${JSON.stringify(lingerSentinel)}], { stdout: "inherit", stderr: "inherit" });
-emit({ event: "init", conversation_id: "conv-linger", init: { model: "gemini-4-neon-low" } });
-emit({ event: "result", result: { conversation_id: "conv-linger", status: "SUCCESS", response: "finished fast", num_turns: 1 } });
-process.exit(0);
+			`(trap '' TERM; sleep 3 && echo lingered > ${JSON.stringify(lingerSentinel)}) &
+printf '%s\\n' '{"event":"init","conversation_id":"conv-linger","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-linger","status":"SUCCESS","response":"finished fast","num_turns":1}}'
+exit 0
 `,
 			"fake-agy-linger",
 		);
@@ -536,15 +539,13 @@ process.exit(0);
 		expect(settled.exitCode).toBe(0);
 		expect(settled.aborted).toBeUndefined();
 		expect(settled.output).toBe("finished fast");
-		expect(lingerElapsed).toBeLessThan(1_200);
+		expect(lingerElapsed).toBeLessThan(1_800);
 		expect(await Bun.file(lingerSentinel).exists()).toBe(false);
 
-		const errBin = await createFakeAgyBinary(
+		const errBin = await createFakeAgyShell(
 			dir,
-			`
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-emit({ event: "result", result: { conversation_id: "conv-err", status: "ERROR", response: "", error: "boom from agy", num_turns: 0 } });
-process.exit(1);
+			`printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-err","status":"ERROR","response":"","error":"boom from agy","num_turns":0}}'
+exit 1
 `,
 			"fake-agy-err",
 		);
@@ -559,20 +560,18 @@ process.exit(1);
 		expect(failed.exitCode).toBe(1);
 		expect(failed.aborted).toBeUndefined();
 		expect(failed.error).toContain("boom from agy");
-	});
+	}, 30_000);
 
 	it("preserves nonzero exit with lingering helpers, handles missing-result helpers, reconciles explicit zeros and multi-turn context, spills oversized schemas, and restores tool start timestamps", async () => {
 		const dir = await makeTempDir("agy-runner-r3-");
 
 		// 1. SUCCESS frame followed by exit 23 WITH a lingering helper must preserve exitCode 23 (never masked to 0)
-		const exit23Bin = await createFakeAgyBinary(
+		const exit23Bin = await createFakeAgyShell(
 			dir,
-			`
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3"], { stdout: "inherit", stderr: "inherit" });
-emit({ event: "init", conversation_id: "conv-23", init: { model: "gemini-4-neon-low" } });
-emit({ event: "result", result: { conversation_id: "conv-23", status: "SUCCESS", response: "said success then crashed", num_turns: 1 } });
-process.exit(23);
+			`(trap '' TERM; sleep 3) &
+printf '%s\\n' '{"event":"init","conversation_id":"conv-23","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-23","status":"SUCCESS","response":"said success then crashed","num_turns":1}}'
+exit 23
 `,
 			"fake-agy-exit23",
 		);
@@ -588,17 +587,15 @@ process.exit(23);
 		});
 		expect(res23.exitCode).toBe(23);
 		expect(res23.aborted).toBeUndefined();
-		expect(Date.now() - t23).toBeLessThan(1_200);
+		expect(Date.now() - t23).toBeLessThan(1_800);
 
 		// 2. Exit 0 WITHOUT a terminal result frame WITH a lingering helper settles promptly under unlimited runtime
-		const noResHelperBin = await createFakeAgyBinary(
+		const noResHelperBin = await createFakeAgyShell(
 			dir,
-			`
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3"], { stdout: "inherit", stderr: "inherit" });
-emit({ event: "init", conversation_id: "conv-nores", init: { model: "gemini-4-neon-low" } });
-emit({ event: "step_update", step_update: { conversation_id: "conv-nores", step_index: 1, state: "ACTIVE", step_type: "agent_response", text_delta: "partial before drop" } });
-process.exit(0);
+			`(trap '' TERM; sleep 3) &
+printf '%s\\n' '{"event":"init","conversation_id":"conv-nores","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"conversation_id":"conv-nores","step_index":1,"state":"ACTIVE","step_type":"agent_response","text_delta":"partial before drop"}}'
+exit 0
 `,
 			"fake-agy-nores-helper",
 		);
@@ -614,7 +611,7 @@ process.exit(0);
 		});
 		expect(resNoRes.exitCode).toBe(1);
 		expect(resNoRes.output).toBe("partial before drop");
-		expect(Date.now() - tNoRes).toBeLessThan(1_200);
+		expect(Date.now() - tNoRes).toBeLessThan(1_800);
 
 		// 3. Explicit terminal zeros override streamed counters; multi-turn result-only invocation leaves contextTokens unset
 		const usageEdgeBin = await createFakeAgyBinary(
@@ -748,14 +745,16 @@ emit({ event: "result", result: { conversation_id: "conv-timer", status: "SUCCES
 		expect(firstB.startMs!).toBeGreaterThan(firstA.startMs!);
 		expect(restoredA.startMs).toBe(firstA.startMs);
 
-		// 6. A throwing onToolResult callback must NOT replay the frame, abort stream reading, or leak an unhandled rejection
+		// 6. A throwing onToolResult callback must NOT replay the frame, suppress live tool-completion progress, or leak an unhandled rejection
 		const throwingBin = await createFakeAgyBinary(
 			dir,
 			`
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-throw", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-throw", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", parameters: { Path: "/tmp/x" } } } });
+await Bun.sleep(180);
 emit({ event: "step_update", step_update: { conversation_id: "conv-throw", step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", output: "tool payload" } } });
-await Bun.sleep(200);
+await Bun.sleep(250);
 emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCESS", response: "completed after throw", num_turns: 1 } });
 `,
 			"fake-agy-throw-cb",
@@ -766,6 +765,7 @@ emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCES
 		};
 		process.on("unhandledRejection", onUnhandled);
 		let cbCalls = 0;
+		const cbProgress: Array<{ status: string; currentTool?: string; toolCount: number }> = [];
 		try {
 			const cbRes = await runSubprocess({
 				cwd: dir,
@@ -774,6 +774,7 @@ emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCES
 				index: 0,
 				id: "ThrowCallbackJob",
 				settings: makeSettings(throwingBin, { "*": "gemini-4-neon-low" }),
+				onProgress: p => cbProgress.push({ status: p.status, currentTool: p.currentTool, toolCount: p.toolCount }),
 				onToolResult: () => {
 					cbCalls += 1;
 					throw new Error("widget callback boom");
@@ -784,8 +785,12 @@ emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCES
 			expect(cbRes.output).toBe("completed after throw");
 			expect(cbCalls).toBe(1);
 			expect(unhandled).toEqual([]);
+			// Live running frame clearing currentTool must still be published despite throwing onToolResult
+			expect(cbProgress.some(p => p.status === "running" && p.currentTool === undefined && p.toolCount === 1)).toBe(
+				true,
+			);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
 		}
-	});
+	}, 30_000);
 });

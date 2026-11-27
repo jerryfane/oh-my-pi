@@ -1050,11 +1050,18 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 									progress.currentToolArgsKey = undefined;
 									progress.currentToolStartMs = undefined;
 								}
-								options.onToolResult?.({
-									tool: resolvedName,
-									text: su.tool_info?.output ?? "",
-									isError: false,
-								});
+								try {
+									options.onToolResult?.({
+										tool: resolvedName,
+										text: su.tool_info?.output ?? "",
+										isError: false,
+									});
+								} catch (err) {
+									logger.warn("agy onToolResult callback threw", {
+										tool: resolvedName,
+										error: err instanceof Error ? err.message : String(err),
+									});
+								}
 								scheduleProgress();
 							}
 						} else if (su.step_type === "agent_response") {
