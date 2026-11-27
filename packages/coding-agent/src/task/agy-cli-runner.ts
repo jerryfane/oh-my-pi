@@ -32,18 +32,10 @@ import {
 } from "./types";
 
 const PROGRESS_COALESCE_MS = 150;
-const POST_RESULT_SETTLE_MS = 250;
 const POST_EXIT_DRAIN_MS = 250;
 const RECENT_TOOLS_LIMIT = 10;
 const RECENT_OUTPUT_LINES = 8;
 const RECENT_OUTPUT_TAIL_BYTES = 8 * 1024;
-/**
- * Keep every argv item and the Linux subreaper's JSON-encoded command env var
- * (`OMP_PTREE_SUBREAPER_COMMAND=<json>`) safely below Linux MAX_ARG_STRLEN (128 KiB)
- * and Windows CreateProcess command-line limits (32 KiB).
- */
-const MAX_INLINE_LAUNCH_BYTES = process.platform === "win32" ? 24 * 1024 : 96 * 1024;
-const LINUX_SUBREAPER_ENV_PREFIX_BYTES = "OMP_PTREE_SUBREAPER_COMMAND=".length + 1;
 const DISABLED_VALUES = new Set(["off", "false", "none", "disabled", "0"]);
 const DEFAULT_MODEL_VALUES = new Set(["default", "auto", "true", "on", "1"]);
 
@@ -304,19 +296,20 @@ function buildStepArgs(params: {
 	return args;
 }
 
-function exceedsInlineLaunchLimit(cmd: string[]): boolean {
-	for (const arg of cmd) {
-		if (Buffer.byteLength(arg, "utf8") > MAX_INLINE_LAUNCH_BYTES) return true;
+function buildJsonSchemaPromptInstruction(jsonSchema?: string): string {
+	if (jsonSchema) {
+		return [
+			"<output_format>",
+			"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose) conforming to this JSON Schema:",
+			jsonSchema,
+			"</output_format>",
+		].join("\n");
 	}
-	if (process.platform === "linux") {
-		const encodedBytes = Buffer.byteLength(JSON.stringify(cmd), "utf8") + LINUX_SUBREAPER_ENV_PREFIX_BYTES;
-		if (encodedBytes > MAX_INLINE_LAUNCH_BYTES) return true;
-	}
-	if (process.platform === "win32") {
-		const totalChars = cmd.reduce((sum, arg) => sum + arg.length + 3, 0);
-		if (totalChars > MAX_INLINE_LAUNCH_BYTES) return true;
-	}
-	return false;
+	return [
+		"<output_format>",
+		"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose).",
+		"</output_format>",
+	].join("\n");
 }
 
 async function waitForDrainOrTimeout(promise: Promise<void>, timeoutMs: number): Promise<"drained" | "timeout"> {
@@ -376,7 +369,6 @@ async function runSingleAgyStep(params: {
 	let aborted = false;
 	let timedOut = false;
 	let abortReason: string | undefined;
-	let settledAfterResult = false;
 	let conversationId = params.conversationId;
 	let model = params.model;
 	let streamedText = "";
@@ -389,7 +381,6 @@ async function runSingleAgyStep(params: {
 	let stepLastContext: number | undefined;
 	let cp: ptree.ChildProcess | undefined;
 	let cancelStdout: (() => Promise<void>) | undefined;
-	let postResultTimer: ReturnType<typeof setTimeout> | undefined;
 
 	const currentUsage = (): StepUsageTotals => ({
 		requests: stepRequests,
@@ -437,18 +428,39 @@ async function runSingleAgyStep(params: {
 			promptArg: params.promptText,
 		});
 
-		if (exceedsInlineLaunchLimit(cmd)) {
+		if (!ptree.fitsInlineSpawn(cmd, { subreaper: true })) {
 			const spillDir = params.artifactsDir ?? os.tmpdir();
-			spillPromptPath = path.join(spillDir, `${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`);
-			await fs.writeFile(spillPromptPath, params.promptText, { mode: 0o600 });
-			cmd = buildStepArgs({
+			const candidateSpillPath = path.join(
+				spillDir,
+				`${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`,
+			);
+			const shortPromptArg = `Read the complete task instructions from ${candidateSpillPath} and execute them thoroughly.`;
+			const cmdWithSpilledPrompt = buildStepArgs({
 				binary: params.binary,
 				model: params.model,
 				conversationId: params.conversationId,
 				additionalDirectories: params.additionalDirectories,
 				jsonSchema: params.jsonSchema,
-				promptArg: `Read the complete task instructions from ${spillPromptPath} and execute them thoroughly.`,
+				promptArg: shortPromptArg,
 			});
+			// Keep `--json-schema` on argv when it fits; if the schema itself overflows supervisor launch limits,
+			// fold it into the spilled JSON instructions and still validate the response locally.
+			const spillSchemaToo =
+				params.jsonSchema !== undefined && !ptree.fitsInlineSpawn(cmdWithSpilledPrompt, { subreaper: true });
+			const spillBody = spillSchemaToo
+				? `${params.promptText}\n\n${buildJsonSchemaPromptInstruction(params.jsonSchema)}`
+				: params.promptText;
+			spillPromptPath = candidateSpillPath;
+			await fs.writeFile(spillPromptPath, spillBody, { mode: 0o600 });
+			cmd = spillSchemaToo
+				? buildStepArgs({
+						binary: params.binary,
+						model: params.model,
+						conversationId: params.conversationId,
+						additionalDirectories: params.additionalDirectories,
+						promptArg: shortPromptArg,
+					})
+				: cmdWithSpilledPrompt;
 		}
 
 		if (params.abortSignal?.aborted) {
@@ -480,13 +492,16 @@ async function runSingleAgyStep(params: {
 			};
 		}
 
-		// Supervise the entire process tree (detached + Linux subreaper) with ptree's hard timeout path
-		// (`gracefulMs: -1` SIGKILL sweep) so deadlines kill SIGTERM-ignoring descendants immediately.
+		// Supervise the entire process tree (detached + Linux subreaper) with:
+		// - ptree's hard timeout path (`gracefulMs: -1` SIGKILL sweep) for `maxRuntimeMs`
+		// - bounded `descendantDrainMs` after `agy` exits so lingering pipe-holding helpers
+		//   are reaped without stalling settlement or replacing `agy`'s real exit code.
 		cp = ptree.spawn(cmd, {
 			cwd: params.cwd,
 			stdin: "ignore",
 			detached: true,
 			subreaper: true,
+			descendantDrainMs: POST_EXIT_DRAIN_MS,
 			...(params.abortSignal ? { signal: params.abortSignal } : {}),
 			...(remainingMs !== undefined ? { timeout: remainingMs } : {}),
 			env: { ...Bun.env, AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
@@ -525,18 +540,6 @@ async function runSingleAgyStep(params: {
 				} else if (parsed.event === "result") {
 					resultEvent = parsed.result;
 					if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
-					// Bound settlement from agy's terminal result frame so a lingering descendant holding
-					// inherited pipes open (or keeping the Linux subreaper alive) cannot stall settlement.
-					if (!postResultTimer) {
-						postResultTimer = setTimeout(() => {
-							postResultTimer = undefined;
-							if (!cp || cp.exitCode !== null || params.abortSignal?.aborted || timedOut) return;
-							settledAfterResult = true;
-							void cancelStdout?.().catch(() => {});
-							cp.kill(new ptree.AbortError("post-result descendant cleanup", cp.peekStderr()), -1);
-						}, POST_RESULT_SETTLE_MS);
-						postResultTimer.unref?.();
-					}
 				}
 				params.onEvent(parsed);
 			};
@@ -565,23 +568,17 @@ async function runSingleAgyStep(params: {
 				timedOut = true;
 				aborted = true;
 				abortReason = `Subagent exceeded task.maxRuntimeMs (${params.maxRuntimeMs}ms)`;
-			} else if (settledAfterResult && !params.abortSignal?.aborted) {
-				exitCode = resultEvent?.status === "SUCCESS" ? 0 : 1;
 			} else if (err instanceof ptree.AbortError || params.abortSignal?.aborted) {
 				aborted = true;
 				abortReason = abortReason ?? abortReasonOf(params.abortSignal, "Cancelled");
 			} else {
 				exitCode = 1;
 			}
-		} finally {
-			if (postResultTimer) {
-				clearTimeout(postResultTimer);
-				postResultTimer = undefined;
-			}
 		}
 
-		// Bound post-exit stdout drain so an orphaned descendant holding stdout open cannot hang settlement.
-		if (aborted || timedOut || settledAfterResult) {
+		// Bound post-exit stdout drain so an orphaned descendant holding stdout open on non-subreaper
+		// platforms cannot hang settlement.
+		if (aborted || timedOut) {
 			await cancelStdout?.().catch(() => {});
 			await readStdout.catch(() => {});
 		} else {
@@ -595,27 +592,25 @@ async function runSingleAgyStep(params: {
 
 		stderrText = cp.peekStderr().trim();
 
-		// Prefer authoritative terminal result totals when present; retain streamed totals as fallback
-		// and preserve the latest per-request context size separately from multi-turn aggregates.
+		// Prefer authoritative terminal result counters whenever present (including explicit zeros);
+		// fall back to streamed counters only for absent fields, and infer context from terminal usage
+		// only when it represents a single request.
 		const resUsage = resultEvent?.usage;
 		const resTurns = resultEvent?.num_turns;
-		if (typeof resTurns === "number" && resTurns > 0) {
+		if (typeof resTurns === "number" && Number.isFinite(resTurns) && resTurns >= 0) {
 			stepRequests = resTurns;
 		}
 		if (resUsage) {
-			if (typeof resUsage.input_tokens === "number" && (resUsage.input_tokens > 0 || stepInput === 0)) {
+			if (typeof resUsage.input_tokens === "number" && Number.isFinite(resUsage.input_tokens)) {
 				stepInput = resUsage.input_tokens;
 			}
-			if (typeof resUsage.output_tokens === "number" && (resUsage.output_tokens > 0 || stepOutput === 0)) {
+			if (typeof resUsage.output_tokens === "number" && Number.isFinite(resUsage.output_tokens)) {
 				stepOutput = resUsage.output_tokens;
 			}
-			if (
-				typeof resUsage.cache_read_tokens === "number" &&
-				(resUsage.cache_read_tokens > 0 || stepCacheRead === 0)
-			) {
+			if (typeof resUsage.cache_read_tokens === "number" && Number.isFinite(resUsage.cache_read_tokens)) {
 				stepCacheRead = resUsage.cache_read_tokens;
 			}
-			if (stepLastContext === undefined) {
+			if (stepLastContext === undefined && stepRequests === 1) {
 				const ctx = (resUsage.input_tokens ?? 0) + (resUsage.cache_read_tokens ?? 0);
 				if (ctx > 0) stepLastContext = ctx;
 			}
@@ -661,10 +656,6 @@ async function runSingleAgyStep(params: {
 			abortReason,
 		};
 	} finally {
-		if (postResultTimer) {
-			clearTimeout(postResultTimer);
-			postResultTimer = undefined;
-		}
 		if (cp && cp.exitCode === null) {
 			cp.kill(new ptree.AbortError("agy step cleanup", cp.peekStderr()), -1);
 		}
@@ -959,20 +950,11 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				// Official `agy --json-schema` requires root `"type": "object"`.
 				jsonSchemaStr = JSON.stringify(jsonSchema);
 			} else if (jsonSchema && Object.keys(jsonSchema).length > 0) {
-				jsonPromptInstruction = [
-					"<output_format>",
-					"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose) conforming to this JSON Schema:",
-					JSON.stringify(jsonSchema),
-					"</output_format>",
-				].join("\n");
+				jsonPromptInstruction = buildJsonSchemaPromptInstruction(JSON.stringify(jsonSchema));
 			} else {
 				// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
 				// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
-				jsonPromptInstruction = [
-					"<output_format>",
-					"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose).",
-					"</output_format>",
-				].join("\n");
+				jsonPromptInstruction = buildJsonSchemaPromptInstruction();
 			}
 		}
 	}
@@ -1006,7 +988,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt;
 			let liveStepRequests = 0;
 			let liveStepTokens = 0;
-			const activeToolsByStep = new Map<number, { tool: string; args: string; argsKey?: string }>();
+			const activeToolsByStep = new Map<number, { tool: string; args: string; argsKey?: string; startMs: number }>();
 
 			lastOutcome = await runSingleAgyStep({
 				binary: config.binary,
@@ -1040,17 +1022,19 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 							if (su.state === "ACTIVE") {
 								const toolName = frameToolName || "tool";
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
+								const startedAt = Date.now();
 								if (stepKey !== undefined) {
 									activeToolsByStep.set(stepKey, {
 										tool: toolName,
 										args: summarized.args,
 										argsKey: summarized.argsKey,
+										startMs: startedAt,
 									});
 								}
 								progress.currentTool = toolName;
 								progress.currentToolArgs = summarized.args;
 								progress.currentToolArgsKey = summarized.argsKey;
-								progress.currentToolStartMs = Date.now();
+								progress.currentToolStartMs = startedAt;
 								progress.streaming = undefined;
 								scheduleProgress();
 							} else if (su.state === "DONE") {
@@ -1075,6 +1059,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 									progress.currentTool = remaining.tool;
 									progress.currentToolArgs = remaining.args;
 									progress.currentToolArgsKey = remaining.argsKey;
+									progress.currentToolStartMs = remaining.startMs;
 								} else {
 									progress.currentTool = undefined;
 									progress.currentToolArgs = undefined;

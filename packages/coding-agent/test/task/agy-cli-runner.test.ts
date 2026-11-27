@@ -560,4 +560,186 @@ process.exit(1);
 		expect(failed.aborted).toBeUndefined();
 		expect(failed.error).toContain("boom from agy");
 	});
+
+	it("preserves nonzero exit with lingering helpers, handles missing-result helpers, reconciles explicit zeros and multi-turn context, spills oversized schemas, and restores tool start timestamps", async () => {
+		const dir = await makeTempDir("agy-runner-r3-");
+
+		// 1. SUCCESS frame followed by exit 23 WITH a lingering helper must preserve exitCode 23 (never masked to 0)
+		const exit23Bin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3"], { stdout: "inherit", stderr: "inherit" });
+emit({ event: "init", conversation_id: "conv-23", init: { model: "gemini-4-neon-low" } });
+emit({ event: "result", result: { conversation_id: "conv-23", status: "SUCCESS", response: "said success then crashed", num_turns: 1 } });
+process.exit(23);
+`,
+			"fake-agy-exit23",
+		);
+		const t23 = Date.now();
+		const res23 = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "exit 23 with helper",
+			index: 0,
+			id: "Exit23Helper",
+			maxRuntimeMs: 0,
+			settings: makeSettings(exit23Bin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(res23.exitCode).toBe(23);
+		expect(res23.aborted).toBeUndefined();
+		expect(Date.now() - t23).toBeLessThan(1_200);
+
+		// 2. Exit 0 WITHOUT a terminal result frame WITH a lingering helper settles promptly under unlimited runtime
+		const noResHelperBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3"], { stdout: "inherit", stderr: "inherit" });
+emit({ event: "init", conversation_id: "conv-nores", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-nores", step_index: 1, state: "ACTIVE", step_type: "agent_response", text_delta: "partial before drop" } });
+process.exit(0);
+`,
+			"fake-agy-nores-helper",
+		);
+		const tNoRes = Date.now();
+		const resNoRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "missing result with helper",
+			index: 0,
+			id: "NoResHelper",
+			maxRuntimeMs: 0,
+			settings: makeSettings(noResHelperBin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(resNoRes.exitCode).toBe(1);
+		expect(resNoRes.output).toBe("partial before drop");
+		expect(Date.now() - tNoRes).toBeLessThan(1_200);
+
+		// 3. Explicit terminal zeros override streamed counters; multi-turn result-only invocation leaves contextTokens unset
+		const usageEdgeBin = await createFakeAgyBinary(
+			dir,
+			`
+const printArg = process.argv.slice(2).find(a => a.startsWith("--print=")) ?? "";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: "conv-u", init: { model: "gemini-4-neon-low" } });
+if (printArg.includes("ZERO_CASE")) {
+	emit({ event: "step_update", step_update: { conversation_id: "conv-u", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "ok", usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 40 } } });
+	emit({ event: "result", result: { conversation_id: "conv-u", status: "SUCCESS", response: "ok", num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 } } });
+} else {
+	emit({ event: "result", result: { conversation_id: "conv-u", status: "SUCCESS", response: "three turns", num_turns: 3, usage: { input_tokens: 1200, output_tokens: 80, cache_read_tokens: 300 } } });
+}
+`,
+			"fake-agy-usage-edge",
+		);
+		const zeroRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "ZERO_CASE",
+			index: 0,
+			id: "ZeroTotals",
+			settings: makeSettings(usageEdgeBin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(zeroRes.exitCode).toBe(0);
+		expect(zeroRes.requests).toBe(0);
+		expect(zeroRes.tokens).toBe(0);
+		expect(zeroRes.usage?.cacheRead).toBe(0);
+
+		const multiTurnRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "THREE_TURN_CASE",
+			index: 0,
+			id: "ThreeTurnNoContext",
+			settings: makeSettings(usageEdgeBin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(multiTurnRes.exitCode).toBe(0);
+		expect(multiTurnRes.requests).toBe(3);
+		expect(multiTurnRes.tokens).toBe(1280);
+		expect(multiTurnRes.usage?.cacheRead).toBe(300);
+		expect(multiTurnRes.contextTokens).toBeUndefined();
+
+		// 4. Short prompt + valid 75 KB root-object JSON schema spills schema into instructions instead of hitting E2BIG
+		const spillSchemaBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+const argv = process.argv.slice(2);
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
+const match = printArg.match(/from (\\S+) and execute/);
+const spillContent = match ? fs.readFileSync(match[1], "utf8") : "";
+const hasSchemaInSpill = spillContent.includes("<output_format>") && spillContent.includes('"summary"');
+const hasFlag = argv.includes("--json-schema");
+emit({ event: "init", conversation_id: "conv-bigschema", init: { model: "gemini-4-neon-low" } });
+if (!hasFlag && hasSchemaInSpill) {
+	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: '{"summary":"validated"}', num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: "plain prose", num_turns: 1 } });
+}
+`,
+			"fake-agy-bigschema",
+		);
+		const hugeObjectSchema = {
+			type: "object",
+			description: "d\n".repeat(38_000),
+			properties: { summary: { type: "string" } },
+			required: ["summary"],
+		};
+		const bigSchemaRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "short prompt",
+			index: 0,
+			id: "BigSchema",
+			artifactsDir: dir,
+			outputSchema: hugeObjectSchema,
+			outputSchemaMode: "strict",
+			outputSchemaSource: "caller",
+			settings: makeSettings(spillSchemaBin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(bigSchemaRes.exitCode).toBe(0);
+		expect(bigSchemaRes.structuredOutput).toEqual({
+			source: "caller",
+			mode: "strict",
+			status: "valid",
+			data: { summary: "validated" },
+		});
+
+		// 5. Completing tool B while tool A is still active restores tool A's original start timestamp
+		const timerBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: "conv-timer", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-timer", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "tool_a", tool_info: { name: "tool_a", parameters: { Path: "/tmp/a" } } } });
+await Bun.sleep(180);
+emit({ event: "step_update", step_update: { conversation_id: "conv-timer", step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "tool_b", tool_info: { name: "tool_b", parameters: { Path: "/tmp/b" } } } });
+await Bun.sleep(180);
+emit({ event: "step_update", step_update: { conversation_id: "conv-timer", step_index: 2, state: "DONE", step_type: "tool", tool_name: "tool_b", tool_info: { name: "tool_b", output: "b done" } } });
+await Bun.sleep(180);
+emit({ event: "step_update", step_update: { conversation_id: "conv-timer", step_index: 1, state: "DONE", step_type: "tool", tool_name: "tool_a", tool_info: { name: "tool_a", output: "a done" } } });
+emit({ event: "result", result: { conversation_id: "conv-timer", status: "SUCCESS", response: "done", num_turns: 1 } });
+`,
+			"fake-agy-timer",
+		);
+		const snapshots: Array<{ tool?: string; startMs?: number }> = [];
+		const timerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "interleaved timers",
+			index: 0,
+			id: "InterleavedTimers",
+			settings: makeSettings(timerBin, { "*": "gemini-4-neon-low" }),
+			onProgress: p => snapshots.push({ tool: p.currentTool, startMs: p.currentToolStartMs }),
+		});
+		expect(timerRes.exitCode).toBe(0);
+		const firstA = snapshots.find(s => s.tool === "tool_a");
+		const firstB = snapshots.find(s => s.tool === "tool_b");
+		const restoredA = [...snapshots].reverse().find(s => s.tool === "tool_a");
+		expect(firstA?.startMs).toBeDefined();
+		expect(firstB?.startMs).toBeDefined();
+		expect(firstB!.startMs!).toBeGreaterThan(firstA!.startMs!);
+		expect(restoredA?.startMs).toBe(firstA?.startMs);
+	});
 });

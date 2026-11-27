@@ -18,8 +18,36 @@ type PipedSubprocess<In extends InMask = InMask> = Subprocess<In, "pipe", "pipe"
 
 const LINUX_SUBREAPER_COMMAND_ENV = "OMP_PTREE_SUBREAPER_COMMAND";
 const LINUX_SUBREAPER_BUN_BE_BUN_ENV = "OMP_PTREE_SUBREAPER_BUN_BE_BUN";
+const LINUX_SUBREAPER_DRAIN_MS_ENV = "OMP_PTREE_SUBREAPER_DRAIN_MS";
 const SUBREAPER_KILL_WINDOW_MS = 100;
 const SUBREAPER_KILL_POLL_MS = 5;
+/** Conservative per-arg / single-env-entry limit safely below Linux MAX_ARG_STRLEN (128 KiB). */
+const MAX_INLINE_ARG_BYTES_UNIX = 96 * 1024;
+/** Conservative command-line budget below Windows CreateProcess 32 KiB limit. */
+const MAX_INLINE_CMD_CHARS_WIN32 = 24 * 1024;
+
+/**
+ * Whether `cmd` fits safely within platform argv and Linux subreaper transport limits
+ * when launched via {@link spawn}.
+ */
+export function fitsInlineSpawn(cmd: readonly string[], opts?: { subreaper?: boolean }): boolean {
+	if (process.platform === "win32") {
+		const totalChars = cmd.reduce((sum, arg) => sum + arg.length + 3, 0);
+		return totalChars <= MAX_INLINE_CMD_CHARS_WIN32;
+	}
+	for (const arg of cmd) {
+		if (Buffer.byteLength(arg, "utf8") > MAX_INLINE_ARG_BYTES_UNIX) return false;
+	}
+	if (opts?.subreaper && process.platform === "linux") {
+		const envEntryBytes =
+			Buffer.byteLength(LINUX_SUBREAPER_COMMAND_ENV, "utf8") +
+			1 + // '='
+			Buffer.byteLength(JSON.stringify(cmd), "utf8") +
+			1; // NUL
+		if (envEntryBytes > MAX_INLINE_ARG_BYTES_UNIX) return false;
+	}
+	return true;
+}
 
 /**
  * Build the Linux child-subreaper entrypoint.
@@ -29,6 +57,7 @@ const SUBREAPER_KILL_POLL_MS = 5;
  */
 export function createLinuxSubreaperScript(libcCandidates: readonly string[] = ["libc.so.6", "libc.so"]): string {
 	return `
+import * as fs from "node:fs";
 import { dlopen, FFIType } from "bun:ffi";
 
 let libc;
@@ -41,6 +70,10 @@ for (const soname of ${JSON.stringify(libcCandidates)}) {
 			},
 			waitpid: {
 				args: [FFIType.i32, FFIType.ptr, FFIType.i32],
+				returns: FFIType.i32,
+			},
+			kill: {
+				args: [FFIType.i32, FFIType.i32],
 				returns: FFIType.i32,
 			},
 		});
@@ -56,10 +89,14 @@ if (libc.symbols.prctl(36, 1, 0, 0, 0) !== 0) {
 const commandJson = Bun.env.${LINUX_SUBREAPER_COMMAND_ENV};
 if (!commandJson) throw new Error("missing supervised command");
 const callerBunBeBun = Bun.env.${LINUX_SUBREAPER_BUN_BE_BUN_ENV};
+const rawDrainMs = Bun.env.${LINUX_SUBREAPER_DRAIN_MS_ENV};
 delete Bun.env.${LINUX_SUBREAPER_COMMAND_ENV};
 delete Bun.env.${LINUX_SUBREAPER_BUN_BE_BUN_ENV};
+delete Bun.env.${LINUX_SUBREAPER_DRAIN_MS_ENV};
 if (callerBunBeBun === undefined) delete Bun.env.BUN_BE_BUN;
 else Bun.env.BUN_BE_BUN = callerBunBeBun;
+const parsedDrainMs = rawDrainMs !== undefined ? Number.parseInt(rawDrainMs, 10) : undefined;
+const drainMs = parsedDrainMs !== undefined && Number.isFinite(parsedDrainMs) && parsedDrainMs >= 0 ? parsedDrainMs : undefined;
 const command = JSON.parse(commandJson);
 const child = Bun.spawn(command, {
 	stdin: "inherit",
@@ -83,12 +120,68 @@ function hasLiveChildren() {
 	return childPid === 0;
 }
 
-const [exitCode] = await Promise.all([
-	child.exited,
-	relay(child.stdout, Bun.stdout),
-	relay(child.stderr, Bun.stderr),
-]);
-while (hasLiveChildren()) await Bun.sleep(10);
+function killDescendants() {
+	const readChildPids = pid => {
+		const found = [];
+		try {
+			for (const tid of fs.readdirSync("/proc/" + pid + "/task")) {
+				try {
+					const raw = fs.readFileSync("/proc/" + pid + "/task/" + tid + "/children", "utf8").trim();
+					if (!raw) continue;
+					for (const token of raw.split(/\\s+/)) {
+						const cpid = Number.parseInt(token, 10);
+						if (cpid > 1 && cpid !== process.pid) found.push(cpid);
+					}
+				} catch {}
+			}
+		} catch {}
+		return found;
+	};
+	const seen = new Set();
+	const queue = readChildPids(process.pid);
+	while (queue.length > 0) {
+		const pid = queue.pop();
+		if (seen.has(pid)) continue;
+		seen.add(pid);
+		for (const grandchild of readChildPids(pid)) {
+			if (!seen.has(grandchild)) queue.push(grandchild);
+		}
+	}
+	for (const pid of seen) {
+		try {
+			libc.symbols.kill(pid, 9);
+		} catch {}
+	}
+}
+
+const stdoutRelay = relay(child.stdout, Bun.stdout);
+const stderrRelay = relay(child.stderr, Bun.stderr);
+const exitCode = await child.exited;
+if (drainMs !== undefined) {
+	const drainAll = (async () => {
+		await Promise.all([stdoutRelay, stderrRelay]);
+		while (hasLiveChildren()) await Bun.sleep(10);
+	})();
+	let timer;
+	const settled = await Promise.race([
+		drainAll.then(() => true),
+		new Promise(resolve => {
+			timer = setTimeout(() => resolve(false), drainMs);
+		}),
+	]);
+	if (timer) clearTimeout(timer);
+	if (!settled) {
+		const killDeadline = Date.now() + ${SUBREAPER_KILL_WINDOW_MS};
+		while (hasLiveChildren() && Date.now() < killDeadline) {
+			killDescendants();
+			await Bun.sleep(${SUBREAPER_KILL_POLL_MS});
+		}
+		await Promise.race([Promise.all([stdoutRelay, stderrRelay]), Bun.sleep(50)]);
+	}
+} else {
+	await Promise.all([stdoutRelay, stderrRelay]);
+	while (hasLiveChildren()) await Bun.sleep(10);
+}
 process.exit(exitCode ?? 1);
 `;
 }
@@ -754,6 +847,13 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 * descendant that creates a new session and reparents to launchd.
 	 */
 	subreaper?: boolean;
+	/**
+	 * On Linux with `subreaper: true`, maximum milliseconds to wait for inherited pipes
+	 * and lingering descendants after the supervised command exits before hard-killing
+	 * remaining descendants and exiting with the command's real exit code.
+	 * Omit to wait indefinitely for all descendants.
+	 */
+	descendantDrainMs?: number;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
 	stderr?: "full" | null;
 };
@@ -763,7 +863,7 @@ function spawnInternal<In extends InMask = InMask>(
 	opts: ChildSpawnOptions<In> | undefined,
 	retainFullStderr: boolean,
 ): ChildProcess<In> {
-	const { timeout = -1, signal, stderr, detached, subreaper = false, ...rest } = opts ?? {};
+	const { timeout = -1, signal, stderr, detached, subreaper = false, descendantDrainMs, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
 	// Bun.spawn's own default is the startup environment, which misses values
 	// omp loads from its `.env` files into `Bun.env` afterwards.
@@ -781,6 +881,9 @@ function spawnInternal<In extends InMask = InMask>(
 					BUN_BE_BUN: "1",
 					[LINUX_SUBREAPER_COMMAND_ENV]: JSON.stringify(cmd),
 					[LINUX_SUBREAPER_BUN_BE_BUN_ENV]: commandEnv.BUN_BE_BUN,
+					...(descendantDrainMs !== undefined
+						? { [LINUX_SUBREAPER_DRAIN_MS_ENV]: String(Math.max(0, Math.trunc(descendantDrainMs))) }
+						: {}),
 				}
 			: commandEnv,
 	});
