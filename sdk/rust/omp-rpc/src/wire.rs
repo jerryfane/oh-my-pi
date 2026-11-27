@@ -2959,13 +2959,13 @@ pub struct ContextUsage {
 	pub percent: f64,
 }
 
-/// Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`.
+/// Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`. Input the agent already took leads its list until the transcript records it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedMessagesState {
 	pub steering: Vec<String>,
 	#[serde(rename = "followUp")]
 	pub follow_up: Vec<String>,
-	/// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	/// Leading `steering` entries the agent already took (live steering inside the streaming response, or steering on its way into the next request); `remove_queued_message` cannot reach them.
 	#[serde(rename = "liveSteered", default = "default_queued_messages_state_live_steered")]
 	pub live_steered: i64,
 }
@@ -3104,6 +3104,12 @@ pub struct SessionState {
 	pub model: Option<ModelInfo>,
 	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
 	pub thinking_level: Option<ThinkingLevel>,
+	/// The user's thinking selector: `auto` while auto mode picks the effort, else `thinkingLevel`.
+	#[serde(rename = "configuredThinkingLevel", default, skip_serializing_if = "Option::is_none")]
+	pub configured_thinking_level: Option<ConfiguredThinkingLevel>,
+	/// Selectors the active model accepts, as omp's thinking selector lists them: `off`, `auto`, then its efforts.
+	#[serde(rename = "thinkingLevels", default, skip_serializing_if = "Option::is_none")]
+	pub thinking_levels: Option<Vec<ConfiguredThinkingLevel>>,
 	#[serde(rename = "isStreaming", default = "default_session_state_is_streaming")]
 	pub is_streaming: bool,
 	#[serde(rename = "isCompacting", default = "default_session_state_is_compacting")]
@@ -3209,6 +3215,12 @@ pub struct BashResult {
 	pub minimized: Option<Map<String, Value>>,
 	#[serde(rename = "workingDir", default, skip_serializing_if = "Option::is_none")]
 	pub working_dir: Option<String>,
+	/// The command ended in another directory than it started in; the next command starts in its own cwd.
+	#[serde(rename = "movedCwd", default, skip_serializing_if = "Option::is_none")]
+	pub moved_cwd: Option<bool>,
+	/// The command ended with `set -e` on; the next command starts with it off.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub errexit: Option<bool>,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub images: Option<Vec<ImageContent>>,
 	/// The embedded shell's final `ShellTrace` of the run; only when the caller asked for one.
@@ -3254,6 +3266,52 @@ pub struct CompactionResult {
 	pub preserve_data: Option<Map<String, Value>>,
 	#[serde(rename = "providerReplayThroughEntryId", default, skip_serializing_if = "Option::is_none")]
 	pub provider_replay_through_entry_id: Option<String>,
+}
+
+/// A role a model holds, as picker rows chip it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPickerRole {
+	pub role: String,
+	/// The role's display tag.
+	pub label: String,
+	/// Auto-selected: the role has no configured model.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub auto: Option<bool>,
+}
+
+/// One row of omp's session model picker.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPickerRow {
+	pub provider: String,
+	pub id: String,
+	pub name: String,
+	/// The quick role this row applies (`@` search); pass it to `set_model`.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub role: Option<String>,
+	/// Visible roles the model holds, built-in order first.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub roles: Option<Vec<ModelPickerRole>>,
+	/// Steps of the model's thinking slider, low to high: `auto`, `off`, then its efforts. Absent when it has no effort to pick.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub thinking: Option<Vec<ConfiguredThinkingLevel>>,
+	/// Model rows: the session's level as this model would run it (the untouched slider). Quick-role rows: the role's explicit level, which `set_model` should carry.
+	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
+	pub thinking_level: Option<ConfiguredThinkingLevel>,
+	/// The session's context exceeds the model's window.
+	#[serde(rename = "overContext", default, skip_serializing_if = "Option::is_none")]
+	pub over_context: Option<bool>,
+	/// The session runs this row: its model, or under `@` its active quick role.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub current: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelPickerResult {
+	pub rows: Vec<ModelPickerRow>,
+	/// Leading rows that are recently used or role-held (the picker's Recent block); 0 when there is no such split.
+	pub recent: i64,
+	/// Matching rows before `limit`.
+	pub total: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -4055,7 +4113,7 @@ pub struct QueueUpdateEvent {
 	pub steering: Vec<String>,
 	#[serde(rename = "followUp")]
 	pub follow_up: Vec<String>,
-	/// Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.
+	/// Leading `steering` entries the agent already took (live steering inside the streaming response, or steering on its way into the next request); `remove_queued_message` cannot reach them.
 	#[serde(rename = "liveSteered", default = "default_queue_update_event_live_steered")]
 	pub live_steered: i64,
 }
@@ -4661,6 +4719,15 @@ pub struct AskUiRequest {
 	pub timeout: Option<i64>,
 }
 
+/// The HTML `<form>` of one `ui.formDialog` call (the `ask` tool or an extension); no opt-in is required.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FormUiRequest {
+	pub id: String,
+	pub html: String,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub timeout: Option<i64>,
+}
+
 /// Close the dialog opened by request `targetId`; a later answer to it is ignored.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelUiRequest {
@@ -4729,6 +4796,8 @@ pub enum ExtensionUiRequest {
 	Editor(EditorUiRequest),
 	/// Every question of one extension `ui.askDialog` call; sent only after `set_ask_dialog` enables it.
 	Ask(AskUiRequest),
+	/// The HTML `<form>` of one `ui.formDialog` call (the `ask` tool or an extension); no opt-in is required.
+	Form(FormUiRequest),
 	/// Close the dialog opened by request `targetId`; a later answer to it is ignored.
 	Cancel(CancelUiRequest),
 	Notify(NotifyUiRequest),
@@ -4748,6 +4817,7 @@ impl ExtensionUiRequest {
 			Some("input") => |value| serde_json::from_value(value).map(Self::Input),
 			Some("editor") => |value| serde_json::from_value(value).map(Self::Editor),
 			Some("ask") => |value| serde_json::from_value(value).map(Self::Ask),
+			Some("form") => |value| serde_json::from_value(value).map(Self::Form),
 			Some("cancel") => |value| serde_json::from_value(value).map(Self::Cancel),
 			Some("notify") => |value| serde_json::from_value(value).map(Self::Notify),
 			Some("setStatus") => |value| serde_json::from_value(value).map(Self::SetStatus),
@@ -4771,6 +4841,7 @@ impl Serialize for ExtensionUiRequest {
 			Self::Input(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "input")], serializer),
 			Self::Editor(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "editor")], serializer),
 			Self::Ask(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "ask")], serializer),
+			Self::Form(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "form")], serializer),
 			Self::Cancel(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "cancel")], serializer),
 			Self::Notify(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "notify")], serializer),
 			Self::SetStatus(member) => serialize_tagged(member, &[("type", "extension_ui_request"), ("method", "setStatus")], serializer),
@@ -4812,7 +4883,7 @@ pub struct ConfirmUiResponse {
 	pub confirmed: bool,
 }
 
-/// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` dialog then takes its recommended answers).
+/// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` dialog then takes its recommended answers, a `form` its defaults).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CancelUiResponse {
 	pub id: String,
@@ -4828,6 +4899,14 @@ pub struct AnswersUiResponse {
 	pub answers: Vec<AskAnswer>,
 }
 
+/// Answers a `form` request with the submitted form data.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DataUiResponse {
+	pub id: String,
+	/// Submitted values by control `name`: a string, a number, or a string array.
+	pub data: Map<String, Value>,
+}
+
 /// Host reply to an extension UI request; variants share `type` and differ by their payload key.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ExtensionUiResponse {
@@ -4835,10 +4914,12 @@ pub enum ExtensionUiResponse {
 	ValueUiResponse(ValueUiResponse),
 	/// Answers a `confirm` request.
 	ConfirmUiResponse(ConfirmUiResponse),
-	/// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` dialog then takes its recommended answers).
+	/// Dismisses a dialog; `timedOut` reports the host's own deadline (an `ask` dialog then takes its recommended answers, a `form` its defaults).
 	CancelUiResponse(CancelUiResponse),
 	/// Answers an `ask` request: one `AskAnswer` per question, in question order.
 	AnswersUiResponse(AnswersUiResponse),
+	/// Answers a `form` request with the submitted form data.
+	DataUiResponse(DataUiResponse),
 }
 
 impl ExtensionUiResponse {
@@ -4856,6 +4937,9 @@ impl ExtensionUiResponse {
 		if let Ok(member) = AnswersUiResponse::deserialize(&value) {
 			return Ok(Self::AnswersUiResponse(member));
 		}
+		if let Ok(member) = DataUiResponse::deserialize(&value) {
+			return Ok(Self::DataUiResponse(member));
+		}
 		Err(serde_json::Error::custom("no ExtensionUiResponse variant matches"))
 	}
 }
@@ -4867,6 +4951,7 @@ impl Serialize for ExtensionUiResponse {
 			Self::ConfirmUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::CancelUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 			Self::AnswersUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
+			Self::DataUiResponse(member) => serialize_tagged(member, &[("type", "extension_ui_response")], serializer),
 		}
 	}
 }
@@ -5352,6 +5437,11 @@ pub struct AbortAndPromptParams {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AbortAndDeliverQueueResult {
+	pub aborted: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NewSessionParams {
 	#[serde(rename = "parentSession", default, skip_serializing_if = "Option::is_none")]
 	pub parent_session: Option<String>,
@@ -5664,6 +5754,12 @@ pub struct SetModelParams {
 	pub provider: String,
 	#[serde(rename = "modelId")]
 	pub model_id: String,
+	/// Thinking level to run the model at, clamped to it; omitted re-applies the session's level.
+	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
+	pub thinking_level: Option<ConfiguredThinkingLevel>,
+	/// Model role the switch records (a quick-role pick passes its role); default `default`. Nothing is persisted.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub role: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5672,8 +5768,19 @@ pub struct GetAvailableModelsResult {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct GetModelPickerParams {
+	/// Search text; blank browses every model, `provider/` limits matches to a provider.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub query: Option<String>,
+	/// Most rows to return; default 100.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limit: Option<i64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetThinkingLevelParams {
-	pub level: ThinkingLevel,
+	/// `auto` lets omp pick the effort per turn.
+	pub level: ConfiguredThinkingLevel,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -5869,6 +5976,8 @@ pub struct LogoutParams {
 pub struct LogoutResult {
 	#[serde(rename = "remainingSource", default, skip_serializing_if = "Option::is_none")]
 	pub remaining_source: Option<String>,
+	#[serde(rename = "signOutError", default, skip_serializing_if = "Option::is_none")]
+	pub sign_out_error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -6578,6 +6687,35 @@ impl Command for AbortAndRestoreQueueCommand {
 	}
 }
 
+/// Abort the current run and continue it with the queued user input (the TUI's empty Enter); `aborted` is false when no run was streaming with queued input.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct AbortAndDeliverQueueCommand {}
+
+impl Command for AbortAndDeliverQueueCommand {
+	const NAME: &'static str = "abort_and_deliver_queue";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = AbortAndDeliverQueueResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<AbortAndDeliverQueueResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
+/// Continue the agent (the TUI's `.`/`c` shortcut), interrupting a running turn first; queued input continues the run in place of the continue directive. Acknowledged once the continuation is under way.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ResumeCommand {}
+
+impl Command for ResumeCommand {
+	const NAME: &'static str = "resume";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ();
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		let _ = data;
+		Ok(())
+	}
+}
+
 /// Start a new session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct NewSessionCommand {
@@ -7186,6 +7324,12 @@ pub struct SetModelCommand {
 	pub provider: String,
 	#[serde(rename = "modelId")]
 	pub model_id: String,
+	/// Thinking level to run the model at, clamped to it; omitted re-applies the session's level.
+	#[serde(rename = "thinkingLevel", default, skip_serializing_if = "Option::is_none")]
+	pub thinking_level: Option<ConfiguredThinkingLevel>,
+	/// Model role the switch records (a quick-role pick passes its role); default `default`. Nothing is persisted.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub role: Option<String>,
 }
 
 impl Command for SetModelCommand {
@@ -7229,10 +7373,32 @@ impl Command for GetAvailableModelsCommand {
 	}
 }
 
+/// Model picker rows ordered and ranked as omp's session model picker shows them; a query starting with `@` lists quick roles.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct GetModelPickerCommand {
+	/// Search text; blank browses every model, `provider/` limits matches to a provider.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub query: Option<String>,
+	/// Most rows to return; default 100.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub limit: Option<i64>,
+}
+
+impl Command for GetModelPickerCommand {
+	const NAME: &'static str = "get_model_picker";
+	const TIMEOUT_MS: Option<u64> = None;
+	type Output = ModelPickerResult;
+
+	fn decode(data: Option<Value>) -> Result<Self::Output, serde_json::Error> {
+		serde_json::from_value::<ModelPickerResult>(data.unwrap_or_else(|| Value::Object(Map::new())))
+	}
+}
+
 /// Set the thinking level.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SetThinkingLevelCommand {
-	pub level: ThinkingLevel,
+	/// `auto` lets omp pick the effort per turn.
+	pub level: ConfiguredThinkingLevel,
 }
 
 impl Command for SetThinkingLevelCommand {
@@ -7750,7 +7916,7 @@ impl Command for GetLogoutAccountsCommand {
 	}
 }
 
-/// Remove one stored credential; fails when it is no longer stored. `remainingSource` names auth that still applies.
+/// Remove one stored credential, revoking it at the provider when one supports it; fails when it is no longer stored. `remainingSource` names auth that still applies; `signOutError` says why the provider's sign-out failed (the credential is removed regardless).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LogoutCommand {
 	#[serde(rename = "providerId")]

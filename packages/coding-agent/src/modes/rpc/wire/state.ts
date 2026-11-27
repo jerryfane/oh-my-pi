@@ -46,12 +46,12 @@ export const stateDefs = {
 			liveSteered: absentAs(
 				doc(
 					"number.integer",
-					"Leading `steering` entries are live steering already sent into the streaming response; `remove_queued_message` cannot reach them.",
+					"Leading `steering` entries the agent already took (live steering inside the streaming response, or steering on its way into the next request); `remove_queued_message` cannot reach them.",
 				),
 				0,
 			),
 		},
-		"Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`.",
+		"Displayable queue-chip text for pending user-authored messages; accepted verbatim by `remove_queued_message`. Input the agent already took leads its list until the transcript records it.",
 	),
 	ToolDescriptor: { name: "string", description: "string", "parameters?": "unknown", "examples?": "unknown[]" },
 	Goal: doc(
@@ -105,6 +105,14 @@ export const stateDefs = {
 	SessionState: {
 		"model?": "ModelInfo",
 		"thinkingLevel?": "ThinkingLevel",
+		"configuredThinkingLevel?": doc(
+			"ConfiguredThinkingLevel",
+			"The user's thinking selector: `auto` while auto mode picks the effort, else `thinkingLevel`.",
+		),
+		"thinkingLevels?": doc(
+			"ConfiguredThinkingLevel[]",
+			"Selectors the active model accepts, as omp's thinking selector lists them: `off`, `auto`, then its efforts.",
+		),
 		isStreaming: absentAs("boolean", false),
 		isCompacting: absentAs("boolean", false),
 		steeringMode: absentAs("QueueMode", "one-at-a-time"),
@@ -181,6 +189,11 @@ export const stateDefs = {
 		"artifactError?": JSON_OBJECT,
 		"minimized?": JSON_OBJECT,
 		"workingDir?": "string",
+		"movedCwd?": doc(
+			"boolean",
+			"The command ended in another directory than it started in; the next command starts in its own cwd.",
+		),
+		"errexit?": doc("boolean", "The command ended with `set -e` on; the next command starts with it off."),
 		"images?": "ImageContent[]",
 		"trace?": doc(
 			JSON_OBJECT,
@@ -211,6 +224,42 @@ export const stateDefs = {
 		"details?": "unknown",
 		"preserveData?": JSON_OBJECT,
 		"providerReplayThroughEntryId?": "string",
+	},
+	ModelPickerRole: doc(
+		{
+			role: "string",
+			label: doc("string", "The role's display tag."),
+			"auto?": doc("boolean", "Auto-selected: the role has no configured model."),
+		},
+		"A role a model holds, as picker rows chip it.",
+	),
+	ModelPickerRow: doc(
+		{
+			provider: "string",
+			id: "string",
+			name: "string",
+			"role?": doc("string", "The quick role this row applies (`@` search); pass it to `set_model`."),
+			"roles?": doc("ModelPickerRole[]", "Visible roles the model holds, built-in order first."),
+			"thinking?": doc(
+				"ConfiguredThinkingLevel[]",
+				"Steps of the model's thinking slider, low to high: `auto`, `off`, then its efforts. Absent when it has no effort to pick.",
+			),
+			"thinkingLevel?": doc(
+				"ConfiguredThinkingLevel",
+				"Model rows: the session's level as this model would run it (the untouched slider). Quick-role rows: the role's explicit level, which `set_model` should carry.",
+			),
+			"overContext?": doc("boolean", "The session's context exceeds the model's window."),
+			"current?": doc("boolean", "The session runs this row: its model, or under `@` its active quick role."),
+		},
+		"One row of omp's session model picker.",
+	),
+	ModelPickerResult: {
+		rows: "ModelPickerRow[]",
+		recent: doc(
+			"number.integer",
+			"Leading rows that are recently used or role-held (the picker's Recent block); 0 when there is no such split.",
+		),
+		total: doc("number.integer", "Matching rows before `limit`."),
 	},
 	ModelCycleResult: { model: "ModelInfo", "thinkingLevel?": "ThinkingLevel", isScoped: "boolean" },
 	ThinkingLevelCycleResult: { level: "Effort" },

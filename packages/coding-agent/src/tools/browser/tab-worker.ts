@@ -40,7 +40,7 @@ import {
 	withBrowserPromiseCombinatorTracking,
 } from "../run-scope";
 import { ToolAbortError, throwIfAborted } from "../tool-errors";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolError } from "../tool-errors";
 import {
 	type AriaSnapshotOptions,
 	assertSelectorString,
@@ -381,6 +381,8 @@ const ATTACHED_TARGET_EXPOSE_TIMEOUT_MS = 5_000;
 const MATCH_COUNT_PROBE_TIMEOUT_MS = 1_000;
 /** Bound on the page command that lets a relay detach report overtake a run's failure; inside the supervisor's grace. */
 const DETACH_REPORT_TIMEOUT_MS = 500;
+/** Bound on the target-list read that tells a closed page from a stale session; past it the page counts as open. */
+const PAGE_CLOSED_PROBE_TIMEOUT_MS = 1_000;
 /** Longest a page call waits for a main-frame navigation the page requested to replace the document. */
 const REQUESTED_NAVIGATION_WAIT_MS = 5_000;
 
@@ -1314,6 +1316,8 @@ class PageSessionLostError extends ToolError {
 		reason: string,
 		/** `during`: the run's code had started, so its input may already have landed. */
 		readonly when: "during" | "before",
+		/** The page itself closed: a reattach finds nothing to drive. */
+		readonly closed: boolean,
 	) {
 		super(
 			`omp lost its connection to this tab's page (${reason}) ${when === "during" ? "during this call" : "before this call, so its code did not run"}`,
@@ -1543,7 +1547,7 @@ function errorPayload(error: unknown): RunErrorPayload {
 	const rendererCrashed = error instanceof RendererCrashedError || undefined;
 	const debuggerDetached =
 		error instanceof DebuggerDetachedError ? { when: error.when, reason: error.reason } : undefined;
-	const pageLost = error instanceof PageSessionLostError ? { when: error.when } : undefined;
+	const pageLost = error instanceof PageSessionLostError ? { when: error.when, closed: error.closed } : undefined;
 	if (error instanceof ToolAbortError) {
 		return { name: error.name, message: error.message, stack: error.stack, isToolError: false, isAbort: true };
 	}
@@ -1896,6 +1900,11 @@ export function formatSelectorMatchHint(count: number): string {
 		: `; selector currently matches ${count} element(s) but the action never became possible — the element may be hidden or covered (try tab.scrollIntoView() or a more specific selector)`;
 }
 
+/** Chromium's `querySelectorAll` SyntaxError for selector text it cannot parse. */
+const INVALID_SELECTOR_RE = /is not a valid selector/;
+/** A query-handler prefix after a comma: `input[name=q], label/Query` reads as one (invalid) CSS list. */
+const LISTED_HANDLER_PREFIX_RE = /,\s*((?:aria|text|xpath|pierce|label|placeholder|testid|alt|title|role)\/)/;
+
 export interface InflightOp {
 	label: string;
 	startedAt: number;
@@ -2225,7 +2234,7 @@ export class WorkerCore {
 				} catch (error) {
 					if (!attach) throw error;
 					throw new ToolError(
-						`Could not create a managed tab in the attached browser profile: ${error instanceof Error ? error.message : String(error)}. To drive one of its existing pages instead, pass target (browser.targets() lists them).`,
+						`Could not create a managed tab in the attached browser profile: ${(error instanceof Error ? error.message : String(error)).replace(/\.+$/, "")}. To drive one of its existing pages instead, pass target (browser.targets() lists them).`,
 					);
 				}
 				this.#observeDialogs();
@@ -2323,12 +2332,22 @@ export class WorkerCore {
 				});
 			}
 			if (payload.mode === "attach" && payload.relay === true) await this.#takeHiddenFrames(this.#page);
+			if (payload.mode === "attach" && payload.page.kind === "create" && payload.page.reload) {
+				// A failed load leaves the new page where it got to; the supervisor reports that from the ready URL.
+				const { url, timeoutMs } = payload.page.reload;
+				await this.#page.goto(url, { waitUntil: "load", timeout: timeoutMs }).catch(() => undefined);
+			}
 			const hiddenFrames = this.#hiddenFrames.splice(0);
 			const info: ReadyInfo = {
 				...(await this.#currentReadyInfo()),
 				...(hiddenFrames.length > 0 ? { hiddenFrames } : {}),
 			};
 			this.#started = true;
+			// A page closed without omp closing it: a supervisor that cannot see the page in the browser's target list
+			// learns it here. A close this worker makes itself comes after it stopped.
+			this.#page.once("close", () => {
+				if (!this.#stopped) this.#transport.send({ type: "page-closed" });
+			});
 			this.#transport.send({ type: "ready", info });
 		} catch (error) {
 			// A page this attempt created would be orphaned (the supervisor retries
@@ -2498,7 +2517,7 @@ export class WorkerCore {
 			this.#sendResult({
 				id: msg.id,
 				ok: false,
-				error: errorPayload(new PageSessionLostError(lostBefore, "before")),
+				error: errorPayload(new PageSessionLostError(lostBefore, "before", await this.#pageClosed())),
 			});
 			return;
 		}
@@ -2696,7 +2715,7 @@ export class WorkerCore {
 			const error = errorPayload(
 				lost === undefined
 					? failure.error
-					: new PageSessionLostError(lost, active.codeStarted ? "during" : "before"),
+					: new PageSessionLostError(lost, active.codeStarted ? "during" : "before", await this.#pageClosed()),
 			);
 			if (nativeNotices.length > 0) {
 				error.message = [error.message, ...nativeNotices].join("\n");
@@ -2743,6 +2762,29 @@ export class WorkerCore {
 		if (frame.detached) return "its main frame detached";
 		if (frame.client.detached) return "its CDP session closed";
 		return undefined;
+	}
+
+	/**
+	 * Whether the page itself closed, not just this worker's hold on it. Puppeteer can see the page's session end
+	 * before it marks the page closed, so the browser's target list on this worker's own connection decides; a list
+	 * that does not answer leaves Puppeteer's word.
+	 */
+	async #pageClosed(): Promise<boolean> {
+		const page = this.#page;
+		const browser = this.#browser;
+		const targetId = this.#targetId;
+		if (!page || page.isClosed()) return true;
+		if (!browser || !targetId) return false;
+		try {
+			const { targetInfos } = await withTimeout(
+				browserConnection(browser).send("Target.getTargets"),
+				PAGE_CLOSED_PROBE_TIMEOUT_MS,
+				"Timed out listing the browser's targets",
+			);
+			return !targetInfos.some(info => info.targetId === targetId);
+		} catch {
+			return false;
+		}
 	}
 
 	/**
@@ -2928,8 +2970,16 @@ export class WorkerCore {
 				const handles = await page.$$(resolved);
 				count = handles.length;
 				for (const handle of handles) void handle.dispose().catch(() => undefined);
-			} catch {
-				// Inconclusive probe — keep polling without advancing toward failure.
+			} catch (error) {
+				// A selector the page cannot parse never matches: say so now, not at the action deadline.
+				const message = (error instanceof Error ? error.message : String(error)).split("\n", 1)[0]!;
+				if (INVALID_SELECTOR_RE.test(message)) {
+					const prefix = LISTED_HANDLER_PREFIX_RE.exec(selector)?.[1];
+					throw new ToolError(
+						`${label}: ${message}${prefix ? `; a ${prefix} prefix applies to the whole selector and cannot join a CSS list: try each selector in its own call` : ""}`,
+					);
+				}
+				// Otherwise inconclusive (mid-navigation, detached frame) — keep polling without advancing toward failure.
 			}
 			if (count !== null && count > 0) break;
 			if (count === 0 && Date.now() >= deadline) {

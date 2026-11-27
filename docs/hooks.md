@@ -71,8 +71,7 @@ by `hookCapability` through the extension runner.
 
 Paths are deduplicated by absolute path. With `ambient: false`, native/installed
 discovery is skipped, but configured package roots can still contribute hook
-factories. Foreign user sources require opt-in via `enabledProviders`; project
-sources are unaffected by that user-level gate.
+factories.
 
 ### Native discovery location
 
@@ -85,7 +84,7 @@ A factory directly under `<cwd>/.omp/hooks/` is not found by ambient native
 discovery; put it in `pre/` or `post/`, or supply its path explicitly. Dot-prefixed
 entries and non-files are skipped. The directory and basename supply capability
 metadata/deduplication keys, not automatic event registration: the factory must
-still call `pi.on(...)`. This mirrors `.claude/hooks/pre|post/`. Only `.ts`/`.js`
+still call `pi.on(...)`. Only `.ts`/`.js`
 factories from the hook capability are appended to the extension pipeline.
 Explicit extension paths use the shared module resolver. See
 [Extension Loading](./extension-loading.md) for load order and disable controls.
@@ -210,6 +209,7 @@ After the tool returns (including a returned error result), the wrapper emits
 `tool_result` with:
 
 - `toolName`, `toolCallId`, normalized `input` for the effective execution arguments
+- In the extension runner, both `tool_call` and `tool_result` include `parentToolCallId` for calls made by a JS or Python eval cell or kernel-defined tool. It identifies the immediately enclosing invocation and is absent on direct calls.
 - `content`
 - `details`
 - `isError: result.isError === true`
@@ -307,7 +307,7 @@ Hook status text set via `ctx.ui.setStatus(key, text)` is:
 
 - stored per key
 - sorted by key name
-- sanitized (ANSI/VT escape sequences stripped; control characters mapped to spaces; repeated spaces collapsed; trimmed)
+- sanitized (OSC/DCS/other ANSI/VT escape sequences stripped; control characters mapped to spaces; repeated spaces collapsed; trimmed). In the ANSI-rendered status bar, SGR foreground colours and text styles are kept (the `status` segment also drops background colours); the native Rex/Tern status line still shows accent text
 - joined and width-truncated for display
 
 ## Error propagation and fallback

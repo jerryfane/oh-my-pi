@@ -71,7 +71,7 @@ The LLM context is built for the model that reads it. When the active model cann
 
 Compaction/context maintenance can run in six ways:
 
-1. **Manual context compaction**: `/compact [instructions]` calls `AgentSession.compact(...)`.
+1. **Manual context compaction**: `/compact [instructions]` calls `AgentSession.compact(...)`. It walks `compaction.methodOrder` and falls back to `soft` when the order omits it, so a manual pass always compacts; `/compact <mode>` keeps the mode's pinned chain.
 2. **Automatic overflow recovery**: after a same-model assistant error that matches context overflow.
 3. **Automatic incomplete-output recovery**: after a same-model assistant message ends with `stopReason === "length"` (including OpenAI/Codex `response.incomplete` and Anthropic output/context limits), subject to the output-cap checks below.
 4. **Automatic threshold maintenance**: after a successful turn when context exceeds the resolved threshold.
@@ -192,6 +192,8 @@ Explicit compaction modes and focused instructions retain their existing behavio
   boundaries. Shared selectors work, for example
   `history://current/full:1-200` and `history://current/full:raw:1-200`.
   Queries, fragments, trailing slashes, and additional path components are rejected.
+  A model that refuses its own reasoning quoted back as text (Claude) gets the
+  view without assistant reasoning.
 - The full-history route is bound to the calling session's current branch. It
   never falls back to another registered agent or an on-disk session search.
   Existing `history://<id>` routes retain their concise transcript behavior.
@@ -217,6 +219,8 @@ store.[^experimental-context-history]
 Including `shake` in `compaction.methodOrder` performs an inline, local reduction instead of calling a summarization model. It replaces eligible tool results and large fenced/XML blocks with recoverable `local://N.log` spill references, using a protected recent-token window and minimum-savings threshold. Automatic shake emits the normal auto-compaction events with `action: "shake"`.
 
 Threshold, incomplete-output, and overflow recovery advance to the next configured method when shake cannot reclaim enough context to get below the recovery band; this prevents repeated no-op shake loops. Idle shake does not use that fallback because the idle timer rechecks usage before running again. Manual `/shake` is a separate, more aggressive command that can target all eligible history.
+
+`/shake thinking` removes reasoning blocks and hidden notes that quote interrupted reasoning from the active branch. It preserves blocks the current provider still replays natively and reports them as kept. Even without a shake, models that reject quoted reasoning do not receive those notes when resuming a session.
 
 ### Snapcompact method
 
@@ -363,7 +367,11 @@ Advisor runtimes retain native `preserveData` for subsequent maintenance and att
 
 `packages/agent/src/compaction/compaction.ts` exports `generateHandoff(...)` and `generateHandoffFromContext(...)`. Coding-agent uses the context-aware function through `SessionHandoff`: the side request uses the base system prompt, normalized tools, transformed live history, and live prompt-cache key, with a unique side session id and trailing agent-attributed `user` handoff prompt. It starts with `toolChoice: "none"` and retries once with `"auto"` only after an explicit-tool-choice compatibility rejection. Only joined text blocks are returned; tools are never dispatched. See [the handoff pipeline](./handoff-generation-pipeline.md).
 
+Before dispatch, the handoff side request counts its prepared system prompt, tools, and messages locally. It ignores provider usage reports, which understate history re-expanded behind an unreadable native compaction. When that count leaves no room for the minimum output in the target model's declared window, automatic maintenance advances to its next configured method without sending the request, and manual `/handoff` reports the size error.
+
 `/handoff [focus]` aliases `/compact handoff [focus]`. It prepares a handoff summary from a transcript snapshot without interrupting the live response or holding follow-ups. Once ready, it applies through the standard `CompactionEntry` commit at a tool-turn boundary or when idle. `firstKeptEntryId` stays anchored to the snapshot, so the current branch's recent history and all messages appended during generation survive verbatim. A reset, branch change that removes the snapshot, or newer compaction invalidates the result.
+
+Handoff output is capped at the summary budget (`MAX_SUMMARY_TOKENS`), so a server with no output limit of its own still ends a runaway document with `stopReason: "length"`, which fails the handoff. `compaction.handoffTimeoutSeconds` (default `0`, off) also bounds wall-clock time: when it expires the handoff fails rather than cancels, automatic maintenance tries the next configured method, and `/handoff` reports `Handoff timed out after Ns`. It is off by default because a slow local model can legitimately take many minutes to write a valid document.
 
 When `compaction.handoffSaveToDisk` is enabled, an **automatically triggered** handoff also writes `handoff-<ISO timestamp>.md` in the persisted session's artifact directory. Manual handoffs are not written by this setting, and non-persisted sessions have no artifact directory.
 
@@ -535,6 +543,7 @@ Defined in `packages/coding-agent/src/session/context-settings.ts`:
 - `compaction.autoContinue` = `true`
 - `compaction.midTurnEnabled` = `true`; a `false` value applies to the session that configured it, not to spawned subagents — each subagent keeps mid-run checks so its single-turn assignment still compacts at the configured threshold.
 - `compaction.handoffSaveToDisk` = `false`
+- `compaction.handoffTimeoutSeconds` = `0` (no limit; a positive value fails a handoff that generates for longer, so automatic maintenance tries the next method)
 - The `handoff` method generates a handoff document through the live-cache side-request pipeline and commits it on the current session. `/handoff` and `/compact handoff` select it manually.
 - `compaction.remoteEndpoint` = `undefined`
 - `compaction.remoteStreamingV2Enabled` = `true`

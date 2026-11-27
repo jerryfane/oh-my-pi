@@ -7,7 +7,7 @@
  */
 import type { AgentMessage } from "@oh-my-pi/pi-agent-core";
 import { escapeXmlText, prompt } from "@oh-my-pi/pi-utils";
-import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
+import { oneLineLabel } from "../task/task-details";
 import topicBoardPrompt from "../prompts/system/topic-board.md" with { type: "text" };
 import type { CustomMessage } from "../session/messages";
 import type { WorkerSummary } from "../vibe/worker-scope";

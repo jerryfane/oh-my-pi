@@ -1,3 +1,4 @@
+import { asGlobalFetch } from "./helpers/fetch-mock";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { Agent, type AgentMessage } from "@oh-my-pi/pi-agent-core";
 import * as compactionModule from "@oh-my-pi/pi-agent-core/compaction";
@@ -18,7 +19,9 @@ import * as snapcompactModule from "@oh-my-pi/snapcompact";
 import {
 	cfgCompaction,
 	cfgCompactionAsyncEnabled,
+	cfgCompactionKeepRecentTokens,
 	cfgCompactionMethodOrder,
+	cfgCompactionRemoteEndpoint,
 } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 
 const CONTEXT_WINDOW = 100_000;
@@ -140,6 +143,8 @@ describe("async speculative compaction", () => {
 			persistEvalStateContext: () => {},
 			convertToLlmForSideRequest:
 				options.convertToLlmForSideRequest ?? ((messages: AgentMessage[]) => messages as never),
+			imageDescriptionModel: () => undefined,
+			prepareImageDescriptions: async () => {},
 			buildLiveProviderContext:
 				options.buildLiveProviderContext ?? (async (): Promise<Context> => ({ messages: [] })),
 			obfuscateTextForProvider: options.obfuscateTextForProvider ?? ((text: string | undefined) => text),
@@ -1047,6 +1052,74 @@ describe("async speculative compaction", () => {
 		expect(compactSpy).toHaveBeenCalledTimes(2);
 	});
 
+	const REMOTE_ENDPOINT = "https://compaction.example.test/openai/v1/chat/completions";
+
+	/** Answers every request to the remote endpoint with `status`; returns the count of those requests. */
+	function stubRemoteEndpoint(status: number): () => number {
+		// Speculation passes no fetch override, so requestRemoteCompaction uses the global fetch.
+		const fetchSpy = vi.spyOn(globalThis, "fetch").mockImplementation(
+			asGlobalFetch(input => {
+				if (String(input) !== REMOTE_ENDPOINT) throw new Error(`Unexpected request to ${String(input)}`);
+				return new Response(JSON.stringify({ error: { message: "rejected" } }), {
+					status,
+					headers: { "content-type": "application/json" },
+				});
+			}),
+		);
+		return () => fetchSpy.mock.calls.filter(([input]) => String(input) === REMOTE_ENDPOINT).length;
+	}
+
+	function useRemoteEndpoint(generateHandoffDocument: SessionMaintenanceHost["generateHandoffDocument"]): void {
+		maintenance = createMaintenance({ methodOrder: ["remote", "handoff"], generateHandoffDocument });
+		cfgCompactionRemoteEndpoint.override(maintenanceSettings, REMOTE_ENDPOINT);
+		// End on a turn start: a split turn summarizes its prefix through the side stream, which this host rejects.
+		sessionManager.appendMessage(userMessage("Continue the task."));
+	}
+
+	it.each([404, 400, 403])(
+		"drops the remote method for the cycle after the endpoint rejects it with %d",
+		async status => {
+			const generateHandoffDocument = vi.fn(async () => "## Goal\nContinue from the handoff.\n");
+			useRemoteEndpoint(generateHandoffDocument);
+			const endpointCalls = stubRemoteEndpoint(status);
+
+			expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD + 1_000, CONTEXT_WINDOW)).toBe(true);
+			await maintenance.speculationCompletion();
+			const rejected = endpointCalls();
+			expect(rejected).toBeGreaterThan(0);
+			expect(maintenance.speculationState).toBe("idle");
+
+			// The next deferral speculates the next configured method instead of re-sending the request.
+			expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD + 2_000, CONTEXT_WINDOW)).toBe(true);
+			await maintenance.speculationCompletion();
+			expect(endpointCalls()).toBe(rejected);
+			expect(generateHandoffDocument).toHaveBeenCalledTimes(1);
+			expect(maintenance.speculationState).toBe("armed");
+
+			// The threshold pass commits the handoff without trying the endpoint again.
+			await maintenance.runAutoCompaction("threshold", false, { triggerContextTokens: THRESHOLD + 2_000 });
+			const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+			expect(entry?.type === "compaction" ? entry.summary : undefined).toContain("Continue from the handoff.");
+			expect(endpointCalls()).toBe(rejected);
+		},
+	);
+
+	it("keeps the remote method after a retriable endpoint rejection", async () => {
+		const generateHandoffDocument = vi.fn(async () => "## Goal\nContinue from the handoff.\n");
+		useRemoteEndpoint(generateHandoffDocument);
+		const endpointCalls = stubRemoteEndpoint(429);
+
+		expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD + 1_000, CONTEXT_WINDOW)).toBe(true);
+		await maintenance.speculationCompletion();
+		expect(endpointCalls()).toBe(1);
+
+		// A rate limit clears with time, so the next deferral sends the remote request again.
+		expect(maintenance.deferThresholdCompactionToSpeculation(THRESHOLD + 2_000, CONTEXT_WINDOW)).toBe(true);
+		await maintenance.speculationCompletion();
+		expect(endpointCalls()).toBe(2);
+		expect(generateHandoffDocument).not.toHaveBeenCalled();
+	});
+
 	it("discards an armed summary when post-snapshot branch growth prevents recovery headroom", async () => {
 		let invocation = 0;
 		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
@@ -1154,30 +1227,60 @@ describe("async speculative compaction", () => {
 		expect(entry?.type === "compaction" ? entry.summary : undefined).toContain("handoff plan 2");
 	});
 
-	it("retains and claims an armed handoff summary when post-snapshot growth fits comfortably within recovery band", async () => {
+	it("reuses an armed handoff across a lead band wider than the kept tail budget", async () => {
+		const contextWindow = 392_000;
+		const threshold = 196_000;
+		model = { ...model, contextWindow };
 		let handoffInvocation = 0;
 		const generateHandoffDocument = vi.fn(async () => `handoff plan ${++handoffInvocation}`);
 		maintenance = createMaintenance({
 			methodOrder: ["handoff"],
 			generateHandoffDocument,
 		});
+		cfgCompactionKeepRecentTokens.override(maintenanceSettings, 20_000);
 
-		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		maintenance.maybeStartSpeculativeCompaction(172_388, contextWindow);
 		await waitForState("armed");
 		expect(generateHandoffDocument).toHaveBeenCalledTimes(1);
 
-		// A modest assistant turn is committed after the snapshot leaf
-		sessionManager.appendMessage(assistantMessage("brief acknowledgment", model));
+		const addedUser = userMessage("post-snapshot request " + "growth ".repeat(21_000));
+		sessionManager.appendMessage(addedUser);
+		sessionManager.appendMessage(assistantMessage("post-snapshot reply", model));
+		agent.replaceMessages(sessionManager.buildSessionContext().messages);
+		maintenance.maybeStartSpeculativeCompaction(193_613, contextWindow);
+		await maintenance.speculationCompletion();
 
-		await maintenance.runAutoCompaction("threshold", false, { triggerContextTokens: THRESHOLD });
+		await maintenance.runAutoCompaction("threshold", false, { triggerContextTokens: threshold });
 
 		// The armed handoff summary is claimed without paying for another LLM generation
 		expect(generateHandoffDocument).toHaveBeenCalledTimes(1);
 		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
 		expect(entry?.type === "compaction" ? entry.summary : undefined).toContain("handoff plan 1");
+		expect(agent.state.messages).toContainEqual(addedUser);
 		expect(entry?.type === "compaction" ? entry.tokensAfter : undefined).toBe(
 			agent.tokenizer.countMessages(convertToLlm(agent.state.messages), { excludeEncryptedReasoning: true }),
 		);
+	});
+
+	it("re-summarizes a rewritten branch inside the lead band before reaching threshold", async () => {
+		let handoffInvocation = 0;
+		const generateHandoffDocument = vi.fn(async () => `handoff plan ${++handoffInvocation}`);
+		maintenance = createMaintenance({ methodOrder: ["handoff"], generateHandoffDocument });
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await waitForState("armed");
+
+		const branch = sessionManager.getBranch();
+		sessionManager.branch(branch[branch.length - 2].id);
+		sessionManager.appendMessage(assistantMessage("rewritten reply", model));
+		agent.replaceMessages(sessionManager.buildSessionContext().messages);
+		maintenance.maybeStartSpeculativeCompaction(SPECULATION_BAND_START, CONTEXT_WINDOW);
+		await maintenance.speculationCompletion();
+		expect(generateHandoffDocument).toHaveBeenCalledTimes(2);
+
+		await maintenance.runAutoCompaction("threshold", false, { triggerContextTokens: THRESHOLD });
+		const entry = sessionManager.getEntries().findLast(item => item.type === "compaction");
+		expect(entry?.type === "compaction" ? entry.summary : undefined).toContain("handoff plan 2");
+		expect(generateHandoffDocument).toHaveBeenCalledTimes(2);
 	});
 });
 

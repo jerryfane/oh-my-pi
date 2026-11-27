@@ -7,6 +7,7 @@ import { createGunzip, createGzip } from "node:zlib";
 import { withStatsSyncLock } from "@oh-my-pi/omp-stats/aggregator";
 import { isCompressScratchPath } from "@oh-my-pi/omp-stats/parser";
 import {
+	errorMessage,
 	formatBytes,
 	getAgentDir,
 	getBlobsDir,
@@ -21,6 +22,7 @@ import {
 	hashPath,
 	isPidAlive,
 	normalizePathForComparison,
+	pathExists,
 	readLines,
 	type FileLockHandle,
 } from "@oh-my-pi/pi-utils";
@@ -86,6 +88,8 @@ const HEADER_SNIFF_BYTES = 4096;
 const STALE_POINTER_GRACE_MS = DAY_MS;
 /** Sessions (and archived transcripts) stripped at once, so one's reads overlap another's writes. */
 const STRIP_CONCURRENCY = 8;
+/** How long a WAL checkpoint waits on active readers/writers before reporting the database busy. */
+const WAL_CHECKPOINT_BUSY_TIMEOUT_MS = 5000;
 
 export interface GcCommandFlags {
 	apply?: boolean;
@@ -110,6 +114,8 @@ export interface GcCommandArgs {
 	flags: GcCommandFlags;
 	/** Where to draw transient per-step progress bars; drawn only on a TTY, none when omitted. */
 	progress?: ProgressOutput;
+	/** SQLite busy timeout for WAL checkpoints; defaults to {@link WAL_CHECKPOINT_BUSY_TIMEOUT_MS}. Tests shorten it. */
+	walBusyTimeoutMs?: number;
 }
 
 export interface BlobGcResult {
@@ -266,6 +272,7 @@ interface ResolvedGcOptions {
 	staleRetainDays: number;
 	compressAfterDays: number;
 	stripAfterDays: number;
+	walBusyTimeoutMs: number;
 	/** Wraps each slow per-item loop in a progress bar. */
 	track: ProgressTracker;
 }
@@ -299,7 +306,11 @@ function numberSetting(value: number | undefined, fallback: unknown, defaultValu
 	return normalizeNumberSetting(fallback, defaultValue);
 }
 
-async function resolveOptions({ flags, progress }: GcCommandArgs): Promise<ResolvedGcOptions> {
+async function resolveOptions({
+	flags,
+	progress,
+	walBusyTimeoutMs = WAL_CHECKPOINT_BUSY_TIMEOUT_MS,
+}: GcCommandArgs): Promise<ResolvedGcOptions> {
 	const agentDir = path.resolve(flags.agentDir ?? getAgentDir());
 	const selected =
 		flags.blobs === true ||
@@ -365,6 +376,7 @@ async function resolveOptions({ flags, progress }: GcCommandArgs): Promise<Resol
 			cfgGcCompressAfterDays.default,
 		),
 		stripAfterDays: numberSetting(flags.stripAfterDays, read(cfgGcStripAfterDays), cfgGcStripAfterDays.default),
+		walBusyTimeoutMs,
 		track: createProgressTracker(progress),
 	};
 }
@@ -383,24 +395,10 @@ function getArchivedSessionsDir(agentDir: string): string {
 	return path.join(path.dirname(getSessionsDir(agentDir)), "archive", "sessions");
 }
 
-function errorMessage(error: unknown): string {
-	return error instanceof Error ? error.message : String(error);
-}
-
 function codeOf(error: unknown): string | undefined {
 	return typeof error === "object" && error !== null && "code" in error
 		? String((error as { code?: unknown }).code)
 		: undefined;
-}
-
-async function pathExists(target: string): Promise<boolean> {
-	try {
-		await fs.stat(target);
-		return true;
-	} catch (error) {
-		if (codeOf(error) === "ENOENT") return false;
-		throw error;
-	}
 }
 
 async function statIfPresent(target: string) {
@@ -1176,14 +1174,15 @@ async function cleanupHistoryRowsForArchivedSessions(
 	}
 }
 
-const STATS_SESSION_TABLES = ["messages", "user_messages", "tool_calls", "file_offsets"] as const;
-const STATS_ENTRY_TABLES = ["messages", "user_messages", "tool_calls"] as const;
+const STATS_SESSION_TABLES = ["messages", "user_messages", "tool_calls", "tool_approvals", "file_offsets"] as const;
+const STATS_ENTRY_TABLES = ["messages", "user_messages", "tool_calls", "tool_approvals"] as const;
 type StatsEntryTable = (typeof STATS_ENTRY_TABLES)[number];
 
 const STATS_IDENTITY_COLUMNS: Record<StatsEntryTable, readonly string[]> = {
 	messages: ["entry_id", "timestamp"],
 	user_messages: ["entry_id", "timestamp"],
 	tool_calls: ["entry_id", "timestamp", "tool_call_id"],
+	tool_approvals: ["tool_call_id"],
 };
 
 interface StatsSession {
@@ -1228,6 +1227,7 @@ function createStatsIdentities(): Record<StatsEntryTable, StatsEntryIdentity[]> 
 		messages: [],
 		user_messages: [],
 		tool_calls: [],
+		tool_approvals: [],
 	};
 }
 
@@ -1468,10 +1468,26 @@ function addSessionStatsIdentity(line: string, identities: Record<StatsEntryTabl
 	if (line.length === 0) return;
 	try {
 		const record: unknown = JSON.parse(line);
+		if (!record || typeof record !== "object" || !("type" in record)) return;
+		if (record.type === "custom") {
+			if (
+				!("customType" in record) ||
+				(record.customType !== "tool_approval_requested" && record.customType !== "tool_approval_resolved") ||
+				!("data" in record) ||
+				!record.data ||
+				typeof record.data !== "object" ||
+				!("toolCallId" in record.data) ||
+				typeof record.data.toolCallId !== "string"
+			) {
+				return;
+			}
+			const toolCallId = record.data.toolCallId.trim();
+			if (toolCallId.length > 0) {
+				identities.tool_approvals.push({ entryId: "", timestamp: 0, toolCallId });
+			}
+			return;
+		}
 		if (
-			!record ||
-			typeof record !== "object" ||
-			!("type" in record) ||
 			record.type !== "message" ||
 			!("id" in record) ||
 			typeof record.id !== "string" ||
@@ -1602,13 +1618,17 @@ function reconcileStatsRowsForSessions(dbPath: string, plans: StatsCleanupPlan[]
 		`),
 		);
 		const transferStatements = entryTables.map(table => {
-			const toolCallMatch =
-				table === "tool_calls" ? `retained.tool_call_id = ${table}.tool_call_id` : "retained.tool_call_id = ''";
-			const identityMatch = `
+			const identityMatch =
+				table === "tool_approvals"
+					? `
+				retained.table_name = 'tool_approvals'
+				AND retained.tool_call_id = tool_approvals.tool_call_id
+			`
+					: `
 				retained.table_name = '${table}'
 				AND retained.entry_id = ${table}.entry_id
 				AND retained.timestamp = ${table}.timestamp
-				AND ${toolCallMatch}
+				AND ${table === "tool_calls" ? `retained.tool_call_id = ${table}.tool_call_id` : "retained.tool_call_id = ''"}
 			`;
 			return statements.use(
 				db.prepare(`
@@ -2204,7 +2224,7 @@ async function runStripGc(options: ResolvedGcOptions, archiveRoot: string): Prom
 	return result;
 }
 
-async function checkpointWal(dbPath: string, apply: boolean): Promise<WalCheckpointResult> {
+async function checkpointWal(dbPath: string, apply: boolean, busyTimeoutMs: number): Promise<WalCheckpointResult> {
 	const walPath = `${dbPath}-wal`;
 	let walBytes = 0;
 	try {
@@ -2226,7 +2246,7 @@ async function checkpointWal(dbPath: string, apply: boolean): Promise<WalCheckpo
 	const db = new Database(dbPath);
 	let checkpointAttempted = false;
 	try {
-		db.run("PRAGMA busy_timeout = 5000");
+		db.run(`PRAGMA busy_timeout = ${busyTimeoutMs}`);
 		using checkpointStmt = db.prepare("PRAGMA wal_checkpoint(TRUNCATE)");
 		const row = checkpointStmt.get() as WalCheckpointRow | null;
 		checkpointAttempted = true;
@@ -2252,7 +2272,7 @@ async function checkpointWal(dbPath: string, apply: boolean): Promise<WalCheckpo
 async function runWalGc(options: ResolvedGcOptions): Promise<WalGcResult> {
 	const databases = await Promise.all(
 		[getHistoryDbPath(options.agentDir), getModelDbPath(options.agentDir)].map(dbPath =>
-			checkpointWal(dbPath, options.apply),
+			checkpointWal(dbPath, options.apply, options.walBusyTimeoutMs),
 		),
 	);
 	return {

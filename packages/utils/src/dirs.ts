@@ -208,11 +208,26 @@ export function normalizePathForComparison(inputPath: string): string {
  * candidate against several static roots can normalize each side once and
  * reuse the public helpers' containment semantics without repeating realpath
  * work.
+ *
+ * The comparison itself is lexical: it never resolves symlinks. Callers that
+ * want a purely lexical check may pass `path.resolve()`d paths instead, as long
+ * as both sides are prepared the same way.
  */
 export function relativePathWithinNormalizedRoot(normalizedRoot: string, normalizedCandidate: string): string | null {
 	const relative = path.relative(normalizedRoot, normalizedCandidate);
-	if (relative !== "" && (relative.startsWith("..") || path.isAbsolute(relative))) return null;
+	// `..name` is a child; only a `..` segment leaves the root.
+	if (relative === ".." || relative.startsWith(`..${path.sep}`) || path.isAbsolute(relative)) return null;
 	return relative;
+}
+
+/**
+ * Lexical containment: `candidate` is `root` itself or below it. Symlinks are not resolved; the
+ * comparison is `path.relative`'s, so it follows the platform (case-insensitive on Windows).
+ * Callers resolve or normalize both sides first. Use {@link pathIsWithin} to compare through
+ * symlinks.
+ */
+export function pathIsWithinLexical(root: string, candidate: string): boolean {
+	return relativePathWithinNormalizedRoot(root, candidate) !== null;
 }
 
 /** `options` apply to `candidate` only. */
@@ -836,6 +851,11 @@ export function getBrowserRelayDir(): string {
 	return dirs.rootSubdir("browser-relay", "data");
 }
 
+/** Get the install registry shared by every omp profile and browser. */
+export function getBrowserRelayInstallRegistryFile(): string {
+	return dirs.baseRootSubdir(path.join("browser-relay", "installs.json"));
+}
+
 /** Get the profile root for Chromium browsers the browser tool spawns via `app.path` (~/.omp/browser-profiles). */
 export function getBrowserProfilesDir(): string {
 	return dirs.rootSubdir("browser-profiles", "state");
@@ -914,9 +934,23 @@ export function getAuthBrokerSnapshotCachePath(): string {
 	return dirs.rootSubdir(path.join("cache", "auth-broker-snapshot.enc"), "cache");
 }
 
+/**
+ * Get the cached OpenAI Codex client version record
+ * (~/.omp/agent/codex-client-version.json; XDG default: $XDG_CACHE_HOME/omp/codex-client-version.json).
+ * It is a refetchable cache, not config, so it belongs under the cache dir.
+ */
+export function getCodexClientVersionPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "codex-client-version.json", "cache");
+}
+
 /** Get the commit-author avatar cache directory (~/.omp/cache/avatars). */
 export function getAvatarCacheDir(): string {
 	return dirs.rootSubdir(path.join("cache", "avatars"), "cache");
+}
+
+/** Get the directory holding the `bun` stub a compiled omp appends to its JS eval kernel's PATH (~/.omp/cache/bun-stub). */
+export function getBunStubDir(): string {
+	return dirs.rootSubdir(path.join("cache", "bun-stub"), "cache");
 }
 
 /** Get the local FastEmbed model cache directory (~/.omp/cache/fastembed). */
@@ -997,6 +1031,11 @@ export function getHistoryDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "history.db", "data");
 }
 
+/** Get the path to transcripts.db (full-text index of session transcripts). */
+export function getTranscriptIndexDbPath(agentDir?: string): string {
+	return dirs.agentSubdir(agentDir, "transcripts.db", "data");
+}
+
 /** Get the path to models.db (model cache database). */
 export function getModelDbPath(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "models.db", "data");
@@ -1040,11 +1079,6 @@ export function getBlobsDir(agentDir?: string): string {
 /** Get the custom themes directory (~/.omp/agent/themes). */
 export function getCustomThemesDir(agentDir?: string): string {
 	return dirs.agentSubdir(agentDir, "themes");
-}
-
-/** Get the tools directory (~/.omp/agent/tools). */
-export function getToolsDir(agentDir?: string): string {
-	return dirs.agentSubdir(agentDir, "tools");
 }
 
 /** Get the slash commands directory (~/.omp/agent/commands). */
@@ -1159,11 +1193,6 @@ export function getDaemonRuntimeDir(projectDir: string): string {
  */
 export function getSessionOwnersDir(): string {
 	return dirs.baseRootSubdir(path.join("run", "session-owners"), "state");
-}
-
-/** Get the provider in-flight root directory (~/.omp/run/provider-inflight; XDG default: $XDG_STATE_HOME/omp/run/provider-inflight). */
-export function getProviderInFlightRoot(): string {
-	return dirs.rootSubdir(path.join("run", "provider-inflight"), "state");
 }
 
 /** Get the marketplaces registry path (~/.omp/marketplaces.json; XDG default: $XDG_DATA_HOME/omp/marketplaces.json). Adopts a legacy registry on first XDG resolution. */

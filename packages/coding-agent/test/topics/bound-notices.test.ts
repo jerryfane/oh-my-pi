@@ -23,7 +23,7 @@ import { PreambleTooLargeError, type TranscriptPreamble } from "@oh-my-pi/pi-cod
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { SessionTools } from "@oh-my-pi/pi-coding-agent/session/session-tools";
-import type { XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
+import type { ToolCommandState } from "@oh-my-pi/pi-coding-agent/tools/tool-commands";
 
 const ROSTER_NOTICE = "Now available: bash.";
 
@@ -203,9 +203,9 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		const tools = captureTools();
 		const { session, requests } = await xdevBench();
 		await session.refreshMCPTools([SEARCH]);
-		const peeked = tools().peekPendingXdevMountNotice({ baseCatalogDelivered: false });
+		const peeked = tools().peekPendingToolCommandMountNotice({ baseCatalogDelivered: false });
 		const batch = tools().noticeBatch();
-		const notice = tools().takePendingXdevMountNotice({
+		const notice = tools().takePendingToolCommandMountNotice({
 			baseCatalogDelivered: false,
 			expectedContentKey: peeked?.contentKey ?? "",
 			batch,
@@ -218,8 +218,8 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 
 		await session.prompt("next");
 		await session.waitForIdle();
-		expect(requests[1]).toContain("xd://mcp__nucleus_fetch");
-		expect(requests[1]).not.toContain("xd://mcp__nucleus_search");
+		expect(requests[1]).toContain("mcp__nucleus_fetch");
+		expect(requests[1]).not.toContain("mcp__nucleus_search");
 	});
 
 	it("a stale mount preview records only the base-carried mounts it saw: a mount a later rebuild lists stays in the next notice (#23 review)", async () => {
@@ -229,7 +229,7 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		await session.refreshMCPTools([SEARCH]);
 		// The preview no longer matches (maintenance changed it); the base this request carries is delivered.
 		const batch = tools().noticeBatch();
-		const notice = tools().takePendingXdevMountNotice({
+		const notice = tools().takePendingToolCommandMountNotice({
 			baseCatalogDelivered: true,
 			expectedContentKey: "stale",
 			batch,
@@ -242,7 +242,7 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 
 		await session.prompt("next");
 		await session.waitForIdle();
-		expect(requests[1]).toContain("xd://mcp__nucleus_fetch");
+		expect(requests[1]).toContain("mcp__nucleus_fetch");
 	});
 
 	it("a refused bound batch records nothing, not even a take that emitted no notice: a later request with a replaced prompt still announces the device (#24 review)", async () => {
@@ -267,7 +267,7 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		await session.prompt("next");
 		await session.waitForIdle();
 		expect(requests).toHaveLength(2);
-		expect(requests[1]).toContain("xd://mcp__nucleus_search");
+		expect(requests[1]).toContain("mcp__nucleus_search");
 	});
 });
 
@@ -310,23 +310,19 @@ async function xdevBench({
 	const model = prefixBound
 		? bound
 		: { ...bound, thinking: bound.thinking && { ...bound.thinking, prefixBinding: false } };
-	const read = tool("read");
-	const write = tool("write");
-	// Devices are read and written through `xd://`: the session has both tools.
-	const xdev: XdevState = {
-		tools: new Map([
-			[read.name, read],
-			[write.name, write],
-		]),
+	const bash = tool("bash");
+	// Mounted tools run as commands inside `bash`.
+	const toolCommands: ToolCommandState = {
+		tools: new Map([[bash.name, bash]]),
 		mountedNames: new Set(),
-		builtInNames: new Set(["read", "write"]),
+		builtInNames: new Set(["bash"]),
 		isActive: () => true,
 	};
 	const mock = createMockModel({ responses: [{ content: ["ok"] }, { content: ["ok"] }, { content: ["ok"] }] });
 	const requests: string[] = [];
 	const agent = new Agent({
 		getApiKey: () => "test-key",
-		initialState: { model, systemPrompt: ["initial"], tools: [read, write], messages: [] },
+		initialState: { model, systemPrompt: ["initial"], tools: [bash], messages: [] },
 		convertToLlm,
 		streamFn: async (requestModel, context, options) => {
 			requests.push(text(context.messages));
@@ -338,9 +334,8 @@ async function xdevBench({
 		sessionManager: SessionManager.inMemory(),
 		settings: Settings.isolated({ "compaction.enabled": false }),
 		modelRegistry: { getApiKey: async () => "test-key" } as never,
-		toolRegistry: xdev.tools,
-		builtInToolNames: ["read", "write"],
-		ensureWriteRegistered: async () => true,
+		toolRegistry: toolCommands.tools,
+		builtInToolNames: ["bash"],
 		extensionRunner: replacePrompt
 			? ({
 					emitBeforeAgentStart: async () =>
@@ -351,11 +346,11 @@ async function xdevBench({
 		rebuildSystemPrompt: async (toolNames, _tools, state) => {
 			const catalog = state ? [...state.mountedNames] : [];
 			return {
-				systemPrompt: [`tools:${toolNames.join(",")}\nxd:// catalog: ${catalog.join(",")}`],
-				xdevCatalogNames: catalog,
+				systemPrompt: [`tools:${toolNames.join(",")}\ntool commands: ${catalog.join(",")}`],
+				toolCommandCatalogNames: catalog,
 			};
 		},
-		xdev,
+		toolCommands,
 	});
 	sessionsToDispose.push(session);
 	await session.prompt("first");

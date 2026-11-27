@@ -2,6 +2,54 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed turn-end hooks being unable to tell which tool calls named no tool: `AgentTurnEndContext.unresolvedToolCallIds` now lists them ([#10876](https://github.com/can1357/oh-my-pi/issues/10876))
+- Fixed `generateHandoffFromContext` sending no output limit, so a server without its own limit could stream a handoff forever; the request is now capped at `MAX_SUMMARY_TOKENS` and ends as an incomplete-output failure ([#18031](https://github.com/can1357/oh-my-pi/issues/18031))
+- Reduced the size of authentication-gateway requests by preventing tool definitions from including internal host state.
+- Corrected OpenTelemetry chat spans to report the model that actually served the response.
+
+## [19.2.1] - 2026-11-25
+
+### Added
+
+- Added `Agent.peekDeliveringMessages(queue?)` for queued input on its way into the next request that the transcript has not recorded yet; queue listeners hear when it lands.
+- Added `Agent.continue(signal, { queuedOnly: true })` to start an idle turn using queued input without making a separate model call for the current context.
+
+### Changed
+
+- Debug logs now time the wait between dequeuing input and the model request that carries it, by phase.
+
+## [19.2.0] - 2026-11-25
+
+### Added
+
+- Added customizable notices for unmet soft tool requirements, allowing hosts to specify the text shown when a required tool call does not satisfy its requirement.
+- Added `AgentLoopError` and turn-level error metadata so hosts can distinguish an agent loop that ended because a soft tool requirement was not met from a failed request.
+- Added abort-signal support to provider-context transformation and side-request context building.
+- Added optional tool detachment when aborting an agent run, allowing tools that support background execution to continue instead of being terminated.
+- Agents can accept an asynchronous Cursor handler factory; a session opens its execution bridge on the first Cursor request, including after a model switch.
+
+### Fixed
+
+- Fixed DeepSeek DSML markup leaking into tool-call arguments and being executed or replayed.
+- Fixed DeepSeek DSML markup being incorrectly included in conversation history on OpenRouter Responses requests.
+- Fixed unmet soft tool requirements leaving tool calls unanswered when a run was continued or retried.
+
+## [19.1.1] - 2026-11-23
+
+### Fixed
+
+- Prevented oversized handoffs from reaching the provider by detecting when prepared context exceeds the target model’s context window.
+- Preserved provider error status, error identifiers, retry classification, and cancellation markers on failed or cancelled assistant turns.
+- Fixed speculative tool calls hanging when discarded or aborted before execution completed.
+
+## [19.1.0] - 2026-11-21
+
+### Added
+
+- Added standby tools support through `Agent.setStandbyTools()` and `AgentContext.standbyTools`, allowing tools to remain inactive until a request explicitly enables tool use.
+
 ## [19.0.0] - 2026-11-18
 
 ### Added

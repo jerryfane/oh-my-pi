@@ -1,3 +1,4 @@
+import { THINKING_EFFORTS } from "@oh-my-pi/pi-catalog/effort";
 import { isUnexpectedSocketCloseMessage } from "@oh-my-pi/pi-utils/fetch-retry";
 import type { Api, AssistantMessage, Usage } from "../types";
 import { AwsCredentialsError } from "./aws";
@@ -52,6 +53,13 @@ export const Flag = {
 	 * status value, so no raw status id can set it.
 	 */
 	CacheControlUnsupported: 0x0000_0800,
+	/**
+	 * The transport already spent its own retry budget on this transient status
+	 * (e.g. 503 backed off twice); every replay re-sends a request the provider
+	 * may already have charged for, so no later layer retries it. A low bit like
+	 * {@link Flag.CacheControlUnsupported}: 0x400 is 1024, above every HTTP status.
+	 */
+	RetriesExhausted: 0x0000_0400,
 	/** HTTP 413 byte/media rejection — token compaction cannot shrink bytes or media budgets (#9235). */
 	PayloadRejected: 0x8000_0000,
 } as const;
@@ -78,6 +86,7 @@ const KIND_MASK =
 	Flag.Grammar |
 	Flag.FastModeUnsupported |
 	Flag.CacheControlUnsupported |
+	Flag.RetriesExhausted |
 	Flag.OAuthExpiry;
 
 const RETRIABLE_KINDS =
@@ -166,7 +175,7 @@ function matchesPayloadRejectionText(text: string): boolean {
 	return true;
 }
 
-const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall\b/i;
+const TIMEOUT_PATTERN = /\b(?:operation\s+)?timed?\s*out\b|\btimeout\b|\bstream stall(?:ed|s|ing)?\b/i;
 const TRANSIENT_ENVELOPE_PATTERN = /anthropic stream envelope error:/i;
 const TRANSIENT_ENVELOPE_TRUNCATION_PATTERN = /before message_(?:start|delta|stop)/i;
 export const STREAM_READ_ERROR_PATTERN = /stream[_ -]?read[_ -]?error/i;
@@ -341,6 +350,15 @@ const SCHEMA_COMPILE_PATTERN = /compil/i;
 const INVALID_REQUEST_PATTERN = /invalid_request_error/i;
 const STRUCTURED_OUTPUTS_PATTERN = /structured[_ -]?outputs?/i;
 const FEATURE_NOT_SUPPORTED_PATTERN = /not (?:supported|available|enabled)|unsupported|does(?: not|n'?t) support/i;
+// Claude on Vertex AI: a GCP organization policy
+// (`constraints/vertexai.allowedPartnerModelFeatures`) denies the partner
+// feature `structured_outputs` by default, so a request carrying `strict` tools
+// fails with `400 FAILED_PRECONDITION: ... attempting to use a disallowed
+// feature structured_outputs for Partner model ...`. The wording is a denial,
+// not "unsupported", so it never reaches FEATURE_NOT_SUPPORTED_PATTERN. Anchored
+// on the adjacent `disallowed feature structured_outputs` phrase so a 400 that
+// only mentions both words apart stays terminal.
+const VERTEX_STRUCTURED_OUTPUTS_POLICY_PATTERN = /\bdisallowed feature\s+structured[_ -]?outputs?\b/i;
 const ANTHROPIC_STRICT_FIELD_PATTERN = /\btools\.\d+\.custom\.strict\b/i;
 const EXTRA_INPUTS_NOT_PERMITTED_PATTERN = /extra inputs? (?:are|is) not permitted/i;
 // Upstream strict-schema validation surfaced through a translating gateway.
@@ -428,6 +446,7 @@ function matchesStrictToolsRejection(message: string, errorStatus: number | unde
 		return true;
 	}
 	if (STRUCTURED_OUTPUTS_PATTERN.test(message) && FEATURE_NOT_SUPPORTED_PATTERN.test(message)) return true;
+	if (VERTEX_STRUCTURED_OUTPUTS_POLICY_PATTERN.test(message)) return true;
 	if (STRICT_TOOL_SCHEMA_REJECTION_PATTERN.test(message)) return true;
 	if (!INVALID_REQUEST_PATTERN.test(message)) return false;
 	const grammarTooLarge = GRAMMAR_TOO_LARGE_PATTERN.test(message) && GRAMMAR_TOO_LARGE_DETAIL_PATTERN.test(message);
@@ -483,6 +502,7 @@ const ERROR_KIND_LABELS: readonly [Flag, string][] = [
 	[Flag.SilentAbort, "silent-abort"],
 	[Flag.UserInterrupt, "user-interrupt"],
 	[Flag.Abort, "abort"],
+	[Flag.RetriesExhausted, "retries-exhausted"],
 ];
 
 const STATUS_MESSAGE_PATTERNS = [
@@ -506,6 +526,7 @@ export function is(id: number | undefined, flag: Flag): boolean {
 export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolean }): boolean {
 	if (is(id, Flag.ContentBlocked)) return false;
 	if (is(id, Flag.PayloadRejected)) return false;
+	if (is(id, Flag.RetriesExhausted)) return false;
 	if (opts?.replayUnsafe) return false;
 	if (is(id, Flag.MalformedFunctionCall)) return true;
 	return ((id ?? 0) & RETRIABLE_KINDS) !== 0;
@@ -513,6 +534,11 @@ export function retriable(id: number | undefined, opts?: { replayUnsafe?: boolea
 
 function isClassified(id: number | undefined): boolean {
 	return ((id ?? 0) & Flag.Class) !== 0;
+}
+
+/** `id` with `flag` set; a raw-status id becomes a classified one carrying only `flag`. */
+export function addFlag(id: number | undefined, flag: Flag): number {
+	return isClassified(id) ? (id ?? 0) | flag : create(flag);
 }
 
 function statusFromId(id: number | undefined): number | undefined {
@@ -950,6 +976,55 @@ function isAnthropicModelNotFoundError(error: unknown, provider: string, modelId
 	);
 }
 
+const AGY_UNKNOWN_MODEL = /^Unknown model ID: (\S+)$/;
+
+/**
+ * Model id from agy's ACP `session/set_config_option` rejection. agy builds
+ * its `model` roster per signed-in account, so a catalog model the account's
+ * tier lacks fails with this exact message before any inference.
+ */
+function antigravityCliUnknownModelId(error: unknown, depth = 0): string | undefined {
+	if (depth > 6) return undefined;
+	if (typeof error === "string") return AGY_UNKNOWN_MODEL.exec(error.trim())?.[1];
+	if (!error || typeof error !== "object") return undefined;
+	for (const text of [
+		"errorMessage" in error ? error.errorMessage : undefined,
+		"message" in error ? error.message : undefined,
+	]) {
+		const id = typeof text === "string" ? AGY_UNKNOWN_MODEL.exec(text.trim())?.[1] : undefined;
+		if (id !== undefined) return id;
+	}
+	return "cause" in error ? antigravityCliUnknownModelId(error.cause, depth + 1) : undefined;
+}
+
+/** Whether agy rejected this request's model, bare or as its effort-suffixed roster value, for the signed-in account. */
+function isAntigravityCliUnknownModelError(error: unknown, provider: string, modelId: string | undefined): boolean {
+	if (provider !== "antigravity-cli" || !modelId) return false;
+	const denied = antigravityCliUnknownModelId(error);
+	if (denied === undefined || !denied.startsWith(modelId)) return false;
+	const suffix = denied.slice(modelId.length);
+	return suffix === "" || THINKING_EFFORTS.some(effort => suffix === `-${effort}`);
+}
+
+// Gemini's per-user quota endpoint refuses a model the signed-in account has no
+// allowance for: "Model gemini-4-argon is not supported for per-user quota requests."
+const PER_USER_QUOTA_MODEL_DENIAL_PATTERN = /\bModel (\S+) is not supported for per-user quota requests\b/;
+
+/** Model id from a Gemini per-user quota model refusal. */
+function perUserQuotaDeniedModelId(error: unknown, depth = 0): string | undefined {
+	if (depth > 6) return undefined;
+	if (typeof error === "string") return PER_USER_QUOTA_MODEL_DENIAL_PATTERN.exec(error)?.[1];
+	if (!error || typeof error !== "object") return undefined;
+	for (const text of [
+		"errorMessage" in error ? error.errorMessage : undefined,
+		"message" in error ? error.message : undefined,
+	]) {
+		const id = typeof text === "string" ? PER_USER_QUOTA_MODEL_DENIAL_PATTERN.exec(text)?.[1] : undefined;
+		if (id !== undefined) return id;
+	}
+	return "cause" in error ? perUserQuotaDeniedModelId(error.cause, depth + 1) : undefined;
+}
+
 /** Whether Cursor returned a non-retryable plan entitlement denial for this account. */
 function isCursorPlanAccountPolicyError(error: unknown, provider: string, depth = 0): boolean {
 	if (provider !== "cursor" || depth > 6) return false;
@@ -969,14 +1044,19 @@ function isCursorPlanAccountPolicyError(error: unknown, provider: string, depth 
 /**
  * Flags for a rejection that denies this credential only the requested model
  * (Codex ChatGPT-account entitlement, Cursor plan, Anthropic model-not-found
- * 404), or 0. A denial that names a model must match `provider` and the
- * requested `modelId`, so provider-controlled text cannot block another model.
+ * 404, agy `Unknown model ID`, Gemini per-user quota model refusal), or 0. A denial that names a model must match
+ * `provider` and the requested `modelId`, so provider-controlled text cannot
+ * block another model.
  */
 export function modelEntitlementDenialKinds(error: unknown, provider: string, modelId: string | undefined): number {
 	if (isCodexChatGPTAccountPolicyError(error, provider, modelId) || isCursorPlanAccountPolicyError(error, provider)) {
 		return Flag.AccountPolicy | Flag.ContentBlocked;
 	}
-	return isAnthropicModelNotFoundError(error, provider, modelId) ? Flag.AccountPolicy : 0;
+	return isAnthropicModelNotFoundError(error, provider, modelId) ||
+		isAntigravityCliUnknownModelError(error, provider, modelId) ||
+		(!!modelId && perUserQuotaDeniedModelId(error) === modelId)
+		? Flag.AccountPolicy
+		: 0;
 }
 
 /** Whether a rejection denies this credential only the requested model; see {@link modelEntitlementDenialKinds}. */
@@ -994,7 +1074,10 @@ export function isMismatchedModelEntitlementDenial(
 	modelId: string | undefined,
 ): boolean {
 	const namesModel =
-		codexChatGPTAccountPolicyModel(error) !== undefined || anthropicModelNotFoundId(error) !== undefined;
+		codexChatGPTAccountPolicyModel(error) !== undefined ||
+		anthropicModelNotFoundId(error) !== undefined ||
+		(provider === "antigravity-cli" && antigravityCliUnknownModelId(error) !== undefined) ||
+		perUserQuotaDeniedModelId(error) !== undefined;
 	return namesModel && !isModelEntitlementDenial(error, provider, modelId);
 }
 
@@ -1042,6 +1125,32 @@ const CLINE_PASS_SURFACE_GATE_PATTERN = /only available via cline product surfac
  */
 export function isClinePassSurfaceGateMessage(errorMessage: string | undefined): boolean {
 	return errorMessage !== undefined && CLINE_PASS_SURFACE_GATE_PATTERN.test(errorMessage);
+}
+
+const OPENCODE_FREE_TIER_GATE_PATTERN = /\bfree tier can only be used from within OpenCode\b/i;
+
+/**
+ * OpenCode Zen serves its free models (`big-pickle`, `*-free`, the
+ * `*-contributor-free` Muse Spark builds) only to the OpenCode app and answers
+ * any other client with a 403 `FreeTierError` (#12306). The key is valid —
+ * paid Zen models keep working on it — and sibling keys fail identically, so
+ * the refusal must neither rotate nor block credentials.
+ */
+export function isOpenCodeFreeTierGateMessage(errorMessage: string | undefined): boolean {
+	return errorMessage !== undefined && OPENCODE_FREE_TIER_GATE_PATTERN.test(errorMessage);
+}
+
+/**
+ * omp's own copy for a provider that switched off the OAuth client or API a
+ * login uses ("Google has turned off Gemini access for this sign-in right
+ * now"). The outage is client-wide, not the account's: refreshing, rotating
+ * siblings, signing in again, or disabling the credential cannot help.
+ */
+const CLIENT_ACCESS_DISABLED_PATTERN = /\bhas turned off [^\n]{0,60}\baccess for this sign-in\b/i;
+
+/** Whether `errorMessage` is a transport's client-disabled copy (see {@link CLIENT_ACCESS_DISABLED_PATTERN}). */
+export function isClientAccessDisabledMessage(errorMessage: string | undefined): boolean {
+	return errorMessage !== undefined && CLIENT_ACCESS_DISABLED_PATTERN.test(errorMessage);
 }
 
 const GITHUB_COPILOT_POLICY_DENIAL_PATTERN = /GitHub Copilot access denied \(HTTP 403\)/;
@@ -1212,7 +1321,7 @@ export function isTransientStreamParseError(error: unknown): boolean {
  * non-terminal status treat it as transient (#11805).
  */
 const STREAM_DROP_PATTERN =
-	/stream disconnected before completion|(?:stream|websocket) closed before response\.completed|stream was interrupted|stream ended before (?:terminal (?:chunk|completion event)|message_(?:start|delta|stop))|socket disconnected before secure tls connection/i;
+	/stream disconnected before completion|(?:stream|websocket) closed before response\.completed|stream (?:was )?interrupted|stream ended before (?:terminal (?:chunk|completion event)|message_(?:start|delta|stop))|socket disconnected before secure tls connection/i;
 
 /**
  * Transport stream-drop diagnostic (see {@link STREAM_DROP_PATTERN}). Unlike

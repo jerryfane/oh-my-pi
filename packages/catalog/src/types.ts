@@ -16,8 +16,8 @@ export type KnownApi =
 	| "anthropic-messages"
 	| "bedrock-converse-stream"
 	| "google-generative-ai"
-	| "google-gemini-cli"
 	| "google-vertex"
+	| "google-interactions"
 	| "kiro-api"
 	| "ollama-chat"
 	| "cursor-agent"
@@ -67,6 +67,7 @@ export const RUNNER_APIS = [
 	"openrouter-rerank",
 	"openrouter-video",
 	"openai-transcriptions",
+	"xai-stt",
 ] as const;
 /** Kind each single-purpose runner API serves; `local-inference` hosts several kinds. */
 export const RUNNER_API_KINDS: Record<Exclude<(typeof RUNNER_APIS)[number], "local-inference">, ModelKind> = {
@@ -86,6 +87,7 @@ export const RUNNER_API_KINDS: Record<Exclude<(typeof RUNNER_APIS)[number], "loc
 	"openrouter-rerank": "rerank",
 	"openrouter-video": "video",
 	"openai-transcriptions": "stt",
+	"xai-stt": "stt",
 };
 
 const RUNNER_API_KIND_BY_API: ReadonlyMap<Api, ModelKind> = new Map(Object.entries(RUNNER_API_KINDS));
@@ -95,12 +97,15 @@ export function runnerApiKind(api: Api): ModelKind | undefined {
 	return RUNNER_API_KIND_BY_API.get(api);
 }
 
+/** Audio containers an `openai-speech`/`xai-tts` runner can be asked to return. */
+export const SPEECH_FORMATS = ["mp3", "wav", "pcm", "opus", "aac", "flac"] as const;
+export type SpeechFormat = (typeof SPEECH_FORMATS)[number];
+
 /** Catalog APIs `generate_image` runs through a pi-ai image client; the hosted Responses pair needs a carrier model. */
 export const IMAGE_GENERATION_APIS = [
 	"openai-images",
 	"openrouter-images",
 	"google-generative-ai",
-	"google-gemini-cli",
 	"openai-responses",
 	"openai-codex-responses",
 	"factory-droid-agent",
@@ -178,17 +183,15 @@ export interface ThinkingConfig {
 	/**
 	 * Per-effort thinking budget in tokens, baked at build time for collapsed
 	 * variants whose upstream expects an explicit `thinkingBudget` instead of a
-	 * value derived from the generic ladder (Antigravity Cloud Code Assist
-	 * gemini-3.x). Request mapping prefers caller `thinkingBudgets`, then this
+	 * value derived from the generic ladder. Request mapping prefers caller `thinkingBudgets`, then this
 	 * map, then the provider default ladder. Only meaningful for `mode: "budget"`.
 	 */
 	effortBudgets?: Readonly<Partial<Record<Effort, number>>>;
 	/**
 	 * When true, a thinking-off request MUST explicitly suppress thinking on
 	 * the wire (google-level: `thinkingLevel: "MINIMAL"` + `includeThoughts:
-	 * false`; budget: `thinkingBudget: 0`) instead of omitting thinkingConfig —
-	 * Cloud Code Assist re-applies the per-id baked server default when the
-	 * config is absent.
+	 * false`; budget: `thinkingBudget: 0`) instead of omitting thinkingConfig, for
+	 * upstreams that re-apply a baked server default when the config is absent.
 	 */
 	suppressWhenOff?: boolean;
 	/**
@@ -510,13 +513,18 @@ export interface OpenAICompat {
 	 * grammar converter reads them as closed/open-object semantics, and
 	 * `additionalProperties: false` pins the strict object shape.
 	 *
+	 * `"google"` rewrites schemas into Google's Gemini dialect
+	 * (`normalizeSchemaForGoogle`: scalar `type`, `nullable`, no unsupported
+	 * keywords) for Gemini models behind an OpenAI-compatible host (GitHub
+	 * Copilot), which 400s on JSON Schema `type` arrays.
+	 *
 	 * Default: auto-detected — `"moonshot-mfjs"` on Moonshot native hosts
 	 * (api.moonshot.ai / api.kimi.com) and Kimi-family model ids on any host,
 	 * since proxies (OpenRouter, custom gateways) forward schemas to Moonshot
 	 * verbatim; `"grammar"` on local OpenAI-compatible backends. Set `"none"`
 	 * to opt a host out.
 	 */
-	toolSchemaFlavor?: "moonshot-mfjs" | "grammar" | "none";
+	toolSchemaFlavor?: "moonshot-mfjs" | "grammar" | "google" | "none";
 	/**
 	 * Stream-watchdog first-event timeout in ms.
 	 * Set to `0` to allow unbounded prompt processing. Default: auto-detected
@@ -995,6 +1003,19 @@ export interface ResolvedOpenAISharedCompat {
 	requiresMistralToolIds: boolean;
 	requiresToolResultName: boolean;
 	requiresAssistantAfterToolResult: boolean;
+	/**
+	 * Append a user/developer message that directly follows a tool result to
+	 * that result's content instead of sending it as its own turn. Rule-owned:
+	 * Gemini 4 Neon ends about half of the requests that close on user text
+	 * after a function response with an empty `MALFORMED_RESPONSE`.
+	 */
+	foldUserAfterToolResult: boolean;
+	/**
+	 * Replay each call of a multi-call assistant turn as its own assistant
+	 * message followed by its result. Rule-owned: vLLM's Llama 3 chat templates
+	 * reject an assistant message with more than one tool call.
+	 */
+	splitToolCalls: boolean;
 	requiresAssistantContentForToolCalls: boolean;
 	stripDeepseekSpecialTokens: boolean;
 	streamMarkupHealingPattern?: OpenAIStreamMarkupHealingPattern;
@@ -1155,6 +1176,12 @@ export interface ResolvedOpenAIResponsesCompat extends ResolvedOpenAISharedCompa
 	 * input into the in-flight response. Rule-owned: GPT-6 family.
 	 */
 	supportsSteering: boolean;
+	/**
+	 * Whether the model never prompt-caches the top-level `instructions` field,
+	 * so system prompts must ride as leading `developer` input items on every
+	 * host. Rule-owned: GPT-6.2 (openai/codex#62312).
+	 */
+	uncachedInstructions: boolean;
 	/** Inject the `# Juice: 0 !important` developer item when reasoning is forced off (gpt-5.6+). */
 	requiresReasoningOffJuiceInstruction: boolean;
 	/**
@@ -1320,7 +1347,7 @@ export type ResolvedDevinCompat = Required<Omit<DevinCompat, "supportsSamplingPa
 	Pick<DevinCompat, "supportsSamplingParams" | "temperatureFloor">;
 /**
  * Compatibility settings for the Google API family (google-generative-ai,
- * google-vertex, google-gemini-cli). Class-driven defaults come from the
+ * google-vertex). Class-driven defaults come from the
  * compat cascade; sparse overrides follow the same shape.
  */
 export interface GoogleCompat {
@@ -1335,24 +1362,12 @@ export interface GoogleCompat {
 	 * `thoughtSignature` as bytes and reject the raw literal.
 	 */
 	base64SkipThoughtSignature?: boolean;
-	/** Drop unsigned thinking blocks from replayed history (Antigravity Claude). */
-	dropUnsignedThinking?: boolean;
-	/** Cloud Code Assist legacy `parameters` schema field instead of `parametersJsonSchema`. */
-	ccaLegacyParametersSchema?: boolean;
 	/** Whether multimodal (non-text) functionResponse parts are accepted (Gemini 3+). */
 	multimodalFunctionResponse?: boolean;
 	/** Stream-watchdog first-event timeout in ms; 0 disables it. */
 	streamFirstEventTimeoutMs?: number;
 	/** Stream-watchdog idle-timeout floor in ms. */
 	streamIdleTimeoutMs?: number;
-	/** Work around the Flash streaming leak (duplicate first chunk) on gemini-cli. */
-	flashStreamLeakWorkaround?: boolean;
-	/** Send the Claude thinking beta header on Antigravity Claude requests. */
-	claudeThinkingBetaHeader?: boolean;
-	/** Antigravity Claude tool-mode request framing. */
-	antigravityClaudeToolMode?: boolean;
-	/** Usage-label bucket Antigravity reports this model under. */
-	antigravityUsageLabel?: string;
 	/** Strip image inputs before encoding (text-only serving of a multimodal id). */
 	stripImageInput?: boolean;
 	/**
@@ -1377,7 +1392,6 @@ export type ResolvedGoogleCompat = Required<
 		GoogleCompat,
 		| "streamFirstEventTimeoutMs"
 		| "streamIdleTimeoutMs"
-		| "antigravityUsageLabel"
 		| "supportsSamplingParams"
 		| "base64SkipThoughtSignature"
 		| "maxImageDimension"
@@ -1386,7 +1400,6 @@ export type ResolvedGoogleCompat = Required<
 > & {
 	streamFirstEventTimeoutMs?: number;
 	streamIdleTimeoutMs?: number;
-	antigravityUsageLabel?: string;
 	supportsSamplingParams?: boolean;
 	base64SkipThoughtSignature?: boolean;
 	maxImageDimension?: number;
@@ -1415,7 +1428,7 @@ export type CompatConfigOf<TApi extends Api> = TApi extends
 			? BedrockCompat
 			: TApi extends "devin-agent"
 				? DevinCompat
-				: TApi extends "google-generative-ai" | "google-vertex" | "google-gemini-cli"
+				: TApi extends "google-generative-ai" | "google-vertex"
 					? GoogleCompat
 					: TApi extends "ollama-chat"
 						? OllamaCompat
@@ -1434,11 +1447,21 @@ export type CompatOf<TApi extends Api> = TApi extends "openrouter"
 					? ResolvedBedrockCompat
 					: TApi extends "devin-agent"
 						? ResolvedDevinCompat
-						: TApi extends "google-generative-ai" | "google-vertex" | "google-gemini-cli"
+						: TApi extends "google-generative-ai" | "google-vertex"
 							? ResolvedGoogleCompat
 							: TApi extends "ollama-chat"
 								? ResolvedOllamaCompat
 								: undefined;
+
+/**
+ * A configured snapcompact frame shape: a snapcompact shape variant name
+ * (`11on16-bw`, `8on22-bw`, …) and optionally the frame edge in px, which
+ * otherwise is the variant's own. An unknown variant name is ignored.
+ */
+export interface SnapcompactShapeConfig {
+	variant: string;
+	frameSize?: number;
+}
 
 /** Provider-native compaction endpoint configuration for one model. */
 export interface RemoteCompactionConfig<TApi extends Api = Api> {
@@ -1514,6 +1537,16 @@ export interface ModelCost extends TokenCost {
 	timeBased?: TimeBasedCost;
 }
 
+/** A model's fast lane on a host that serves it under separate wire ids; see {@link Model.priorityLane}. */
+export interface PriorityLane {
+	/** Logical id the lane was listed under; `buildModel` prices it under this id's catalog rules. */
+	id: string;
+	/** Standard wire id → the same model's fast-lane wire id. Wire ids without an entry run at standard speed. */
+	routes: Readonly<Record<string, string>>;
+	/** Lane rate card. */
+	cost: ModelCost;
+}
+
 /**
  * Exact local content tokenizer family for a model.
  *
@@ -1543,12 +1576,13 @@ export interface ModelAccountAccess {
 	 */
 	cyberPrograms?: readonly string[];
 	/**
-	 * Antigravity request constants this account's `fetchAvailableModels`
-	 * roster advertised, keyed by upstream SKU id. Takes precedence over
-	 * {@link Model.antigravityWireProfiles}, which keeps only the first
-	 * account's values when multi-account rosters are unioned.
+	 * Service-tier ids this account's own catalog advertised for the model
+	 * (Codex `service_tiers[].id`). Tier entitlements differ per account
+	 * (Ultrafast is plan-gated), while {@link Model.serviceTiers} is the union
+	 * across accounts, so requests and credential selection read this list for
+	 * the account in hand. Absent when the account's catalog listed no tiers.
 	 */
-	antigravityWireProfiles?: Readonly<Record<string, AntigravityModelWireProfile>>;
+	serviceTiers?: readonly string[];
 }
 
 /** One Cursor `RequestedModel.parameters` entry recovered from rich discovery. */
@@ -1564,20 +1598,6 @@ export interface CursorModelRoute {
 	maxMode?: boolean;
 }
 
-/**
- * Antigravity Cloud Code Assist request constants for one upstream SKU, as the
- * native client sends them; see {@link Model.antigravityWireProfiles}.
- */
-export interface AntigravityModelWireProfile {
-	/** Opaque `labels.model_enum` token (`fetchAvailableModels` `model`). */
-	modelEnum?: string;
-	/** Fixed `generationConfig.maxOutputTokens` the client always sends. */
-	maxOutputTokens?: number;
-	/** SKU thinking level; the native client sends it in preference to a budget. */
-	thinkingLevel?: "LOW" | "MEDIUM" | "HIGH" | "xhigh";
-	/** SKU thinking budget (`-1` is dynamic), sent when no level is advertised. */
-	thinkingBudget?: number;
-}
 // Model interface for the unified model system
 export interface Model<TApi extends Api = Api> {
 	id: string;
@@ -1632,6 +1652,13 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	requestModelId?: string;
 	/**
+	 * Fast lane served under its own wire ids rather than a request field
+	 * (Devin's `-fast` / `-priority` / `-lightning` uids). Discovery folds the
+	 * lane's row into this one; the `priority` service tier (`/fast`) sends the
+	 * routed wire id and bills the lane's card.
+	 */
+	priorityLane?: PriorityLane;
+	/**
 	 * `reasoning.mode` to send on OpenAI Responses-family requests. Set on
 	 * generated pro aliases (`gpt-5.6-*-pro` on `openai`/`openai-codex`) that
 	 * pair a base wire id (`requestModelId`) with OpenAI's pro reasoning
@@ -1668,6 +1695,14 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	imageCountBudget?: number;
 	/**
+	 * Snapcompact frame shape for this model, from user or extension
+	 * configuration. Replaces the model line's eval default (a gateway may
+	 * serve a model whose readers or network path favor another shape); an
+	 * explicit `snapcompact.shape` setting still wins, and the frame stays
+	 * within the host's `image-max-edge`.
+	 */
+	snapcompactShape?: SnapcompactShapeConfig;
+	/**
 	 * Native provider tool-call support. `false` is the only unsupported signal:
 	 * `true` and `undefined` both mean callers may use native tools. Catalog and
 	 * discovery sources should set this sparsely when an upstream explicitly
@@ -1693,19 +1728,10 @@ export interface Model<TApi extends Api = Api> {
 	 */
 	cursorMaxModeRoutes?: Readonly<Record<string, boolean>>;
 	/**
-	 * Per-wire-id Antigravity request constants recorded from the account's
-	 * `fetchAvailableModels` roster, keyed by upstream SKU id. A collapsed row
-	 * carries one entry per member it routes to; a raw row carries its own.
-	 * Absent on bundled snapshots that predate discovery.
-	 */
-	antigravityWireProfiles?: Readonly<Record<string, AntigravityModelWireProfile>>;
-	/**
 	 * Per-account availability recorded by multi-account discovery: provider
-	 * account key (Codex: ChatGPT `chatgpt_account_id`; Antigravity: login
-	 * email) → that account's entitlements on this model. An account appears
+	 * account key (Codex: ChatGPT `chatgpt_account_id`) → that account's entitlements on this model. An account appears
 	 * only when its own catalog lists the model, so credential selection can
-	 * route account-gated models (e.g. `gpt-daybreak-blue-latest`, Antigravity
-	 * Claude 5.5) straight to eligible accounts. Absent on bundled/config rows.
+	 * route account-gated models (e.g. `gpt-daybreak-blue-latest`) straight to eligible accounts. Absent on bundled/config rows.
 	 */
 	accountAccess?: Readonly<Record<string, ModelAccountAccess>>;
 	/** Cursor `RequestedModel.parameters` for this model's default variant. */
@@ -1757,6 +1783,10 @@ export interface Model<TApi extends Api = Api> {
 	pricingStatus?: Exclude<ModelPricingStatus, "fixed">;
 	/** Premium Copilot requests charged per user-initiated request (defaults to 1). */
 	premiumMultiplier?: number;
+	/** Speech runners: voice sent when the caller names none (gateways may reject a voiceless request). */
+	voice?: string;
+	/** Speech runners: the only output formats the endpoint returns; absent means any {@link SpeechFormat}. */
+	speechFormats?: SpeechFormat[];
 	contextWindow: number | null;
 	/** Preserve the host's supplied window instead of applying inferred expansion or reference-price caps. */
 	contextWindowAuthoritative?: boolean;
@@ -1794,9 +1824,10 @@ export interface Model<TApi extends Api = Api> {
 	 *
 	 * Used by containerized omp installs (e.g. robomp slots) to route every
 	 * LLM call through a sidecar gateway that holds the real provider
-	 * credentials. The model's other metadata (pricing, context window,
-	 * thinking config, …) still resolves locally; only the streaming
-	 * dispatch is redirected.
+	 * credentials. The provider's roster and model metadata (pricing, context
+	 * window, thinking config, …) come from the gateway's `GET /v1/pi/models`
+	 * (`piNativeModelManagerOptions`), falling back to the local catalog when
+	 * the gateway predates that route.
 	 */
 	transport?: "pi-native";
 	/** Standard Responses is opt-in and catalog-gated; either model/request false vetoes true. Codex keeps its independent policy. */

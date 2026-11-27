@@ -3,7 +3,7 @@
  * of owner-facing workers, the policy it runs them under (sibling board,
  * answers to asks), and how an agent's IRC message to a topic becomes a topic turn.
  */
-import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import type { IrcDeliveryReceipt, IrcMessage } from "../irc/irc-types";
 import { logger, prompt } from "@oh-my-pi/pi-utils";
 import type { IrcBusApi } from "../irc/bus";
 import { IrcBus } from "../irc/bus";

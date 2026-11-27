@@ -34,8 +34,8 @@ import { formatTopicBoard, topicBoardMessage } from "@oh-my-pi/pi-coding-agent/t
 import { createTopicsHost, type TopicsHost } from "@oh-my-pi/pi-coding-agent/topics/host";
 import { resetTopicsRegistryForTests, topicsRegistry } from "@oh-my-pi/pi-coding-agent/topics/workers";
 import { VibeSessionRegistry } from "@oh-my-pi/pi-coding-agent/vibe/runtime";
-import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
-import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import type { IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/irc-types";
+import type { AgentProgress, SingleResult } from "@oh-my-pi/pi-coding-agent/task/task-details";
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 const OWNER = "Main";

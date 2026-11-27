@@ -6,7 +6,7 @@
 import { type } from "@oh-my-pi/omptype";
 import type { AgentTool, AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { prompt } from "@oh-my-pi/pi-utils";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolError } from "../tools/tool-errors";
 import topicSuggestDescription from "../prompts/tools/topic-suggest.md" with { type: "text" };
 import type { TopicsHost } from "./host";
 import { type TopicSuggestion, topicsErrorCode } from "./suggestions";

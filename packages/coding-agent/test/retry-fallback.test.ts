@@ -376,13 +376,13 @@ describe("retry fallback selector resolution", () => {
 	});
 
 	it("does not adopt a model-kind role's chain for a chat session on the same model", () => {
-		const model = getBundledModel("google-antigravity", "gemini-3.8-flash");
+		const model = getBundledModel("google", "gemini-3.8-flash");
 		const webModel = getBundledModel("web", "parallel");
 		if (!model || !webModel) throw new Error("Expected bundled Gemini and web-search test models");
-		const live = "google-antigravity/gemini-3.8-flash:medium";
+		const live = "google/gemini-3.8-flash:medium";
 		const models = [model, webModel];
 		const roleModels: Record<string, string> = {
-			web: "google-antigravity/gemini-3.8-flash:minimal",
+			web: "google/gemini-3.8-flash:minimal",
 			task: live,
 		};
 		const withWebChain = (chains: RetryFallbackResolutionContext["chains"]): RetryFallbackResolutionContext => ({
@@ -406,6 +406,39 @@ describe("retry fallback selector resolution", () => {
 
 		// A web-search caller names its role explicitly and keeps its own chain.
 		expect(resolveRetryFallbackChainKey(webOnly, live, model, "web")).toBe("web");
+	});
+});
+
+describe("retry fallback route validation", () => {
+	it("accepts upstream-pinned keys and entries without credentials or the full catalog but warns for unknown models", () => {
+		const model = getBundledModel("openrouter", "qwen/qwen3-coder");
+		if (!model) throw new Error("Expected bundled OpenRouter test model");
+		const models = [model];
+		const registry = {
+			find: (provider: string, id: string) => resolveProviderModelReference(provider, id, models),
+			hasProvider: (provider: string) => provider === "openrouter",
+			getProviderModels: (provider: string) => models.filter(candidate => candidate.provider === provider),
+			getAll: (): Model[] => {
+				throw new Error("Route validation must not compose the full catalog");
+			},
+		};
+		const pinned = "openrouter/qwen/qwen3-coder:exacto@cerebras";
+		const unknown = "openrouter/unknown-model:exacto@cerebras";
+		const settings = Settings.isolated({
+			"retry.fallbackChains": {
+				[pinned]: [],
+				[unknown]: [],
+				default: [pinned, "openrouter/qwen/qwen3-coder:high@cerebras", unknown],
+			},
+		});
+		const warnings: string[] = [];
+
+		validateRetryFallbackChains(settings, registry, warning => warnings.push(warning));
+
+		expect(warnings).toEqual([
+			`retry.fallbackChains key references unknown model: ${unknown}`,
+			`Fallback chain for role 'default' references unknown model: ${unknown}`,
+		]);
 	});
 });
 

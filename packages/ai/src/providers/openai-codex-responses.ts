@@ -48,7 +48,7 @@ import type {
 	ToolResultMessage,
 	Usage,
 } from "../types";
-import { getPremiumServiceTierRequests, parseServiceTier } from "../types";
+import { getPremiumServiceTierRequests, parseServiceTier, serviceTierOffersByAccount } from "../types";
 import {
 	clampOpenAIResponsesImageDetailForReplay,
 	createOpenAIResponsesHistoryPayload,
@@ -668,7 +668,7 @@ function createCodexRequestMetadata(
 }
 
 function applyCodexCompatibilityHeaders(headers: Headers, metadata: CodexCompatibilityIdentity): void {
-	headers.set(OPENAI_HEADERS.SCOPED_SESSION_ID, metadata.affinitySessionId ?? metadata.sessionId);
+	headers.set(OPENAI_HEADERS.SESSION_ID, metadata.affinitySessionId ?? metadata.sessionId);
 	headers.set(OPENAI_HEADERS.THREAD_ID, metadata.threadId);
 	headers.set(OPENAI_HEADERS.WINDOW_ID, metadata.windowId);
 	if (metadata.turnMetadataJson) {
@@ -1025,6 +1025,16 @@ function isCodexWebSocketRetryableStreamError(error: unknown): boolean {
 	);
 }
 
+/**
+ * Whether a stream event mirrors per-response HTTP headers (`x-codex-turn-state`,
+ * `x-models-etag`) in its `headers` field. WebSocket frames carry no HTTP
+ * headers; the live backend sends them on `codex.response.metadata`, while
+ * `response.metadata` is the shape codex-rs parses.
+ */
+function isCodexHeaderMetadataEvent(type: unknown): boolean {
+	return type === "codex.response.metadata" || type === "response.metadata";
+}
+
 function updateCodexSessionMetadataFromHeaders(
 	turnState: CodexTurnStateCell | undefined,
 	state: CodexWebSocketSessionState | undefined,
@@ -1200,6 +1210,20 @@ function applyCodexServiceTierPricing(
 	return resolvedTier;
 }
 
+/**
+ * Drop a tier the request's own account does not offer. The body was built
+ * against {@link Model.serviceTiers}, the union across accounts, and the
+ * backend refuses a plan-gated tier (Ultrafast) from an account without it.
+ */
+function dropUnofferedServiceTier(
+	body: Pick<RequestBody, "service_tier">,
+	model: Model<"openai-codex-responses">,
+	accountId: string | undefined,
+): void {
+	if (!body.service_tier || !accountId) return;
+	if (serviceTierOffersByAccount(model, body.service_tier)?.[accountId] === false) delete body.service_tier;
+}
+
 function resetOutputState(output: AssistantMessage): void {
 	output.content.length = 0;
 	output.usage = {
@@ -1263,6 +1287,7 @@ function createCodexRequestContext(
 
 	const accountId = getCodexAccountId(apiKey);
 	applyCodexAccessPrograms(transformedBody, model, accountId, options?.codexAccessPrograms);
+	dropUnofferedServiceTier(transformedBody, model, accountId);
 	const baseUrl = model.baseUrl || CODEX_BASE_URL;
 	const url = resolveCodexResponsesUrl(baseUrl);
 
@@ -1651,7 +1676,7 @@ function applyCodexCompactionResponseMetadata(
 	requestContext: CodexRequestContext,
 	event: Record<string, unknown>,
 ): void {
-	if (event.type !== "response.metadata") return;
+	if (!isCodexHeaderMetadataEvent(event.type)) return;
 	updateCodexSessionMetadataFromHeaders(
 		requestContext.turnState,
 		requestContext.websocketState,
@@ -1836,7 +1861,7 @@ async function openCodexWebSocketTransport(
 				model: requestContext.transformedBody.model,
 				reasoningEffort: requestContext.transformedBody.reasoning?.effort ?? null,
 				headers: redactHeaders(websocketHeaders),
-				sentTurnStateHeader: websocketHeaders.has(X_CODEX_TURN_STATE_HEADER),
+				sentTurnState: websocketRequest.client_metadata?.[X_CODEX_TURN_STATE_HEADER] !== undefined,
 				sentModelsEtagHeader: websocketHeaders.has(X_MODELS_ETAG_HEADER),
 				requestType: websocketRequest.type,
 				retry,
@@ -2333,12 +2358,11 @@ class CodexStreamProcessor {
 			return firstTokenTime;
 		}
 
-		if (eventType === "response.metadata") {
-			// The WebSocket transport has no per-response HTTP headers; codex-rs
-			// mirrors them into this event's `headers` and reads
-			// `x-codex-turn-state` from there (ResponsesStreamEvent::turn_state).
-			// Capture only the first non-empty value so same-turn follow-ups keep
-			// the server's original sticky-routing token on either transport.
+		if (isCodexHeaderMetadataEvent(eventType)) {
+			// WebSocket frames carry no per-response HTTP headers; the backend
+			// mirrors them into this event's `headers`. Capture only the first
+			// non-empty `x-codex-turn-state` so same-turn follow-ups keep the
+			// server's original sticky-routing token on either transport.
 			updateCodexSessionMetadataFromHeaders(
 				this.requestContext.turnState,
 				this.requestContext.websocketState,
@@ -3330,6 +3354,7 @@ export async function prewarmOpenAICodexResponses(
 		model: model.requestModelId ?? model.id,
 	};
 	applyOpenAIServiceTier(routedRequest, options?.serviceTier, model);
+	dropUnofferedServiceTier(routedRequest, model, accountId);
 	const headers = logger.time(
 		"prewarmCodex:createHeaders",
 		createCodexHeaders,
@@ -4224,14 +4249,11 @@ function createCodexHeaders(
 	headers.set(OPENAI_HEADERS.VERSION, codexClientVersion);
 	headers.set("User-Agent", USER_AGENT);
 	if (sessionId) {
-		// The backend derives prompt-cache affinity from the session headers
-		// (codex-rs `responses_session_id`); a side request shares its parent's.
-		const affinitySessionId = requestMetadata?.affinitySessionId ?? sessionId;
-		headers.set(OPENAI_HEADERS.CONVERSATION_ID, affinitySessionId);
-		headers.set(OPENAI_HEADERS.SESSION_ID, affinitySessionId);
+		// The backend derives prompt-cache affinity from `session-id` (codex-rs
+		// `responses_session_id`); a side request shares its parent's.
+		headers.set(OPENAI_HEADERS.SESSION_ID, requestMetadata?.affinitySessionId ?? sessionId);
 		headers.set("x-client-request-id", sessionId);
 	} else {
-		headers.delete(OPENAI_HEADERS.CONVERSATION_ID);
 		headers.delete(OPENAI_HEADERS.SESSION_ID);
 		headers.delete("x-client-request-id");
 	}
@@ -4239,7 +4261,6 @@ function createCodexHeaders(
 	if (requestMetadata) {
 		applyCodexCompatibilityHeaders(headers, requestMetadata);
 	} else {
-		headers.delete(OPENAI_HEADERS.SCOPED_SESSION_ID);
 		headers.delete(OPENAI_HEADERS.THREAD_ID);
 		headers.delete(OPENAI_HEADERS.WINDOW_ID);
 		headers.delete(OPENAI_HEADERS.TURN_METADATA);

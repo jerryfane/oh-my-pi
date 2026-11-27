@@ -8,7 +8,7 @@
 import * as crypto from "node:crypto";
 import type { TextContent } from "@oh-my-pi/pi-ai";
 import { escapeXmlText } from "@oh-my-pi/pi-utils";
-import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
+import { oneLineLabel } from "../task/task-details";
 import { escapeHarnessTags } from "../session/harness-tags";
 import type { StartFailedCode } from "../session/inbox-epoch";
 import type { CustomEntry, CustomMessageEntry, SessionEntry, SessionMessageEntry } from "../session/session-entries";

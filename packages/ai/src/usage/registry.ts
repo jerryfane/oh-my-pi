@@ -6,11 +6,9 @@ import { claudeRankingStrategy, claudeUsageProvider } from "./claude";
 import { clinePassUsageProvider } from "./cline-pass";
 import { commandCodeRankingStrategy, commandCodeUsageProvider } from "./commandcode";
 import { cursorRankingStrategy, cursorUsageProvider } from "./cursor";
-import { devinUsageProvider } from "./devin";
+import { devinRankingStrategy, devinUsageProvider } from "./devin";
 import { factoryDroidRankingStrategy, factoryDroidUsageProvider } from "./factory-droid";
-import { googleGeminiCliUsageProvider } from "./gemini";
 import { githubCopilotUsageProvider } from "./github-copilot";
-import { antigravityRankingStrategy, antigravityUsageProvider } from "./google-antigravity";
 import { kimiRankingStrategy, kimiUsageProvider } from "./kimi";
 import { kiroRankingStrategy, kiroUsageProvider } from "./kiro";
 import { museCodeUsageProvider } from "./muse-code";
@@ -33,8 +31,6 @@ export const DEFAULT_USAGE_PROVIDERS: readonly UsageProvider[] = [
 	kimiUsageProvider,
 	minimaxCodeUsageProvider,
 	museCodeUsageProvider,
-	antigravityUsageProvider,
-	googleGeminiCliUsageProvider,
 	ollamaUsageProvider,
 	factoryDroidUsageProvider,
 	ollamaCloudUsageProvider,
@@ -67,7 +63,6 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 	["openai-codex", codexRankingStrategy],
 	["anthropic", claudeRankingStrategy],
 	["cursor", cursorRankingStrategy],
-	["google-antigravity", antigravityRankingStrategy],
 	["factory-droid", factoryDroidRankingStrategy],
 	["kimi-code", kimiRankingStrategy],
 	["zai", zaiRankingStrategy],
@@ -75,6 +70,7 @@ const DEFAULT_RANKING_STRATEGIES = new Map<Provider, CredentialRankingStrategy>(
 	["xai-oauth", xaiOauthRankingStrategy],
 	["commandcode", commandCodeRankingStrategy],
 	["kiro", kiroRankingStrategy],
+	["devin", devinRankingStrategy],
 ]);
 
 /** Built-in ranking strategy for `provider`. */

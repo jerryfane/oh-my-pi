@@ -94,7 +94,7 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		if (Array.isArray(command) && Array.isArray(command.raw)) {
 			args = { command: templateCommand(command, rest) };
 		} else if (typeof command === "string") {
-			args = { ...optionsArg("sh", rest[0], rest.slice(1), ["cwd", "timeout"], "{ cwd, timeout }"), command };
+			args = { ...optionsArg("sh", rest[0], rest.slice(1), ["timeout"], "{ timeout }"), command };
 		} else {
 			throw new TypeError('sh() expects a command string or a template literal: sh("ls -la") or sh`ls ${dir}`');
 		}
@@ -410,8 +410,12 @@ if (!globalThis.__omp_js_prelude_loaded__) {
 		const isHandleLike = value => value instanceof EvalHandle || value instanceof PendingHandle;
 		// `Array.from(1800)` is `[]`: a number would otherwise return at once, silently, where a sleep was meant.
 		if (typeof handles === "number") throw new TypeError(WAIT_NOT_A_SLEEP);
-		const raw = isHandleLike(handles) ? [handles] : Array.from(handles ?? []);
-		const items = await Promise.all(raw);
+		const raw = isHandleLike(handles) || typeof handles === "string" ? [handles] : Array.from(handles ?? []);
+		const items = (await Promise.all(raw)).map(value =>
+			typeof value === "string" && value.length > 0
+				? new AgentHandle(value.startsWith("agent://") ? value.slice(8) : value, "task")
+				: value,
+		);
 		for (const handle of items) {
 			if (!(handle instanceof EvalHandle)) throw new TypeError("wait() expects agent or completion handles");
 		}

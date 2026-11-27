@@ -2,13 +2,13 @@ import { clearSubmittedText, refuseImages, restoreDetachedDraft, runWithDetached
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
-import { logger, setProjectDir } from "@oh-my-pi/pi-utils";
+import { errorMessage, logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { rescopeSessionToCwd } from "../session/cwd-rescope";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
 import { continuesConversation } from "../modes/utils/conversation-position";
 import type { FreshSessionResult } from "../session/agent-session";
 import { COMPACT_MODES, findCompactMode, type ParsedCompactArgs, parseCompactArgs } from "../session/compact-modes";
-import { USER_INTERRUPT_LABEL } from "../session/messages";
+import { isInterruptReason } from "../session/messages";
 import { resolveResumableSession, resolveResumeTarget } from "../session/session-listing";
 import { toggleSessionPin, unpinSession } from "../session/session-pins";
 import {
@@ -16,11 +16,12 @@ import {
 	createSessionWorktree,
 	defaultSessionWorktreeBranch,
 	formatSessionWorktreeSummary,
+	runSessionWorktreeHook,
 } from "../session/session-worktree";
 import type { SessionWorktree } from "../worktree/backend";
 import { formatShakeSummary, type ShakeMode } from "../session/shake-types";
 import { resolveToCwd } from "../tools/path-utils";
-import { commandConsumed, errorMessage, usage } from "./helpers/parse";
+import { commandConsumed, usage } from "./helpers/parse";
 import { handleSshAcp } from "./helpers/ssh";
 import type {
 	ParsedSlashCommand,
@@ -50,10 +51,7 @@ async function handleCompact(command: ParsedSlashCommand, runtime: SlashCommandR
 			);
 		} catch (err) {
 			// Don't append an out-of-turn notice after the host already reported its interrupt.
-			if (
-				err instanceof CompactionCancelledError &&
-				(err.cause === USER_INTERRUPT_LABEL || runtime.signal?.aborted)
-			) {
+			if (err instanceof CompactionCancelledError && (isInterruptReason(err.cause) || runtime.signal?.aborted)) {
 				return;
 			}
 			const message = errorMessage(err);
@@ -90,7 +88,7 @@ async function handleCompactTui(command: ParsedSlashCommand, runtime: TuiSlashCo
 	// A switch still applying (or rolling back) decides which conversation is live.
 	if (origin && ctx.session.isSessionTransitioning) await ctx.session.waitForSessionTransition();
 	if (origin && !continuesConversation(ctx.sessionManager, origin)) {
-		restoreDetachedDraft(ctx.editor, command.text, runtime.input?.images, runtime.input?.imageLinks);
+		restoreDetachedDraft(ctx.composer, command.text, runtime.input?.images, runtime.input?.imageLinks);
 		ctx.showWarning(`Conversation changed before /${command.name} ran; returned it to the editor`);
 		return;
 	}
@@ -714,7 +712,7 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
+			runtime.ctx.composer.addToHistory(command.text);
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleMoveCommand(command.args || undefined);
 		},
@@ -733,7 +731,9 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			const sourceCwd = runtime.sessionManager.getCwd();
 			let worktree: SessionWorktree;
 			try {
-				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch);
+				worktree = await createSessionWorktree(sourceCwd, runtime.settings, branch, {
+					session: runtime.sessionManager.getSessionId(),
+				});
 			} catch (err) {
 				return usage(`Worktree creation failed: ${errorMessage(err)}`, runtime);
 			}
@@ -746,10 +746,14 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 				);
 			}
 			await runtime.output(formatSessionWorktreeSummary(worktree, cleanup.cleaned));
+			for (const warning of await runSessionWorktreeHook(worktree, runtime.session)) {
+				// Cancelled while the hook ran: ACP has answered the prompt, and a late warning would land in the next turn.
+				if (!runtime.signal?.aborted) await runtime.output(`Warning: ${warning}`);
+			}
 			return commandConsumed();
 		},
 		handleTui: async (command, runtime) => {
-			runtime.ctx.editor.addToHistory(command.text);
+			runtime.ctx.composer.addToHistory(command.text);
 			clearSubmittedText(runtime);
 			await runtime.ctx.handleWorktreeCommand(command.args || undefined);
 		},

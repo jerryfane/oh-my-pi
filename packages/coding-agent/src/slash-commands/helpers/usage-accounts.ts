@@ -13,6 +13,10 @@ export interface UsageAccountIdentity {
 	orgName?: string;
 	/** Epoch ms of the interactive login that minted the OAuth grant (see `OAuthCredentials.authorizedAt`). */
 	authorizedAt?: number;
+	/** Epoch ms the server says the grant ends (see `OAuthCredentials.refreshExpires`). */
+	refreshExpires?: number;
+	/** Epoch ms the OAuth access token expires; a long-lived login's outlasts its ~30d grant. */
+	expires?: number;
 }
 
 /** Flatten every stored credential (OAuth and API key) into identity rows for unreported-account detection. */
@@ -34,6 +38,8 @@ export function collectStoredAccounts(authStorage: AuthStorage): UsageAccountIde
 					orgId: credential.orgId,
 					orgName: credential.orgName,
 					authorizedAt: credential.authorizedAt,
+					refreshExpires: credential.refreshExpires,
+					expires: credential.expires,
 				});
 			} else {
 				accounts.push({ provider, type: "api_key" });
@@ -121,8 +127,7 @@ export function collectUnreportedAccounts(
 		// subset (an org-only account, with no base identifiers, is covered by
 		// any same-org report). The email/account fallback below applies only
 		// when both sides are org-less. When both the account and a report carry
-		// an email, it decides: Codex Team seats share an account id and
-		// Antigravity accounts share one Google project.
+		// an email, it decides: Codex Team seats share an account id.
 		const accountOrg = account.orgId?.toLowerCase();
 		const email = account.email?.toLowerCase();
 		const ids = [account.email, account.accountId, account.projectId]

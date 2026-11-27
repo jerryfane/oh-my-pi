@@ -9,7 +9,7 @@
  * once. Routes act only on their own owner's workers, so at most one takes
  * a message.
  */
-import type { IrcDeliveryReceipt, IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import type { IrcDeliveryReceipt, IrcMessage } from "./irc-types";
 import type { IrcBusApi } from "./bus";
 
 /**
