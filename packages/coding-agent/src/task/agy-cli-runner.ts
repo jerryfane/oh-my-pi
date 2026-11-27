@@ -1118,27 +1118,6 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
 	let runtimeExceeded = false;
-
-	let jsonSchemaStr: string | undefined;
-	let jsonPromptInstruction: string | undefined;
-	if (outputSchema !== undefined) {
-		const { jsonSchema, normalized, error: schemaErr } = buildOutputValidator(outputSchema);
-		if (!schemaErr && normalized !== undefined) {
-			if (jsonSchema && jsonSchema.type === "object") {
-				// Official `agy --json-schema` requires root `"type": "object"`.
-				jsonSchemaStr = JSON.stringify(jsonSchema);
-			} else if (jsonSchema && Object.keys(jsonSchema).length > 0) {
-				jsonPromptInstruction = buildJsonSchemaPromptInstruction(JSON.stringify(jsonSchema));
-			} else {
-				// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
-				// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
-				jsonPromptInstruction = buildJsonSchemaPromptInstruction();
-			}
-		}
-	}
-
-	const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
-	const additionalDirs = worktree !== undefined ? undefined : options.additionalDirectories;
 	let conversationId: string | undefined;
 	let lastOutcome: StepRunOutcome = {
 		exitCode: 1,
@@ -1155,6 +1134,26 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let completedCacheReadTokens = 0;
 
 	try {
+		let jsonSchemaStr: string | undefined;
+		let jsonPromptInstruction: string | undefined;
+		if (outputSchema !== undefined) {
+			const { jsonSchema, normalized, error: schemaErr } = buildOutputValidator(outputSchema);
+			if (!schemaErr && normalized !== undefined) {
+				if (jsonSchema && jsonSchema.type === "object") {
+					// Official `agy --json-schema` requires root `"type": "object"`.
+					jsonSchemaStr = JSON.stringify(jsonSchema);
+				} else if (jsonSchema && Object.keys(jsonSchema).length > 0) {
+					jsonPromptInstruction = buildJsonSchemaPromptInstruction(JSON.stringify(jsonSchema));
+				} else {
+					// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
+					// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
+					jsonPromptInstruction = buildJsonSchemaPromptInstruction();
+				}
+			}
+		}
+
+		const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
+		const additionalDirs = worktree !== undefined ? undefined : options.additionalDirectories;
 		for (let i = 0; i < stepPrompts.length; i++) {
 			if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
 				runtimeExceeded = true;
@@ -1306,12 +1305,26 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				break;
 			}
 		}
+	} catch (err) {
+		const message = formatErrorMessage(err);
+		lastOutcome = {
+			...lastOutcome,
+			exitCode: 1,
+			error: lastOutcome.error ?? message,
+			stderr: lastOutcome.stderr || message,
+		};
 	} finally {
 		if (progressTimer) {
 			clearTimeout(progressTimer);
 			progressTimer = null;
 		}
-		await options.onRelease?.().catch(() => {});
+		if (options.onRelease) {
+			try {
+				await options.onRelease();
+			} catch (err) {
+				logger.warn("agy onRelease callback failed", { id, error: formatErrorMessage(err) });
+			}
+		}
 	}
 
 	const wasAborted = runtimeExceeded || lastOutcome.aborted || Boolean(signal?.aborted);

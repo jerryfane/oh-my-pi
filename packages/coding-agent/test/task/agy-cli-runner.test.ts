@@ -1064,6 +1064,7 @@ exit 0
 
 			// Async rejecting onProgress (native async, virtual-then Proxy, and Promise with shadowed catch)
 			// must not trigger unhandledRejection or fail the settled run.
+			let proxyThenCalls = 0;
 			const asyncCases: Array<{ name: string; observer: (progress: AgentProgress) => unknown }> = [
 				{
 					name: "native-async",
@@ -1081,6 +1082,7 @@ exit 0
 								get: (_target, prop) =>
 									prop === "then"
 										? (_resolve: unknown, reject: (reason: unknown) => void) => {
+												proxyThenCalls += 1;
 												queueMicrotask(() => reject(new Error(`proxy thenable failed on ${p.status}`)));
 											}
 										: undefined,
@@ -1115,6 +1117,41 @@ exit 0
 				await Bun.sleep(20);
 				expect(asyncRes.exitCode).toBe(0);
 				expect(asyncLifecycle).toEqual(["started", "completed"]);
+			}
+			expect(proxyThenCalls).toBeGreaterThanOrEqual(2);
+
+			// Both synchronously throwing and asynchronously rejecting onRelease hooks must preserve
+			// the settled SingleResult and terminal lifecycle publication.
+			for (const releaseMode of ["sync-throw", "async-reject"] as const) {
+				const releaseBus = new EventBus();
+				const releaseLifecycle: string[] = [];
+				releaseBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+					releaseLifecycle.push((payload as SubagentLifecyclePayload).status);
+				});
+				let releaseCalled = 0;
+				const releaseRes = await runSubprocess({
+					cwd: dir,
+					agent: makeAgent(),
+					task: `check ${releaseMode} release hook`,
+					index: 0,
+					id: `ReleaseHook-${releaseMode}`,
+					eventBus: releaseBus,
+					onRelease:
+						releaseMode === "sync-throw"
+							? () => {
+									releaseCalled += 1;
+									throw new Error("sync release hook failed");
+								}
+							: async () => {
+									releaseCalled += 1;
+									throw new Error("async release hook failed");
+								},
+					settings: makeSettings(resilientBin, { "*": "gemini-4-neon-low" }),
+				});
+				expect(releaseCalled).toBe(1);
+				expect(releaseRes.exitCode).toBe(0);
+				expect(releaseRes.output).toBe("valid-after-noise");
+				expect(releaseLifecycle).toEqual(["started", "completed"]);
 			}
 			expect(unhandled).toEqual([]);
 		} finally {
