@@ -306,6 +306,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#timeoutTimer?: NodeJS.Timeout;
 	#drainTimer?: ReturnType<typeof setTimeout>;
 	#drainDeadlineMs?: number;
+	#descendantsCleaned = false;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -367,7 +368,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#openPipeReaders--;
 			this.#stderrTail += dec.decode();
 			trim();
-			this.#syncAbortListeners();
+			this.#syncPipeLifecycle();
 		})();
 
 		proc.exited
@@ -376,7 +377,7 @@ export class ChildProcess<In extends InMask = InMask> {
 				if (!this.#hardKillTree && this.#descendantDrainMs !== undefined && this.#drainDeadlineMs === undefined) {
 					this.#drainDeadlineMs = performance.now() + this.#descendantDrainMs;
 				}
-				this.#syncAbortListeners();
+				this.#syncPipeLifecycle();
 				if (this.#exitReasonPending) {
 					this.#clearDrainTimer();
 					this.#exitReason = this.#exitReasonPending;
@@ -658,7 +659,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		const reader = this.proc.stdout.getReader();
 		this.#openPipeReaders++;
 		this.#pipeReaders.add(reader);
-		this.#syncAbortListeners();
+		this.#syncPipeLifecycle();
 		try {
 			for (;;) {
 				if (this.#cutoff) {
@@ -682,7 +683,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#pipeReaders.delete(reader);
 			this.#openPipeReaders--;
 			reader.releaseLock();
-			this.#syncAbortListeners();
+			this.#syncPipeLifecycle();
 		}
 	}
 
@@ -693,7 +694,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		const reader = stream.getReader();
 		this.#openPipeReaders++;
 		this.#pipeReaders.add(reader);
-		this.#syncAbortListeners();
+		this.#syncPipeLifecycle();
 		const dec = new TextDecoder();
 		let out = "";
 		try {
@@ -712,7 +713,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		const tail = dec.decode();
 		this.#pipeReaders.delete(reader);
 		this.#openPipeReaders--;
-		this.#syncAbortListeners();
+		this.#syncPipeLifecycle();
 		return out + tail;
 	}
 
@@ -720,7 +721,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		const reader = this.proc.stdout.getReader();
 		this.#openPipeReaders++;
 		this.#pipeReaders.add(reader);
-		this.#syncAbortListeners();
+		this.#syncPipeLifecycle();
 		const chunks: Uint8Array[] = [];
 		let length = 0;
 		try {
@@ -740,7 +741,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#pipeReaders.delete(reader);
 			this.#openPipeReaders--;
 			reader.releaseLock();
-			this.#syncAbortListeners();
+			this.#syncPipeLifecycle();
 		}
 		const bytes = new Uint8Array(length);
 		let offset = 0;
@@ -852,8 +853,12 @@ export class ChildProcess<In extends InMask = InMask> {
 		else sync();
 	}
 
-	#syncAbortListeners(): void {
+	#syncPipeLifecycle(): void {
 		this.#syncDrainTimer();
+		this.#syncAbortListeners();
+	}
+
+	#syncAbortListeners(): void {
 		if (!this.#abortRegistrations) return;
 		for (const sync of this.#abortRegistrations) sync();
 	}
@@ -864,29 +869,61 @@ export class ChildProcess<In extends InMask = InMask> {
 		this.#drainTimer = undefined;
 	}
 
-	#expireDrain(): void {
-		if (this.#openPipeReaders <= 0) return;
+	#hasLiveDescendants(): boolean {
+		if (this.#descendantsCleaned) return false;
 		if (this.#terminateGroup && process.platform !== "win32") {
 			try {
-				process.kill(-this.proc.pid, "SIGKILL");
-			} catch {}
-		} else if (this.#windowsRootProcess) {
+				process.kill(-this.proc.pid, 0);
+				return true;
+			} catch (err) {
+				const code = (err as NodeJS.ErrnoException | undefined)?.code;
+				if (code === "EPERM") return true;
+				this.#descendantsCleaned = true;
+				return false;
+			}
+		}
+		if (this.#windowsRootProcess) {
 			try {
-				this.#windowsRootProcess.killTree();
-			} catch {}
+				if (this.#windowsRootProcess.children().length > 0) return true;
+				this.#descendantsCleaned = true;
+				return false;
+			} catch {
+				this.#descendantsCleaned = true;
+				return false;
+			}
+		}
+		this.#descendantsCleaned = true;
+		return false;
+	}
+
+	#expireDrain(): void {
+		if (this.#hasLiveDescendants()) {
+			this.#descendantsCleaned = true;
+			if (this.#terminateGroup && process.platform !== "win32") {
+				try {
+					process.kill(-this.proc.pid, "SIGKILL");
+				} catch {}
+			} else if (this.#windowsRootProcess) {
+				try {
+					this.#windowsRootProcess.killTree();
+				} catch {}
+			}
 		}
 		// Cancel only currently blocked readers without permanently setting `#cutoff`, so a
 		// later reader can still drain already-buffered ready stdout bytes and EOF cleanly.
-		for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+		if (this.#openPipeReaders > 0) {
+			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+		}
 	}
 
 	/**
 	 * On non-subreaper spawns with `descendantDrainMs`, run one post-exit timer
-	 * anchored at process exit (monotonic clock) covering all tracked pipe readers
-	 * (stderr + any tracked stdout reader) and cancel it only once every pipe reader
-	 * has finished. Even when the deadline has already passed (`remainingMs === 0`),
-	 * schedule via `setTimeout(..., 0)` so ready buffered bytes and EOF drain first
-	 * and only blocking I/O on a lingering descendant is cut off.
+	 * anchored at process exit (monotonic clock) covering both tracked pipe readers
+	 * and live same-group/child descendants (including helpers that closed stdio),
+	 * clearing only once all pipes and descendants are gone. Even when the deadline
+	 * has already passed (`remainingMs === 0`), schedule via `setTimeout(..., 0)` so
+	 * ready buffered bytes and EOF drain first and only blocking I/O or lingering
+	 * descendants are cut off.
 	 */
 	#syncDrainTimer(): void {
 		if (this.#hardKillTree || this.#descendantDrainMs === undefined) return;
@@ -896,7 +933,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		}
 		const deadline = this.#drainDeadlineMs;
 		if (deadline === undefined) return;
-		if (this.#openPipeReaders <= 0) {
+		if (this.#openPipeReaders <= 0 && !this.#hasLiveDescendants()) {
 			this.#clearDrainTimer();
 			return;
 		}

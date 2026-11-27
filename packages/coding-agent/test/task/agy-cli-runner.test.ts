@@ -3,6 +3,7 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
+import { CostGate } from "../../src/session/cost-gate";
 import { resolveAgySubagentConfig } from "../../src/task/agy-cli-runner";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "../../src/task/executor";
 import type { AgentProgress } from "../../src/task/task-details";
@@ -111,6 +112,26 @@ describe("agy CLI subagent runner", () => {
 		// Offline mode pins dispatch to parent provider on native OMP
 		const offlineSettings = makeSettings(bin, { "*": "gemini-4-neon-medium" }, { "models.offline": true });
 		expect(resolveAgySubagentConfig(base({ settings: offlineSettings }))).toBeUndefined();
+
+		// Spend-capped sessions stay native so CostGate enforces session.maxCost; uncapped CostGate still routes to agy
+		const cappedSettings = makeSettings(bin, { "*": "gemini-4-neon-medium" }, { "session.maxCost": 1.0 });
+		const cappedGate = new CostGate(cappedSettings, 1.25, () => {});
+		expect(resolveAgySubagentConfig(base({ settings: cappedSettings, costGate: cappedGate }))).toBeUndefined();
+		expect(resolveAgySubagentConfig(base({ costGate: cappedGate }))).toBeUndefined();
+		const uncappedGate = new CostGate(settings, 0, () => {});
+		expect(resolveAgySubagentConfig(base({ costGate: uncappedGate }))).toEqual({
+			binary: bin,
+			model: "gemini-4-neon-medium",
+		});
+
+		// Relative task.agyBinary is resolved to an absolute path so launching from another task cwd succeeds
+		const relativeBin = path.relative(process.cwd(), bin);
+		const relativeSettings = makeSettings(relativeBin, { task: "gemini-4-neon-low" });
+		const otherCwd = await makeTempDir("agy-runner-other-cwd-");
+		expect(resolveAgySubagentConfig(base({ cwd: otherCwd, settings: relativeSettings }))).toEqual({
+			binary: bin,
+			model: "gemini-4-neon-low",
+		});
 
 		// Seeded/resumable topic lifecycles and OMP-only contracts stay on native OMP
 		expect(resolveAgySubagentConfig(base({ keepAlive: true }))).toBeUndefined();
@@ -777,7 +798,8 @@ emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCES
 				onProgress: p => cbProgress.push({ status: p.status, currentTool: p.currentTool, toolCount: p.toolCount }),
 				onToolResult: () => {
 					cbCalls += 1;
-					throw new Error("widget callback boom");
+					// Null-prototype object throws on String(err); live scheduleProgress() must still run in finally
+					throw Object.create(null);
 				},
 			});
 			await Bun.sleep(20);

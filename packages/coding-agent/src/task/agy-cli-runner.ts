@@ -15,6 +15,7 @@ import { $env, $which, isRecord, logger, ptree } from "@oh-my-pi/pi-utils";
 import { cfgOffline } from "../config/auxiliary-model-policy";
 import { Settings } from "../config/settings";
 import { AgentRegistry } from "../registry/agent-registry";
+import { cfgSessionMaxCost } from "../session/settings";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { truncateTail } from "../tools/streaming-output";
 import { emitSubagentFrame } from "../utils/event-bus";
@@ -123,11 +124,22 @@ function isExecutableFile(candidate: string): boolean {
 	}
 }
 
+function formatErrorMessage(err: unknown): string {
+	if (err instanceof Error) return err.message;
+	try {
+		return String(err);
+	} catch {
+		return "unknown error";
+	}
+}
+
 function resolveAgyBinaryPath(settings: Settings): string | undefined {
 	const configured = cfgTaskAgyBinary.get(settings)?.trim() || $env.OMP_AGY_SUBAGENT_BIN?.trim();
 	if (configured) {
 		if (configured.includes("/") || configured.includes("\\")) {
-			return isExecutableFile(configured) ? configured : undefined;
+			// Resolve relative paths once against the OMP process cwd so spawning in another task cwd/worktree succeeds.
+			const resolved = path.resolve(configured);
+			return isExecutableFile(resolved) ? resolved : undefined;
 		}
 		return $which(configured) ?? undefined;
 	}
@@ -151,8 +163,9 @@ export function resolveAgySubagentConfig(options: ExecutorOptions): AgySubagentC
 	const settings = options.settings;
 	if (!settings) return undefined;
 
-	// Enforce OMP security, offline, transcript-epoch, and resumable-lifecycle boundaries natively.
+	// Enforce OMP security, offline, spend-cap, transcript-epoch, and resumable-lifecycle boundaries natively.
 	if (cfgOffline.get(settings)) return undefined;
+	if (options.costGate?.capped === true || cfgSessionMaxCost.get(settings) !== undefined) return undefined;
 	if (isReadOnlyAgent(options.agent)) return undefined;
 	if (options.perCallModelGrants !== undefined) return undefined;
 	if (options.restrictToolNames === true) return undefined;
@@ -526,7 +539,7 @@ async function runSingleAgyStep(params: {
 				params.onEvent(parsed);
 			} catch (err) {
 				logger.warn("agy stream event callback threw", {
-					error: err instanceof Error ? err.message : String(err),
+					error: formatErrorMessage(err),
 				});
 			}
 		};
@@ -1059,10 +1072,11 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								} catch (err) {
 									logger.warn("agy onToolResult callback threw", {
 										tool: resolvedName,
-										error: err instanceof Error ? err.message : String(err),
+										error: formatErrorMessage(err),
 									});
+								} finally {
+									scheduleProgress();
 								}
-								scheduleProgress();
 							}
 						} else if (su.step_type === "agent_response") {
 							if (su.text_delta) {

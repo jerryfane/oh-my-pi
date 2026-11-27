@@ -681,6 +681,22 @@ ${createLinuxSubreaperScript()}
 				}
 				await Bun.sleep(450);
 				expect(await Bun.file(clockSentinel).exists()).toBe(false);
+
+				// 8. Same-group helper that closes all stdio pipes is still killed at descendantDrainMs on non-subreaper path
+				const closedPipeSentinel = path.join(dir, "closed-pipe-helper.txt");
+				const cpClosedPipe = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.35 && echo lived > ${JSON.stringify(closedPipeSentinel)}) </dev/null >/dev/null 2>&1 & printf done-fast; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 50 },
+				);
+				const closedRes = await cpClosedPipe.wait();
+				expect(closedRes.exitCode).toBe(0);
+				expect(closedRes.stdout).toBe("done-fast");
+				await Bun.sleep(450);
+				expect(await Bun.file(closedPipeSentinel).exists()).toBe(false);
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}
