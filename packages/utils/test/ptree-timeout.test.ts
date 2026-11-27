@@ -718,4 +718,97 @@ console.log("settled");
 			}
 		}, 60_000);
 	}
+
+	it.skipIf(process.platform === "win32")(
+		"bounds nonzero stderr drain on detached non-subreaper spawns while preserving real exit code",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-nonsub-"));
+			const sentinel = path.join(dir, "helper-lived.txt");
+			try {
+				const t0 = Date.now();
+				const cp = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 2 && echo lived > ${JSON.stringify(sentinel)}) >/dev/null & echo err-msg >&2; exit 23`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 150 },
+				);
+				const exitCode = await cp.exited;
+				const elapsed = Date.now() - t0;
+				expect(exitCode).toBe(23);
+				expect(cp.peekStderr()).toContain("err-msg");
+				expect(elapsed).toBeLessThan(1_000);
+				await Bun.sleep(400);
+				expect(await Bun.file(sentinel).exists()).toBe(false);
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform !== "linux")(
+		"kills pgrp helpers and fails closed on surviving setsid helpers when procfs discovery fails",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-noproc-"));
+			const pgrpSentinel = path.join(dir, "pgrp-lived.txt");
+			const setsidPidFile = path.join(dir, "setsid.pid");
+			const brokenProcScript = createLinuxSubreaperScript().replaceAll('"/proc/"', '"/nonexistent-proc-dir/"');
+			try {
+				// Non-setsid helper is still killed via kill(-child.pid, 9) even when /proc fails
+				const pgrpProc = Bun.spawn([process.execPath, "-e", brokenProcScript], {
+					env: {
+						...Bun.env,
+						BUN_BE_BUN: "1",
+						OMP_PTREE_SUBREAPER_COMMAND: JSON.stringify([
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(pgrpSentinel)}) >/dev/null 2>&1 & exit 0`,
+						]),
+						OMP_PTREE_SUBREAPER_DRAIN_MS: "80",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				expect(await pgrpProc.exited).toBe(0);
+				await Bun.sleep(750);
+				expect(await Bun.file(pgrpSentinel).exists()).toBe(false);
+
+				// Session-detached helper that cannot be discovered without /proc forces nonzero exit (fail closed)
+				const setsidProc = Bun.spawn([process.execPath, "-e", brokenProcScript], {
+					env: {
+						...Bun.env,
+						BUN_BE_BUN: "1",
+						OMP_PTREE_SUBREAPER_COMMAND: JSON.stringify([
+							"/bin/sh",
+							"-c",
+							`setsid sh -c 'echo $$ > ${JSON.stringify(setsidPidFile)}; sleep 5' </dev/null >/dev/null 2>&1 & sleep 0.05; exit 0`,
+						]),
+						OMP_PTREE_SUBREAPER_DRAIN_MS: "80",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [setsidExit, setsidStderr] = await Promise.all([
+					setsidProc.exited,
+					new Response(setsidProc.stderr).text(),
+				]);
+				expect(setsidExit).toBe(1);
+				expect(setsidStderr).toContain("failed to terminate lingering descendants");
+			} finally {
+				const rawPid = await Bun.file(setsidPidFile)
+					.text()
+					.catch(() => "");
+				const pid = Number.parseInt(rawPid.trim(), 10);
+				if (pid > 1) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });

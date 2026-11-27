@@ -102,6 +102,7 @@ const child = Bun.spawn(command, {
 	stdin: "inherit",
 	stdout: "pipe",
 	stderr: "pipe",
+	detached: true,
 	windowsHide: true,
 	env: Bun.env,
 });
@@ -173,10 +174,24 @@ if (drainMs !== undefined) {
 	if (!settled) {
 		const killDeadline = Date.now() + ${SUBREAPER_KILL_WINDOW_MS};
 		while (hasLiveChildren() && Date.now() < killDeadline) {
+			// Kill the supervised command's process group first (works even without mounted /proc),
+			// then sweep any session-detached descendants via procfs.
+			try {
+				libc.symbols.kill(-child.pid, 9);
+			} catch {}
 			killDescendants();
 			await Bun.sleep(${SUBREAPER_KILL_POLL_MS});
 		}
+		const cleanupFailed = hasLiveChildren();
+		if (cleanupFailed) {
+			try {
+				Bun.stderr.write("ptree subreaper: failed to terminate lingering descendants after command exit\\n");
+			} catch {}
+		}
 		await Promise.race([Promise.all([stdoutRelay, stderrRelay]), Bun.sleep(50)]);
+		if (cleanupFailed && (exitCode ?? 1) === 0) {
+			process.exit(1);
+		}
 	}
 } else {
 	await Promise.all([stdoutRelay, stderrRelay]);
@@ -295,6 +310,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#subreaperStop?: { escalate: () => void };
 	#terminateGroup: boolean;
 	#hardKillTree: boolean;
+	#descendantDrainMs?: number;
 	// Windows has no process groups. Retaining the root's native handle pins
 	// its PID after exit so killTree() can still enumerate its original children.
 	#windowsRootProcess?: Process;
@@ -304,9 +320,11 @@ export class ChildProcess<In extends InMask = InMask> {
 		retainFullStderr = exposeStderr,
 		terminateGroup = false,
 		hardKillTree = false,
+		descendantDrainMs?: number,
 	) {
 		this.#terminateGroup = terminateGroup;
 		this.#hardKillTree = hardKillTree;
+		this.#descendantDrainMs = descendantDrainMs;
 		this.#windowsRootProcess = process.platform === "win32" ? (Process.fromPid(proc.pid) ?? undefined) : undefined;
 		if (retainFullStderr) this.#stderrChunks = [];
 		// Eagerly drain stderr into a truncated tail, retaining raw chunks only for explicit full capture.
@@ -356,6 +374,27 @@ export class ChildProcess<In extends InMask = InMask> {
 					this.#exitReason = this.#exitReasonPending;
 					reject(this.#exitReasonPending);
 					return;
+				}
+				// On non-subreaper platforms (or detached spawns without a Linux subreaper),
+				// bound post-exit pipe drain from the raw command exit so a lingering descendant
+				// holding inherited stderr/stdout open cannot block settlement or alter the exit code.
+				if (!this.#hardKillTree && this.#descendantDrainMs !== undefined && this.#openPipeReaders > 0) {
+					const drainTimer = setTimeout(() => {
+						if (this.#openPipeReaders > 0) {
+							if (this.#terminateGroup && process.platform !== "win32") {
+								try {
+									process.kill(-this.proc.pid, "SIGKILL");
+								} catch {}
+							} else if (this.#windowsRootProcess) {
+								try {
+									this.#windowsRootProcess.killTree();
+								} catch {}
+							}
+							this.#cutoffOutput();
+						}
+					}, this.#descendantDrainMs);
+					drainTimer.unref?.();
+					void this.#stderrDone.finally(() => clearTimeout(drainTimer));
 				}
 				if (exitCode === 0) {
 					resolve(0);
@@ -848,10 +887,9 @@ type ChildSpawnOptions<In extends InMask = InMask> = Omit<
 	 */
 	subreaper?: boolean;
 	/**
-	 * On Linux with `subreaper: true`, maximum milliseconds to wait for inherited pipes
-	 * and lingering descendants after the supervised command exits before hard-killing
-	 * remaining descendants and exiting with the command's real exit code.
-	 * Omit to wait indefinitely for all descendants.
+	 * Maximum milliseconds to wait for inherited pipes and lingering descendants after
+	 * the supervised command exits before hard-killing remaining descendants and settling
+	 * with the command's real exit code. Omit to wait indefinitely for all descendants.
 	 */
 	descendantDrainMs?: number;
 	/** Expose and retain complete stderr for a later `wait({ stderr: "full" })`. */
@@ -865,6 +903,10 @@ function spawnInternal<In extends InMask = InMask>(
 ): ChildProcess<In> {
 	const { timeout = -1, signal, stderr, detached, subreaper = false, descendantDrainMs, ...rest } = opts ?? {};
 	const useSubreaper = subreaper && process.platform === "linux";
+	const normalizedDrainMs =
+		descendantDrainMs !== undefined && Number.isFinite(descendantDrainMs) && descendantDrainMs >= 0
+			? Math.trunc(descendantDrainMs)
+			: undefined;
 	// Bun.spawn's own default is the startup environment, which misses values
 	// omp loads from its `.env` files into `Bun.env` afterwards.
 	const commandEnv = rest.env ?? Bun.env;
@@ -881,13 +923,20 @@ function spawnInternal<In extends InMask = InMask>(
 					BUN_BE_BUN: "1",
 					[LINUX_SUBREAPER_COMMAND_ENV]: JSON.stringify(cmd),
 					[LINUX_SUBREAPER_BUN_BE_BUN_ENV]: commandEnv.BUN_BE_BUN,
-					...(descendantDrainMs !== undefined
-						? { [LINUX_SUBREAPER_DRAIN_MS_ENV]: String(Math.max(0, Math.trunc(descendantDrainMs))) }
+					...(normalizedDrainMs !== undefined
+						? { [LINUX_SUBREAPER_DRAIN_MS_ENV]: String(normalizedDrainMs) }
 						: {}),
 				}
 			: commandEnv,
 	});
-	const cp = new ChildProcess(child, stderr === "full", retainFullStderr, detached === true, useSubreaper);
+	const cp = new ChildProcess(
+		child,
+		stderr === "full",
+		retainFullStderr,
+		detached === true,
+		useSubreaper,
+		normalizedDrainMs,
+	);
 	if (signal) cp.attachSignal(signal);
 	if (timeout > 0) cp.attachTimeout(timeout);
 	return cp;

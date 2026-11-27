@@ -734,12 +734,18 @@ emit({ event: "result", result: { conversation_id: "conv-timer", status: "SUCCES
 			onProgress: p => snapshots.push({ tool: p.currentTool, startMs: p.currentToolStartMs }),
 		});
 		expect(timerRes.exitCode).toBe(0);
-		const firstA = snapshots.find(s => s.tool === "tool_a");
-		const firstB = snapshots.find(s => s.tool === "tool_b");
-		const restoredA = [...snapshots].reverse().find(s => s.tool === "tool_a");
-		expect(firstA?.startMs).toBeDefined();
-		expect(firstB?.startMs).toBeDefined();
-		expect(firstB!.startMs!).toBeGreaterThan(firstA!.startMs!);
-		expect(restoredA?.startMs).toBe(firstA?.startMs);
+		const firstAIdx = snapshots.findIndex(s => s.tool === "tool_a");
+		const firstBIdx = snapshots.findIndex((s, idx) => idx > firstAIdx && s.tool === "tool_b");
+		const restoredAIdx = snapshots.findIndex((s, idx) => idx > firstBIdx && s.tool === "tool_a");
+		expect(firstAIdx).toBeGreaterThanOrEqual(0);
+		expect(firstBIdx).toBeGreaterThan(firstAIdx);
+		expect(restoredAIdx).toBeGreaterThan(firstBIdx);
+		const firstA = snapshots[firstAIdx]!;
+		const firstB = snapshots[firstBIdx]!;
+		const restoredA = snapshots[restoredAIdx]!;
+		expect(firstA.startMs).toBeDefined();
+		expect(firstB.startMs).toBeDefined();
+		expect(firstB.startMs!).toBeGreaterThan(firstA.startMs!);
+		expect(restoredA.startMs).toBe(firstA.startMs);
 	});
 });
