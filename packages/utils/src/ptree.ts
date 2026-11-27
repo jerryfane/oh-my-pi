@@ -367,8 +367,7 @@ export class ChildProcess<In extends InMask = InMask> {
 					trim();
 				}
 			} catch {}
-			this.#pipeReaders.delete(reader);
-			this.#openPipeReaders--;
+			if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
 			this.#stderrTail += dec.decode();
 			trim();
 			this.#syncPipeLifecycle();
@@ -707,8 +706,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			await reader.cancel().catch(() => {});
 			throw err;
 		} finally {
-			this.#pipeReaders.delete(reader);
-			this.#openPipeReaders--;
+			if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
 			reader.releaseLock();
 			this.#syncPipeLifecycle();
 		}
@@ -738,8 +736,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			// A cancelled or failed read keeps whatever was already collected.
 		}
 		const tail = dec.decode();
-		this.#pipeReaders.delete(reader);
-		this.#openPipeReaders--;
+		if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
 		this.#syncPipeLifecycle();
 		return out + tail;
 	}
@@ -765,8 +762,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		} catch {
 			// A cancelled or failed read keeps whatever was already collected.
 		} finally {
-			this.#pipeReaders.delete(reader);
-			this.#openPipeReaders--;
+			if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
 			reader.releaseLock();
 			this.#syncPipeLifecycle();
 		}
@@ -862,9 +858,9 @@ export class ChildProcess<In extends InMask = InMask> {
 			// The { once: true } listener has removed itself at this point.
 			attached = false;
 			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			if (rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined) {
-				this.#abortRegistrations?.delete(sync);
-			}
+			const active = rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
+			if (!active) return;
+			this.#abortRegistrations?.delete(sync);
 			this.kill(new AbortError(signal.reason, "<cancelled>"));
 			this.#cutoffOutput();
 		};
@@ -908,6 +904,9 @@ export class ChildProcess<In extends InMask = InMask> {
 			const resolve = this.#resolveDrainDone;
 			this.#resolveDrainDone = undefined;
 			this.#drainDone = undefined;
+			// Reconcile abort listeners before resolving drain continuations so a late abort
+			// triggered right after settlement cannot mark a finished process as aborted.
+			this.#syncAbortListeners();
 			resolve();
 		}
 	}
@@ -958,13 +957,21 @@ export class ChildProcess<In extends InMask = InMask> {
 		}
 		// Cancel only currently blocked readers without permanently setting `#cutoff`, so a
 		// later reader can still drain already-buffered ready stdout bytes and EOF cleanly.
+		// Detach cancelled readers before reconciling abort listeners so an immediate post-drain
+		// abort cannot observe stale `#openPipeReaders > 0` before `reader.cancel()` unwinds.
 		if (this.#openPipeReaders > 0) {
-			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+			for (const reader of [...this.#pipeReaders]) {
+				if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
+				reader.cancel().catch(() => {});
+			}
 		}
 		if (this.#resolveDrainDone) {
 			const resolve = this.#resolveDrainDone;
 			this.#resolveDrainDone = undefined;
 			this.#drainDone = undefined;
+			// Reconcile abort listeners before resolving drain continuations so a late abort
+			// triggered right after forced expiry cannot mark a finished process as aborted.
+			this.#syncAbortListeners();
 			resolve();
 		}
 	}

@@ -753,6 +753,35 @@ process.stdout.write(res.stdout + ":" + res.exitCode);
 					await Bun.sleep(450);
 					expect(await Bun.file(cutSentinel).exists()).toBe(false);
 				}
+
+				// 10. A late abort after drain settlement (natural exit, closed-stdio expiry, and pipe-holding expiry) must not fail a completed wait()
+				for (const mode of ["natural", "expired", "expired-piped"] as const) {
+					const acLate = new AbortController();
+					const helperSleep = mode === "natural" ? "0.04" : "0.5";
+					const drainBudget = mode === "natural" ? 300 : 60;
+					const cmd =
+						mode === "expired-piped"
+							? `(trap '' TERM; sleep ${helperSleep}) </dev/null & printf finished; exit 0`
+							: `(trap '' TERM; sleep ${helperSleep}) </dev/null >/dev/null 2>&1 & printf finished; exit 0`;
+					const cpLateAbort = spawn(["/bin/sh", "-c", cmd], {
+						detached: true,
+						subreaper: false,
+						descendantDrainMs: drainBudget,
+						signal: acLate.signal,
+					});
+					const waitP = cpLateAbort.wait({ allowAbort: true });
+					void cpLateAbort.exited.then(() =>
+						cpLateAbort.drainDone.then(() => {
+							acLate.abort("too-late");
+						}),
+					);
+					const resLate = await waitP;
+					expect(resLate.stdout).toBe("finished");
+					expect(resLate.exitCode).toBe(0);
+					expect(resLate.ok).toBe(true);
+					expect(resLate.exitError).toBeUndefined();
+					expect(cpLateAbort.exitReason).toBeUndefined();
+				}
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}
