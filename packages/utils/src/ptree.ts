@@ -305,8 +305,11 @@ export class ChildProcess<In extends InMask = InMask> {
 	#abortRegistrations?: Set<() => void>;
 	#timeoutTimer?: NodeJS.Timeout;
 	#drainTimer?: ReturnType<typeof setTimeout>;
+	#drainPollTimer?: ReturnType<typeof setInterval>;
 	#drainDeadlineMs?: number;
 	#descendantsCleaned = false;
+	#drainDone?: Promise<void>;
+	#resolveDrainDone?: () => void;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -444,6 +447,19 @@ export class ChildProcess<In extends InMask = InMask> {
 	/** Resolves once the internal stderr drain finishes (on EOF or cutoff). */
 	get stderrDone(): Promise<void> {
 		return this.#stderrDone;
+	}
+
+	/**
+	 * Resolves immediately when no post-exit descendant cleanup is pending; otherwise
+	 * waits (holding the event loop ref'd until settled) for lingering descendants to
+	 * exit or be terminated at `descendantDrainMs`.
+	 */
+	get drainDone(): Promise<void> {
+		this.#syncDrainTimer();
+		if (!this.#drainDone) return Promise.resolve();
+		this.#drainTimer?.ref?.();
+		this.#drainPollTimer?.ref?.();
+		return this.#drainDone;
 	}
 
 	get exitedCleanly(): Promise<number> {
@@ -810,6 +826,12 @@ export class ChildProcess<In extends InMask = InMask> {
 		// native terminate() is graceful-first, and reporting before it finishes
 		// would leave timed-out descendants alive past the caller's budget.
 		if (exitError?.aborted && this.#terminating) await this.#terminating;
+		// When post-exit descendant drain is configured on a non-subreaper spawn,
+		// ensure any remaining same-group/child descendants settle or are killed
+		// before wait() returns (0ms no-op when no descendants remain).
+		if (!exitError?.aborted && !this.#hardKillTree && this.#descendantDrainMs !== undefined) {
+			await this.drainDone;
+		}
 
 		const exitCode = this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null);
 		const ok = exitCode === 0;
@@ -864,9 +886,20 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	#clearDrainTimer(): void {
-		if (!this.#drainTimer) return;
-		clearTimeout(this.#drainTimer);
-		this.#drainTimer = undefined;
+		if (this.#drainTimer) {
+			clearTimeout(this.#drainTimer);
+			this.#drainTimer = undefined;
+		}
+		if (this.#drainPollTimer) {
+			clearInterval(this.#drainPollTimer);
+			this.#drainPollTimer = undefined;
+		}
+		if (this.#resolveDrainDone) {
+			const resolve = this.#resolveDrainDone;
+			this.#resolveDrainDone = undefined;
+			this.#drainDone = undefined;
+			resolve();
+		}
 	}
 
 	#hasLiveDescendants(): boolean {
@@ -897,6 +930,10 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	#expireDrain(): void {
+		if (this.#drainPollTimer) {
+			clearInterval(this.#drainPollTimer);
+			this.#drainPollTimer = undefined;
+		}
 		if (this.#hasLiveDescendants()) {
 			this.#descendantsCleaned = true;
 			if (this.#terminateGroup && process.platform !== "win32") {
@@ -913,6 +950,12 @@ export class ChildProcess<In extends InMask = InMask> {
 		// later reader can still drain already-buffered ready stdout bytes and EOF cleanly.
 		if (this.#openPipeReaders > 0) {
 			for (const reader of this.#pipeReaders) reader.cancel().catch(() => {});
+		}
+		if (this.#resolveDrainDone) {
+			const resolve = this.#resolveDrainDone;
+			this.#resolveDrainDone = undefined;
+			this.#drainDone = undefined;
+			resolve();
 		}
 	}
 
@@ -933,18 +976,36 @@ export class ChildProcess<In extends InMask = InMask> {
 		}
 		const deadline = this.#drainDeadlineMs;
 		if (deadline === undefined) return;
-		if (this.#openPipeReaders <= 0 && !this.#hasLiveDescendants()) {
+		const hasDescendants = this.#hasLiveDescendants();
+		if (this.#openPipeReaders <= 0 && !hasDescendants) {
 			this.#clearDrainTimer();
 			return;
 		}
-		if (this.#drainTimer) return;
+		if (!this.#drainDone) {
+			const { promise, resolve } = Promise.withResolvers<void>();
+			this.#drainDone = promise;
+			this.#resolveDrainDone = resolve;
+		}
 		const remainingMs = Math.max(0, deadline - performance.now());
-		const timer = setTimeout(() => {
-			this.#drainTimer = undefined;
-			this.#expireDrain();
-		}, remainingMs);
-		timer.unref?.();
-		this.#drainTimer = timer;
+		if (!this.#drainTimer) {
+			const timer = setTimeout(() => {
+				this.#drainTimer = undefined;
+				this.#expireDrain();
+			}, remainingMs);
+			timer.unref?.();
+			this.#drainTimer = timer;
+		}
+		// When pipes already closed and only live descendants keep drain active, poll lightly
+		// so a cooperative descendant that exits before the deadline settles immediately.
+		if (this.#openPipeReaders <= 0 && hasDescendants && remainingMs > 10 && !this.#drainPollTimer) {
+			const poll = setInterval(() => {
+				if (this.#openPipeReaders <= 0 && !this.#hasLiveDescendants()) {
+					this.#clearDrainTimer();
+				}
+			}, 10);
+			poll.unref?.();
+			this.#drainPollTimer = poll;
+		}
 	}
 
 	#cutoffOutput(): void {

@@ -137,9 +137,14 @@ function resolveAgyBinaryPath(settings: Settings): string | undefined {
 	const configured = cfgTaskAgyBinary.get(settings)?.trim() || $env.OMP_AGY_SUBAGENT_BIN?.trim();
 	if (configured) {
 		if (configured.includes("/") || configured.includes("\\")) {
-			// Resolve relative paths once against the OMP process cwd so spawning in another task cwd/worktree succeeds.
-			const resolved = path.resolve(configured);
-			return isExecutableFile(resolved) ? resolved : undefined;
+			// Canonicalize via OS realpath(3) (`realpathSync.native`, avoiding Bun's lexical `realpathSync`
+			// normalization of `link/..`) so launching from another task cwd/worktree executes the exact target binary.
+			try {
+				const resolved = fsSync.realpathSync.native(configured);
+				return isExecutableFile(resolved) ? resolved : undefined;
+			} catch {
+				return undefined;
+			}
 		}
 		return $which(configured) ?? undefined;
 	}
@@ -584,8 +589,9 @@ async function runSingleAgyStep(params: {
 			}
 		}
 
-		// Wait for both tracked pipes to settle (bounded by ptree's descendantDrainMs / timeout / abort cutoff).
-		await Promise.all([readStdout, cp.stderrDone.catch(() => {})]);
+		// Wait for both tracked pipes and any pending post-exit descendant cleanup to settle
+		// (bounded by ptree's descendantDrainMs / timeout / abort cutoff).
+		await Promise.all([readStdout, cp.stderrDone.catch(() => {}), cp.drainDone.catch(() => {})]);
 
 		stderrText = cp.peekStderr().trim();
 

@@ -653,17 +653,29 @@ ${createLinuxSubreaperScript()}
 				}
 
 				// 7. Backward wall-clock jump (Date.now) does not extend the monotonic post-exit drain deadline
-				const clockSentinel = path.join(dir, "clock-helper.txt");
+				//    Use a setsid stdout holder outside the managed group so it stays alive until the late reader starts.
+				const holderPidFile = path.join(dir, "clock-holder.pid");
 				const cpClock = spawn(
 					[
 						"/bin/sh",
 						"-c",
-						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(clockSentinel)}) 2>/dev/null & printf clock-ok; exit 0`,
+						`setsid sh -c 'echo $$ > ${JSON.stringify(holderPidFile)}; sleep 0.6' </dev/null 2>/dev/null & printf clock-ok; exit 0`,
 					],
 					{ detached: true, subreaper: false, descendantDrainMs: 50 },
 				);
 				expect(await cpClock.exited).toBe(0);
-				await Bun.sleep(120);
+				await Bun.sleep(130);
+				const holderPid = Number.parseInt(
+					(
+						await Bun.file(holderPidFile)
+							.text()
+							.catch(() => "")
+					).trim(),
+					10,
+				);
+				expect(holderPid).toBeGreaterThan(1);
+				// Confirm the external stdout holder is still alive when the late reader starts
+				expect(() => process.kill(holderPid, 0)).not.toThrow();
 				const realDateNow = Date.now;
 				const dateNowSpy = spyOn(Date, "now").mockImplementation(() => realDateNow() - 10_000);
 				try {
@@ -678,24 +690,30 @@ ${createLinuxSubreaperScript()}
 					expect(performance.now() - tClock).toBeLessThan(60);
 				} finally {
 					dateNowSpy.mockRestore();
+					try {
+						process.kill(holderPid, "SIGKILL");
+					} catch {}
 				}
-				await Bun.sleep(450);
-				expect(await Bun.file(clockSentinel).exists()).toBe(false);
 
-				// 8. Same-group helper that closes all stdio pipes is still killed at descendantDrainMs on non-subreaper path
+				// 8. Standalone one-shot caller awaiting wait() kills closed-pipe same-group helpers before exiting
 				const closedPipeSentinel = path.join(dir, "closed-pipe-helper.txt");
-				const cpClosedPipe = spawn(
-					[
-						"/bin/sh",
-						"-c",
-						`(trap '' TERM; sleep 0.35 && echo lived > ${JSON.stringify(closedPipeSentinel)}) </dev/null >/dev/null 2>&1 & printf done-fast; exit 0`,
-					],
-					{ detached: true, subreaper: false, descendantDrainMs: 50 },
+				const oneShotScript = path.join(dir, "one-shot-wait.ts");
+				await Bun.write(
+					oneShotScript,
+					`import { spawn } from ${JSON.stringify(path.join(import.meta.dir, "../src/ptree.ts"))};
+const cp = spawn(
+	["/bin/sh", "-c", ${JSON.stringify(`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(closedPipeSentinel)}) </dev/null >/dev/null 2>&1 & printf root-ok; exit 0`)}],
+	{ detached: true, subreaper: false, descendantDrainMs: 120 },
+);
+const res = await cp.wait();
+process.stdout.write(res.stdout + ":" + res.exitCode);
+`,
 				);
-				const closedRes = await cpClosedPipe.wait();
-				expect(closedRes.exitCode).toBe(0);
-				expect(closedRes.stdout).toBe("done-fast");
-				await Bun.sleep(450);
+				const caller = Bun.spawn([process.execPath, oneShotScript], { stdout: "pipe", stderr: "pipe" });
+				const [callerExit, callerOut] = await Promise.all([caller.exited, new Response(caller.stdout).text()]);
+				expect(callerExit).toBe(0);
+				expect(callerOut).toBe("root-ok:0");
+				await Bun.sleep(550);
 				expect(await Bun.file(closedPipeSentinel).exists()).toBe(false);
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });

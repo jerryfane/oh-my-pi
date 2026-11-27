@@ -124,12 +124,21 @@ describe("agy CLI subagent runner", () => {
 			model: "gemini-4-neon-medium",
 		});
 
-		// Relative task.agyBinary is resolved to an absolute path so launching from another task cwd succeeds
-		const relativeBin = path.relative(process.cwd(), bin);
-		const relativeSettings = makeSettings(relativeBin, { task: "gemini-4-neon-low" });
+		// Relative task.agyBinary is canonicalized through symlinks (`link/../agy` -> `real/agy`, not lexical `./agy`)
+		const symBase = await makeTempDir("agy-runner-sym-");
+		const realDir = path.join(symBase, "real");
+		const nestedDir = path.join(realDir, "nested");
+		await fs.mkdir(nestedDir, { recursive: true });
+		const expectedSymBin = await createFakeAgyShell(realDir, "exit 0", "agy");
+		await createFakeAgyShell(symBase, "exit 1", "agy");
+		const linkPath = path.join(symBase, "link");
+		await fs.symlink(nestedDir, linkPath);
+		// Do not use path.join(..., "..", ...), which lexically collapses `link/..` before config lookup
+		const relativeSymBin = `${path.relative(process.cwd(), linkPath)}${path.sep}..${path.sep}agy`;
+		const relativeSettings = makeSettings(relativeSymBin, { task: "gemini-4-neon-low" });
 		const otherCwd = await makeTempDir("agy-runner-other-cwd-");
 		expect(resolveAgySubagentConfig(base({ cwd: otherCwd, settings: relativeSettings }))).toEqual({
-			binary: bin,
+			binary: await fs.realpath(expectedSymBin),
 			model: "gemini-4-neon-low",
 		});
 
