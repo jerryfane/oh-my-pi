@@ -85,6 +85,7 @@ interface AgyStreamStepUpdate {
 
 interface AgyStreamResult {
 	event: "result";
+	malformedReason?: string;
 	result?: {
 		conversation_id?: string;
 		status?: string;
@@ -100,14 +101,111 @@ interface AgyStreamResult {
 
 export type AgyStreamEvent = AgyStreamInit | AgyStreamStepUpdate | AgyStreamResult;
 
+function optionalString(value: unknown): string | undefined {
+	return typeof value === "string" ? value : undefined;
+}
+
+function optionalFiniteNumber(value: unknown): number | undefined {
+	return typeof value === "number" && Number.isFinite(value) ? value : undefined;
+}
+
+function parseAgyUsage(raw: unknown): AgyUsage | undefined {
+	if (!isRecord(raw)) return undefined;
+	const usage: AgyUsage = {};
+	const input = optionalFiniteNumber(raw.input_tokens);
+	const output = optionalFiniteNumber(raw.output_tokens);
+	const thinking = optionalFiniteNumber(raw.thinking_tokens);
+	const cacheRead = optionalFiniteNumber(raw.cache_read_tokens);
+	const total = optionalFiniteNumber(raw.total_tokens);
+	if (input !== undefined && input >= 0) usage.input_tokens = input;
+	if (output !== undefined && output >= 0) usage.output_tokens = output;
+	if (thinking !== undefined && thinking >= 0) usage.thinking_tokens = thinking;
+	if (cacheRead !== undefined && cacheRead >= 0) usage.cache_read_tokens = cacheRead;
+	if (total !== undefined && total >= 0) usage.total_tokens = total;
+	return usage;
+}
+
 export function parseAgyStreamLine(line: string): AgyStreamEvent | undefined {
 	const trimmed = line.trim();
 	if (!trimmed.startsWith("{")) return undefined;
 	try {
 		const parsed: unknown = JSON.parse(trimmed);
 		if (!isRecord(parsed) || typeof parsed.event !== "string") return undefined;
-		if (parsed.event === "init" || parsed.event === "step_update" || parsed.event === "result") {
-			return parsed as unknown as AgyStreamEvent;
+		if (parsed.event === "init") {
+			const rawInit = isRecord(parsed.init) ? parsed.init : undefined;
+			return {
+				event: "init",
+				conversation_id: optionalString(parsed.conversation_id),
+				...(rawInit
+					? {
+							init: {
+								model: optionalString(rawInit.model),
+								cwd: optionalString(rawInit.cwd),
+								permission_mode: optionalString(rawInit.permission_mode),
+							},
+						}
+					: {}),
+			};
+		}
+		if (parsed.event === "step_update") {
+			const rawSu = isRecord(parsed.step_update) ? parsed.step_update : undefined;
+			if (!rawSu) return { event: "step_update" };
+			const rawToolInfo = isRecord(rawSu.tool_info) ? rawSu.tool_info : undefined;
+			return {
+				event: "step_update",
+				step_update: {
+					conversation_id: optionalString(rawSu.conversation_id),
+					step_index: optionalFiniteNumber(rawSu.step_index),
+					state: optionalString(rawSu.state),
+					step_type: optionalString(rawSu.step_type),
+					tool_name: optionalString(rawSu.tool_name),
+					...(rawToolInfo
+						? {
+								tool_info: {
+									name: optionalString(rawToolInfo.name),
+									parameters: isRecord(rawToolInfo.parameters) ? rawToolInfo.parameters : undefined,
+									output: optionalString(rawToolInfo.output),
+								},
+							}
+						: {}),
+					text_delta: optionalString(rawSu.text_delta),
+					duration_seconds: optionalFiniteNumber(rawSu.duration_seconds),
+					usage: parseAgyUsage(rawSu.usage),
+				},
+			};
+		}
+		if (parsed.event === "result") {
+			if (!isRecord(parsed.result)) {
+				return {
+					event: "result",
+					malformedReason: "agy emitted a malformed terminal result frame: missing result object",
+				};
+			}
+			const rawRes = parsed.result;
+			let malformedReason: string | undefined;
+			if (rawRes.status !== undefined && typeof rawRes.status !== "string") {
+				malformedReason = "agy emitted a malformed terminal result frame: non-string status";
+			} else if (rawRes.response !== undefined && typeof rawRes.response !== "string") {
+				malformedReason = "agy emitted a malformed terminal result frame: non-string response";
+			} else if (rawRes.error !== undefined && typeof rawRes.error !== "string") {
+				malformedReason = "agy emitted a malformed terminal result frame: non-string error";
+			}
+			const numTurns = optionalFiniteNumber(rawRes.num_turns);
+			return {
+				event: "result",
+				...(malformedReason ? { malformedReason } : {}),
+				result: {
+					conversation_id: optionalString(rawRes.conversation_id),
+					status: optionalString(rawRes.status),
+					response: optionalString(rawRes.response),
+					error: optionalString(rawRes.error),
+					duration_seconds: optionalFiniteNumber(rawRes.duration_seconds),
+					num_turns: numTurns !== undefined && numTurns >= 0 ? numTurns : undefined,
+					structured_output: rawRes.structured_output,
+					usage: parseAgyUsage(rawRes.usage),
+					finished_reason: optionalString(rawRes.finished_reason),
+				},
+			};
 		}
 		return undefined;
 	} catch {
@@ -376,6 +474,7 @@ async function runSingleAgyStep(params: {
 	let model = params.model;
 	let streamedText = "";
 	let resultEvent: AgyStreamResult["result"] | undefined;
+	let resultMalformedReason: string | undefined;
 	let stderrText = "";
 	let stepRequests = 0;
 	let stepInput = 0;
@@ -538,6 +637,7 @@ async function runSingleAgyStep(params: {
 				}
 			} else if (parsed.event === "result") {
 				resultEvent = parsed.result;
+				resultMalformedReason = parsed.malformedReason;
 				if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
 			}
 			try {
@@ -629,18 +729,21 @@ async function runSingleAgyStep(params: {
 			}
 		}
 
-		const hasTerminalSuccess = resultEvent !== undefined && resultEvent.status === "SUCCESS";
-		const statusIsError = resultEvent !== undefined && resultEvent.status !== "SUCCESS";
-		const missingResultOnZeroExit = !aborted && exitCode === 0 && !hasTerminalSuccess;
-		const finalResponse = resultEvent?.response !== undefined ? resultEvent.response : streamedText;
+		const hasMalformedResult = resultMalformedReason !== undefined;
+		const hasTerminalSuccess = !hasMalformedResult && resultEvent !== undefined && resultEvent.status === "SUCCESS";
+		const statusIsError = !hasMalformedResult && resultEvent !== undefined && resultEvent.status !== "SUCCESS";
+		const missingResultOnZeroExit = !aborted && !hasMalformedResult && exitCode === 0 && !hasTerminalSuccess;
+		const finalResponse = typeof resultEvent?.response === "string" ? resultEvent.response : streamedText;
 		const errorMessage =
-			resultEvent?.error ||
+			(typeof resultEvent?.error === "string" && resultEvent.error.length > 0 ? resultEvent.error : undefined) ||
 			(aborted ? abortReason : undefined) ||
+			(hasMalformedResult ? resultMalformedReason : undefined) ||
 			(statusIsError ? `agy exited with status ${resultEvent?.status}` : undefined) ||
 			(missingResultOnZeroExit ? "agy exited without emitting a terminal result frame" : undefined) ||
 			(exitCode !== 0 ? stderrText || `agy exited with code ${exitCode}` : undefined);
 
-		const effectiveExitCode = aborted || statusIsError || missingResultOnZeroExit ? 1 : exitCode;
+		const effectiveExitCode =
+			aborted || hasMalformedResult || statusIsError || missingResultOnZeroExit ? 1 : exitCode;
 		return {
 			exitCode: effectiveExitCode,
 			conversationId,
@@ -655,7 +758,7 @@ async function runSingleAgyStep(params: {
 			abortReason,
 		};
 	} catch (err) {
-		const message = err instanceof Error ? err.message : String(err);
+		const message = formatErrorMessage(err);
 		return {
 			exitCode: 1,
 			conversationId,
@@ -669,7 +772,7 @@ async function runSingleAgyStep(params: {
 			abortReason,
 		};
 	} finally {
-		if (cp && cp.exitCode === null) {
+		if (cp && cp.exitCode === null && cp.exitReason === undefined) {
 			cp.kill(new ptree.AbortError("agy step cleanup", cp.peekStderr()), -1);
 		}
 		if (spillPromptPath) {
@@ -1162,41 +1265,53 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let exitCode = wasAborted ? 1 : lastOutcome.exitCode;
 	let error = wasAborted ? (abortReason ?? lastOutcome.error) : lastOutcome.error;
 
-	let rawOutput = lastOutcome.response;
+	let rawOutput = typeof lastOutcome.response === "string" ? lastOutcome.response : "";
 	if (wasAborted && !rawOutput.trim() && recentOutputTail.trim().length > 0) {
 		const snippet = previewLine(recentOutputTail.trim(), 200);
 		rawOutput = `[cancelled after ${progress.requests} req, ${progress.tokens} tok — last activity: "${snippet}"]`;
 	}
 
-	const structured = finalizeStructuredOutput({
-		outputSchema,
-		outputSchemaMode: options.outputSchemaMode,
-		outputSchemaSource: options.outputSchemaSource,
-		exitCode,
-		rawOutput,
-		parsedFromAgy: lastOutcome.structuredOutput,
-		error,
-	});
-	rawOutput = structured.rawOutput;
-	exitCode = structured.exitCode;
-	error = structured.error;
-
-	const { content: truncatedOutput, truncated } = truncateTail(rawOutput, {
-		maxBytes: MAX_OUTPUT_BYTES,
-		maxLines: MAX_OUTPUT_LINES,
-	});
-
+	let structuredOutput: StructuredSubagentOutput | undefined;
+	let truncatedOutput = rawOutput;
+	let truncated = false;
 	let outputPath: string | undefined;
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
-	if (options.artifactsDir) {
-		const persisted = await persistSubagentOutputArtifacts({
-			artifactsDir: options.artifactsDir,
-			id,
+	try {
+		const structured = finalizeStructuredOutput({
+			outputSchema,
+			outputSchemaMode: options.outputSchemaMode,
+			outputSchemaSource: options.outputSchemaSource,
+			exitCode,
 			rawOutput,
-			structuredOutput: structured.structuredOutput,
+			parsedFromAgy: lastOutcome.structuredOutput,
+			error,
 		});
-		outputPath = persisted.outputPath;
-		outputMeta = persisted.outputMeta;
+		rawOutput = typeof structured.rawOutput === "string" ? structured.rawOutput : "";
+		exitCode = structured.exitCode;
+		error = structured.error;
+		structuredOutput = structured.structuredOutput;
+
+		const truncatedResult = truncateTail(rawOutput, {
+			maxBytes: MAX_OUTPUT_BYTES,
+			maxLines: MAX_OUTPUT_LINES,
+		});
+		truncatedOutput = truncatedResult.content;
+		truncated = Boolean(truncatedResult.truncated);
+
+		if (options.artifactsDir) {
+			const persisted = await persistSubagentOutputArtifacts({
+				artifactsDir: options.artifactsDir,
+				id,
+				rawOutput,
+				structuredOutput,
+			});
+			outputPath = persisted.outputPath;
+			outputMeta = persisted.outputMeta;
+		}
+	} catch (err) {
+		const message = formatErrorMessage(err);
+		exitCode = 1;
+		error = error ?? message;
 	}
 
 	progress.currentTool = undefined;
@@ -1234,8 +1349,8 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		exitCode,
 		output: truncatedOutput,
 		stderr: lastOutcome.stderr || error || "",
-		truncated: Boolean(truncated),
-		...(structured.structuredOutput ? { structuredOutput: structured.structuredOutput } : {}),
+		truncated,
+		...(structuredOutput ? { structuredOutput } : {}),
 		durationMs,
 		tokens: progress.tokens,
 		requests: progress.requests,

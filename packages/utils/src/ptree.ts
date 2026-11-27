@@ -479,12 +479,17 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this;
 	}
 
+	#isRootExited(): boolean {
+		return this.proc.exitCode !== null || this.proc.signalCode !== null;
+	}
+
 	kill(reason?: Exception, gracefulMs?: number) {
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
-			// group leader; wait() still needs to report the later deadline.
-			if (this.proc.exitCode !== null) this.#exitReason = reason;
+			// group leader (numeric exit or signal death); wait() still needs to report
+			// the later deadline or abort while drain is active.
+			if (this.#isRootExited()) this.#exitReason = reason;
 		}
 		// A command under the Linux subreaper is stopped without ever signalling
 		// the subreaper politely: SIGTERM would end it, its orphaned descendants
@@ -495,7 +500,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			if (gracefulMs !== undefined && gracefulMs < 0) this.#subreaperStop.escalate();
 			return;
 		}
-		if (this.#hardKillTree && this.proc.exitCode === null && this.proc.signalCode === null) {
+		if (this.#hardKillTree && !this.#isRootExited()) {
 			let root: Process | null = null;
 			try {
 				root = Process.fromPid(this.proc.pid);
@@ -515,7 +520,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			}
 		}
 		if (
-			this.proc.exitCode !== null &&
+			this.#isRootExited() &&
 			this.#terminateGroup &&
 			(this.#openPipeReaders > 0 || this.#drainDone !== undefined) &&
 			process.platform !== "win32"
@@ -532,7 +537,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			return;
 		}
 		if (
-			this.proc.exitCode !== null &&
+			this.#isRootExited() &&
 			this.#windowsRootProcess &&
 			(this.#openPipeReaders > 0 || this.#drainDone !== undefined)
 		) {
@@ -544,7 +549,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#terminating = Promise.resolve();
 			return;
 		}
-		if (this.proc.exitCode !== null && this.#drainDone !== undefined) {
+		if (this.#isRootExited() && this.#drainDone !== undefined) {
 			this.#clearDrainTimer();
 		}
 		if (!this.proc.killed) {
@@ -585,7 +590,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			signal("SIGTERM");
 			await Promise.race([this.proc.exited, Bun.sleep(gracefulMs)]);
 		}
-		if (this.proc.exitCode === null && this.proc.signalCode === null) signal("SIGKILL");
+		if (!this.#isRootExited()) signal("SIGKILL");
 	}
 
 	/**
@@ -829,7 +834,9 @@ export class ChildProcess<In extends InMask = InMask> {
 			await this.drainDone;
 		}
 		this.#clearTimeout();
-		if (!exitError) exitError = this.exitReason;
+		// Preserve abort/timeout precedence if cancellation arrived during post-exit drain
+		// after a non-zero or signal-terminated root exit.
+		if (this.exitReason?.aborted || !exitError) exitError = this.exitReason;
 		if (!exitError && this.exitCode !== null && this.exitCode !== 0) {
 			exitError = new NonZeroExitError(this.exitCode, this.#stderrTail);
 		}
@@ -857,16 +864,14 @@ export class ChildProcess<In extends InMask = InMask> {
 		const onAbort = () => {
 			// The { once: true } listener has removed itself at this point.
 			attached = false;
-			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			const active = rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
+			const active = !this.#isRootExited() || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
 			if (!active) return;
 			this.#abortRegistrations?.delete(sync);
 			this.kill(new AbortError(signal.reason, "<cancelled>"));
 			this.#cutoffOutput();
 		};
 		const sync = () => {
-			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			const active = rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
+			const active = !this.#isRootExited() || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
 			if (signal.aborted) {
 				if (active) onAbort();
 				return;
@@ -939,10 +944,6 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	#expireDrain(): void {
-		if (this.#drainPollTimer) {
-			clearInterval(this.#drainPollTimer);
-			this.#drainPollTimer = undefined;
-		}
 		if (this.#hasLiveDescendants()) {
 			this.#descendantsCleaned = true;
 			if (this.#terminateGroup && process.platform !== "win32") {
@@ -960,20 +961,12 @@ export class ChildProcess<In extends InMask = InMask> {
 		// Detach cancelled readers before reconciling abort listeners so an immediate post-drain
 		// abort cannot observe stale `#openPipeReaders > 0` before `reader.cancel()` unwinds.
 		if (this.#openPipeReaders > 0) {
-			for (const reader of [...this.#pipeReaders]) {
+			for (const reader of this.#pipeReaders) {
 				if (this.#pipeReaders.delete(reader)) this.#openPipeReaders--;
 				reader.cancel().catch(() => {});
 			}
 		}
-		if (this.#resolveDrainDone) {
-			const resolve = this.#resolveDrainDone;
-			this.#resolveDrainDone = undefined;
-			this.#drainDone = undefined;
-			// Reconcile abort listeners before resolving drain continuations so a late abort
-			// triggered right after forced expiry cannot mark a finished process as aborted.
-			this.#syncAbortListeners();
-			resolve();
-		}
+		this.#clearDrainTimer();
 	}
 
 	/**
@@ -1049,7 +1042,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			// the dead-leader fallback while an inherited pipe proves that exact
 			// group still has a live member; this avoids stale-PGID reuse.
 			if (
-				this.proc.exitCode === null ||
+				!this.#isRootExited() ||
 				((this.#openPipeReaders > 0 || this.#drainDone !== undefined) &&
 					(this.#terminateGroup || this.#windowsRootProcess))
 			) {
@@ -1062,7 +1055,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	[Symbol.dispose](): void {
-		if (this.proc.exitCode !== null) return;
+		if (this.#isRootExited()) return;
 		this.kill(new AbortError("process disposed", this.#stderrTail));
 	}
 }

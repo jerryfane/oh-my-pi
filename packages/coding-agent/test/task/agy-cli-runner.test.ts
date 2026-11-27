@@ -919,4 +919,89 @@ exit 0
 		expect(capturedPatch).toContain("+from-agy");
 		expect(order).toEqual(["cleanup"]);
 	}, 30_000);
+
+	it("maps malformed agy terminal frames to failed SingleResult and lifecycle events instead of rejecting", async () => {
+		const dir = await makeTempDir("omp-agy-malformed-");
+		const cases = [
+			{
+				name: "null-response",
+				frame: '{"event":"result","result":{"conversation_id":"conv-bad","status":"SUCCESS","response":null}}',
+				expectedError: /non-string response/i,
+			},
+			{
+				name: "null-result",
+				frame: '{"event":"result","result":null}',
+				expectedError: /missing result object/i,
+			},
+			{
+				name: "non-string-status",
+				frame: '{"event":"result","result":{"status":200,"response":"ok"}}',
+				expectedError: /non-string status/i,
+			},
+			{
+				name: "non-string-error",
+				frame: '{"event":"result","result":{"status":"ERROR","error":123}}',
+				expectedError: /non-string error/i,
+			},
+		] as const;
+
+		for (const tc of cases) {
+			const bin = await createFakeAgyShell(
+				dir,
+				`printf '%s\\n' '{"event":"init","conversation_id":"conv-bad","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '${tc.frame}'
+exit 0
+`,
+				`fake-agy-${tc.name}`,
+			);
+			const eventBus = new EventBus();
+			const lifecycle: string[] = [];
+			eventBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+				lifecycle.push((payload as SubagentLifecyclePayload).status);
+			});
+			const result = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "check malformed frame",
+				index: 0,
+				id: `Malformed-${tc.name}`,
+				eventBus,
+				settings: makeSettings(bin, { "*": "gemini-4-neon-low" }),
+			});
+			expect(result.exitCode).toBe(1);
+			expect(typeof result.output).toBe("string");
+			expect(result.error).toMatch(tc.expectedError);
+			expect(lifecycle).toEqual(["started", "failed"]);
+		}
+
+		// Control: malformed non-terminal step_update fields are safely ignored and a valid terminal frame still succeeds.
+		const resilientBin = await createFakeAgyShell(
+			dir,
+			`printf '%s\\n' '{"event":"init","conversation_id":123,"init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":0,"state":"DONE","tool_name":"read","tool_info":{"parameters":"bad","output":{"nested":true}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","text_delta":42,"usage":"bad"}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-ok","status":"SUCCESS","response":"valid-after-noise","num_turns":1}}'
+exit 0
+`,
+			"fake-agy-resilient",
+		);
+		const okBus = new EventBus();
+		const okLifecycle: string[] = [];
+		okBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+			okLifecycle.push((payload as SubagentLifecyclePayload).status);
+		});
+		const okResult = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "check resilient stream",
+			index: 0,
+			id: "Malformed-resilient",
+			eventBus: okBus,
+			settings: makeSettings(resilientBin, { "*": "gemini-4-neon-low" }),
+		});
+		expect(okResult.exitCode).toBe(0);
+		expect(okResult.output).toBe("valid-after-noise");
+		expect(okResult.error).toBeUndefined();
+		expect(okLifecycle).toEqual(["started", "completed"]);
+	}, 30_000);
 });

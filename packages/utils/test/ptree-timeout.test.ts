@@ -782,6 +782,41 @@ process.stdout.write(res.stdout + ":" + res.exitCode);
 					expect(resLate.exitError).toBeUndefined();
 					expect(cpLateAbort.exitReason).toBeUndefined();
 				}
+
+				// 11. Aborting closed-stdio drain after a signal-terminated leader kills descendants and reports AbortError
+				{
+					const sigSentinel = path.join(dir, "signal-drain-abort.txt");
+					const acSig = new AbortController();
+					const cpSig = spawn(
+						[
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.25; echo survived > "$1") </dev/null >/dev/null 2>&1 & kill -TERM $$`,
+							"_",
+							sigSentinel,
+						],
+						{ detached: true, subreaper: false, descendantDrainMs: 2500, signal: acSig.signal },
+					);
+					const tSig = performance.now();
+					let sigAbortTimer: ReturnType<typeof setTimeout> | undefined;
+					void cpSig.exited
+						.catch(() => {})
+						.then(() => {
+							sigAbortTimer = setTimeout(() => acSig.abort("cancel-after-signal"), 30);
+						});
+					let caught: unknown;
+					try {
+						await cpSig.wait();
+					} catch (err) {
+						caught = err;
+					} finally {
+						if (sigAbortTimer) clearTimeout(sigAbortTimer);
+					}
+					expect(performance.now() - tSig).toBeLessThan(600);
+					expect(caught).toBeInstanceOf(AbortError);
+					await Bun.sleep(350);
+					expect(await Bun.file(sigSentinel).exists()).toBe(false);
+				}
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}
