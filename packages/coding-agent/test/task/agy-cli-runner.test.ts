@@ -138,9 +138,11 @@ fs.writeFileSync(${JSON.stringify(argvDump)}, JSON.stringify(process.argv.slice(
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-123", init: { model: "gemini-4-neon-medium", cwd: process.cwd(), permission_mode: "always-proceed" } });
 emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", parameters: { Path: "/tmp/demo.ts" } } } });
-emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", parameters: { Path: "/tmp/demo.ts" }, output: "10 lines read" } } });
-emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 2, state: "ACTIVE", step_type: "agent_response", text_delta: "line 1\\nline 2\\n" } });
-emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "line 3\\n", usage: { input_tokens: 1200, output_tokens: 80, cache_read_tokens: 9000, total_tokens: 1280 } } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "list_directory", tool_info: { name: "list_directory", parameters: { Path: "/tmp" } } } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", output: "10 lines read" } } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 2, state: "DONE", step_type: "tool", tool_name: "list_directory", tool_info: { name: "list_directory", output: "demo.ts" } } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 3, state: "ACTIVE", step_type: "agent_response", text_delta: "line 1\\nline 2\\n" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 3, state: "DONE", step_type: "agent_response", text_delta: "line 3\\n", usage: { input_tokens: 1200, output_tokens: 80, cache_read_tokens: 9000, total_tokens: 1280 } } });
 emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS", response: "line 1\\nline 2\\nline 3\\n", duration_seconds: 0.4, num_turns: 1, usage: { input_tokens: 1200, output_tokens: 80, cache_read_tokens: 9000, total_tokens: 1280 } } });
 `,
 		);
@@ -181,14 +183,20 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 		// Stale JSON sidecar cleared when plain Markdown replaced it
 		expect(await Bun.file(staleSidecar).exists()).toBe(false);
 
-		// Lifecycle, newest-first recentOutput, and onToolResult callback
+		// Lifecycle, newest-first recentOutput, and interleaved onToolResult attribution
 		expect(lifecycles.map(l => l.status)).toEqual(["started", "completed"]);
 		expect(lifecycles[0]?.detached).toBe(true);
 		expect(progressCallbacks.at(-1)?.status).toBe("completed");
-		expect(progressCallbacks.at(-1)?.toolCount).toBe(1);
-		expect(progressCallbacks.at(-1)?.recentTools[0]?.tool).toBe("read_file");
+		expect(progressCallbacks.at(-1)?.toolCount).toBe(2);
+		expect(progressCallbacks.at(-1)?.recentTools.map(t => ({ tool: t.tool, args: t.args }))).toEqual([
+			{ tool: "read_file", args: "/tmp/demo.ts" },
+			{ tool: "list_directory", args: "/tmp" },
+		]);
 		expect(progressCallbacks.at(-1)?.recentOutput).toEqual(["line 3", "line 2", "line 1"]);
-		expect(toolResults).toEqual([{ tool: "read_file", text: "10 lines read", isError: false }]);
+		expect(toolResults).toEqual([
+			{ tool: "read_file", text: "10 lines read", isError: false },
+			{ tool: "list_directory", text: "demo.ts", isError: false },
+		]);
 		expect(progressFrames.length).toBeGreaterThanOrEqual(2);
 
 		const argv = JSON.parse(await fs.readFile(argvDump, "utf8")) as string[];
@@ -203,21 +211,40 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 		expect(printArg).toContain("--check-leading-dash find target");
 	});
 
-	it("validates constrained, unconstrained (true), and strict-invalid structured output schemas", async () => {
+	it("validates constrained, unconstrained (true / {}), non-object, and strict-invalid structured output schemas", async () => {
 		const dir = await makeTempDir("agy-runner-schema-");
 		const artifactsDir = path.join(dir, "artifacts");
 		await fs.mkdir(artifactsDir, { recursive: true });
 		const schemaCapture = path.join(dir, "schema.txt");
 
+		// Emits JSON ONLY when requested via --json-schema (which must have root type:"object", matching real agy)
+		// or via an explicit <output_format> JSON instruction in the prompt; otherwise emits plain prose.
 		const validBin = await createFakeAgyBinary(
 			dir,
 			`
 import * as fs from "node:fs";
-const idx = process.argv.indexOf("--json-schema");
-if (idx >= 0) fs.writeFileSync(${JSON.stringify(schemaCapture)}, process.argv[idx + 1] ?? "");
+const argv = process.argv.slice(2);
+const idx = argv.indexOf("--json-schema");
+const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
-emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: '{"summary":"all good"}', structured_output: { summary: "all good" }, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
+if (idx >= 0) {
+	const rawSchema = argv[idx + 1] ?? "";
+	const parsed = JSON.parse(rawSchema);
+	if (parsed?.type !== "object") {
+		process.stderr.write('Error: invalid --json-schema: schema root must specify "type": "object"\\n');
+		process.exit(1);
+	}
+	fs.writeFileSync(${JSON.stringify(schemaCapture)}, rawSchema);
+	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
+	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: '{"summary":"all good"}', structured_output: { summary: "all good" }, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
+} else if (printArg.includes("<output_format>") && printArg.includes("raw valid JSON")) {
+	const payload = printArg.includes('"type":"array"') ? '["a","b"]' : '{"summary":"all good"}';
+	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
+	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: payload, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
+} else {
+	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
+	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: "Plain prose response.", num_turns: 1 } });
+}
 `,
 			"fake-agy-valid",
 		);
@@ -250,28 +277,54 @@ emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS",
 			summary: "all good",
 		});
 
-		// Unconstrained JSON Schema `true` is valid and publishes structured data + sidecar
-		const unconstrained = await runSubprocess({
+		// Unconstrained JSON Schema `true` and `{}` both request raw JSON and publish structured data + sidecar
+		for (const [label, schemaVal] of [
+			["SchemaTrue", true],
+			["SchemaEmptyObj", {}],
+		] as const) {
+			const unconstrained = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent({ name: "task" }),
+				task: "summarize",
+				index: 0,
+				id: label,
+				artifactsDir,
+				outputSchema: schemaVal,
+				outputSchemaMode: "strict",
+				outputSchemaSource: "caller",
+				settings: makeSettings(validBin, { task: "gemini-4-neon-low" }),
+			});
+			expect(unconstrained.exitCode).toBe(0);
+			expect(unconstrained.structuredOutput).toEqual({
+				source: "caller",
+				mode: "strict",
+				status: "valid",
+				data: { summary: "all good" },
+			});
+			expect(JSON.parse(await fs.readFile(path.join(artifactsDir, `${label}.json`), "utf8"))).toEqual({
+				summary: "all good",
+			});
+		}
+
+		// Valid non-object JSON Schema (array) requests raw JSON via prompt instead of failing agy --json-schema
+		const arrayRes = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent({ name: "task" }),
-			task: "summarize",
+			task: "list items",
 			index: 0,
-			id: "SchemaTrue",
+			id: "SchemaArray",
 			artifactsDir,
-			outputSchema: true,
+			outputSchema: { type: "array", items: { type: "string" } },
 			outputSchemaMode: "strict",
 			outputSchemaSource: "caller",
 			settings: makeSettings(validBin, { task: "gemini-4-neon-low" }),
 		});
-		expect(unconstrained.exitCode).toBe(0);
-		expect(unconstrained.structuredOutput).toEqual({
+		expect(arrayRes.exitCode).toBe(0);
+		expect(arrayRes.structuredOutput).toEqual({
 			source: "caller",
 			mode: "strict",
 			status: "valid",
-			data: { summary: "all good" },
-		});
-		expect(JSON.parse(await fs.readFile(path.join(artifactsDir, "SchemaTrue.json"), "utf8"))).toEqual({
-			summary: "all good",
+			data: ["a", "b"],
 		});
 
 		// Strict invalid output fails with exitCode 1
@@ -303,7 +356,8 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 		const dir = await makeTempDir("agy-runner-steps-");
 		const logPath = path.join(dir, "invocations.jsonl");
 
-		// Step 1 reports usage on step_update DONE; Step 2 reports usage ONLY on result frame
+		// Step 1 reports partial step_update usage (1st DONE has usage, 2nd DONE omits usage) + aggregate on result;
+		// Step 2 reports usage ONLY on result frame.
 		const bin = await createFakeAgyBinary(
 			dir,
 			`
@@ -317,8 +371,9 @@ const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 const cid = conv ?? "conv-step-1";
 emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
 if (!conv) {
-	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "step-1-done", usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 500 } } });
-	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "step-1-done", num_turns: 1, usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 500 } } });
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "part-1", usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 40 } } });
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 2, state: "DONE", step_type: "agent_response", text_delta: "part-2" } });
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "step-1-done", num_turns: 2, usage: { input_tokens: 300, output_tokens: 30, cache_read_tokens: 90 } } });
 } else {
 	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "step-2-done", num_turns: 2, usage: { input_tokens: 200, output_tokens: 20, cache_read_tokens: 600 } } });
 }
@@ -326,12 +381,13 @@ if (!conv) {
 			"fake-agy-steps",
 		);
 
-		const hugePrompt = `Step 1: ${"x".repeat(110_000)}`;
+		// 90,000-byte multiline prompt (< 96 KiB raw, > 128 KiB JSON-encoded for Linux subreaper) must spill instead of E2BIG
+		const multilinePrompt = "a\n".repeat(45_000);
 		const result = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
-			task: hugePrompt,
-			steps: [hugePrompt, "Step 2: wrap up"],
+			task: multilinePrompt,
+			steps: [multilinePrompt, "Step 2: wrap up"],
 			index: 0,
 			id: "MultiStep",
 			artifactsDir: dir,
@@ -340,10 +396,10 @@ if (!conv) {
 
 		expect(result.exitCode).toBe(0);
 		expect(result.output).toBe("step-2-done");
-		// Exact per-step reconciliation: 1+2=3 requests, 110+220=330 tokens, 500+600=1100 cacheRead
-		expect(result.requests).toBe(3);
-		expect(result.tokens).toBe(330);
-		expect(result.usage?.cacheRead).toBe(1100);
+		// Authoritative terminal totals per step: 2+2=4 requests, 330+220=550 tokens, 90+600=690 cacheRead
+		expect(result.requests).toBe(4);
+		expect(result.tokens).toBe(550);
+		expect(result.usage?.cacheRead).toBe(690);
 
 		const calls = (await fs.readFile(logPath, "utf8"))
 			.trim()
@@ -356,6 +412,21 @@ if (!conv) {
 		const leftovers = (await fs.readdir(dir)).filter(f => f.includes("agy-prompt-"));
 		expect(leftovers).toEqual([]);
 
+		// Single-step partial step_update usage preserves latest per-request contextTokens separately from aggregate usage
+		const singlePartial = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "short single step",
+			index: 0,
+			id: "PartialUsageSingle",
+			settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
+		});
+		expect(singlePartial.exitCode).toBe(0);
+		expect(singlePartial.requests).toBe(2);
+		expect(singlePartial.tokens).toBe(330);
+		expect(singlePartial.usage?.cacheRead).toBe(90);
+		expect(singlePartial.contextTokens).toBe(140);
+
 		// Spill write failure emits terminal failed lifecycle instead of rejecting unhandled
 		const spillBus = new EventBus();
 		const spillLifecycles: SubagentLifecyclePayload[] = [];
@@ -363,7 +434,7 @@ if (!conv) {
 		const spillFail = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
-			task: hugePrompt,
+			task: multilinePrompt,
 			index: 0,
 			id: "SpillFail",
 			artifactsDir: path.join(dir, "missing-nonexistent-dir"),
@@ -399,18 +470,18 @@ process.exit(0);
 		expect(truncatedRes.output).toBe("halfway output");
 	});
 
-	it("kills the entire process tree on timeout without hanging on descendants and surfaces error frames", async () => {
+	it("hard-kills SIGTERM-ignoring descendants at maxRuntimeMs, settles promptly when a helper lingers after SUCCESS, and surfaces error frames", async () => {
 		const dir = await makeTempDir("agy-runner-abort-");
 		const sentinelPath = path.join(dir, "descendant-survived.txt");
 
-		// Spawn a descendant that inherits stdout and tries to write a sentinel after 600ms
+		// Spawn a descendant that ignores SIGTERM and tries to write a sentinel after 500ms
 		const treeBin = await createFakeAgyBinary(
 			dir,
 			`
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-tree", init: { model: "gemini-4-neon-low" } });
 emit({ event: "step_update", step_update: { conversation_id: "conv-tree", step_index: 1, state: "ACTIVE", step_type: "agent_response", text_delta: "partial progress here" } });
-Bun.spawn(["sh", "-c", "sleep 0.6 && echo alive > " + ${JSON.stringify(sentinelPath)}], { stdout: "inherit", stderr: "inherit" });
+Bun.spawn(["sh", "-c", "trap '' TERM; sleep 0.5 && echo alive > " + ${JSON.stringify(sentinelPath)}], { stdout: "inherit", stderr: "inherit" });
 setTimeout(() => {}, 30_000);
 `,
 			"fake-agy-tree",
@@ -420,10 +491,10 @@ setTimeout(() => {}, 30_000);
 		const aborted = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
-			task: "long job with descendant",
+			task: "long job with SIGTERM-ignoring descendant",
 			index: 0,
 			id: "TimeoutTreeJob",
-			maxRuntimeMs: 180,
+			maxRuntimeMs: 220,
 			settings: makeSettings(treeBin, { "*": "gemini-4-neon-low" }),
 		});
 		const elapsed = Date.now() - t0;
@@ -431,11 +502,42 @@ setTimeout(() => {}, 30_000);
 		expect(aborted.aborted).toBe(true);
 		expect(aborted.abortReason).toContain("maxRuntimeMs");
 		expect(aborted.output).toContain("partial progress here");
-		expect(elapsed).toBeLessThan(4_000);
+		// Hard timeout uses immediate SIGKILL (no 1000ms SIGTERM grace period)
+		expect(elapsed).toBeLessThan(900);
 
-		// Wait past the descendant's sleep window and verify it was killed with the tree
-		await Bun.sleep(700);
+		// Wait past the descendant's sleep window and verify it was hard-killed at the deadline
+		await Bun.sleep(600);
 		expect(await Bun.file(sentinelPath).exists()).toBe(false);
+
+		// Successful agy exit with a lingering helper holding inherited pipes settles promptly even with unlimited runtime
+		const lingerSentinel = path.join(dir, "linger-survived.txt");
+		const lingerBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+Bun.spawn(["sh", "-c", "trap '' TERM; sleep 3 && echo lingered > " + ${JSON.stringify(lingerSentinel)}], { stdout: "inherit", stderr: "inherit" });
+emit({ event: "init", conversation_id: "conv-linger", init: { model: "gemini-4-neon-low" } });
+emit({ event: "result", result: { conversation_id: "conv-linger", status: "SUCCESS", response: "finished fast", num_turns: 1 } });
+process.exit(0);
+`,
+			"fake-agy-linger",
+		);
+		const tLinger = Date.now();
+		const settled = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "job with lingering helper",
+			index: 0,
+			id: "LingerHelperJob",
+			maxRuntimeMs: 0,
+			settings: makeSettings(lingerBin, { "*": "gemini-4-neon-low" }),
+		});
+		const lingerElapsed = Date.now() - tLinger;
+		expect(settled.exitCode).toBe(0);
+		expect(settled.aborted).toBeUndefined();
+		expect(settled.output).toBe("finished fast");
+		expect(lingerElapsed).toBeLessThan(1_200);
+		expect(await Bun.file(lingerSentinel).exists()).toBe(false);
 
 		const errBin = await createFakeAgyBinary(
 			dir,

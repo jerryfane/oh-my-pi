@@ -19,7 +19,8 @@ import { buildOutputValidator, summarizeValidationFailure } from "../tools/outpu
 import { truncateTail } from "../tools/streaming-output";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { previewLine, shortenToolArgumentPaths, TRUNCATE_LENGTHS } from "../utils/render-utils";
-import { type ExecutorOptions, persistSubagentOutputArtifacts } from "./executor";
+import type { ExecutorOptions } from "./executor";
+import { persistSubagentOutputArtifacts } from "./output-artifacts";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { cfgTaskAgyBinary, cfgTaskAgySubagents, cfgTaskMaxRuntimeMs } from "./settings";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "./task-details";
@@ -31,12 +32,18 @@ import {
 } from "./types";
 
 const PROGRESS_COALESCE_MS = 150;
-const POST_ABORT_DRAIN_MS = 1_000;
+const POST_RESULT_SETTLE_MS = 250;
+const POST_EXIT_DRAIN_MS = 250;
 const RECENT_TOOLS_LIMIT = 10;
 const RECENT_OUTPUT_LINES = 8;
 const RECENT_OUTPUT_TAIL_BYTES = 8 * 1024;
-/** Keep argv strings safely below Linux MAX_ARG_STRLEN (128 KiB). */
-const MAX_INLINE_PROMPT_BYTES = 96 * 1024;
+/**
+ * Keep every argv item and the Linux subreaper's JSON-encoded command env var
+ * (`OMP_PTREE_SUBREAPER_COMMAND=<json>`) safely below Linux MAX_ARG_STRLEN (128 KiB)
+ * and Windows CreateProcess command-line limits (32 KiB).
+ */
+const MAX_INLINE_LAUNCH_BYTES = process.platform === "win32" ? 24 * 1024 : 96 * 1024;
+const LINUX_SUBREAPER_ENV_PREFIX_BYTES = "OMP_PTREE_SUBREAPER_COMMAND=".length + 1;
 const DISABLED_VALUES = new Set(["off", "false", "none", "disabled", "0"]);
 const DEFAULT_MODEL_VALUES = new Set(["default", "auto", "true", "on", "1"]);
 
@@ -297,6 +304,36 @@ function buildStepArgs(params: {
 	return args;
 }
 
+function exceedsInlineLaunchLimit(cmd: string[]): boolean {
+	for (const arg of cmd) {
+		if (Buffer.byteLength(arg, "utf8") > MAX_INLINE_LAUNCH_BYTES) return true;
+	}
+	if (process.platform === "linux") {
+		const encodedBytes = Buffer.byteLength(JSON.stringify(cmd), "utf8") + LINUX_SUBREAPER_ENV_PREFIX_BYTES;
+		if (encodedBytes > MAX_INLINE_LAUNCH_BYTES) return true;
+	}
+	if (process.platform === "win32") {
+		const totalChars = cmd.reduce((sum, arg) => sum + arg.length + 3, 0);
+		if (totalChars > MAX_INLINE_LAUNCH_BYTES) return true;
+	}
+	return false;
+}
+
+async function waitForDrainOrTimeout(promise: Promise<void>, timeoutMs: number): Promise<"drained" | "timeout"> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([
+			promise.then(() => "drained" as const),
+			new Promise<"timeout">(resolve => {
+				timer = setTimeout(() => resolve("timeout"), timeoutMs);
+				timer.unref?.();
+			}),
+		]);
+	} finally {
+		if (timer) clearTimeout(timer);
+	}
+}
+
 interface StepUsageTotals {
 	requests: number;
 	inputTokens: number;
@@ -315,6 +352,7 @@ interface StepRunOutcome {
 	error?: string;
 	stderr: string;
 	aborted: boolean;
+	timedOut: boolean;
 	abortReason?: string;
 }
 
@@ -329,12 +367,16 @@ async function runSingleAgyStep(params: {
 	artifactsDir?: string;
 	id: string;
 	stepIndex: number;
-	abortSignal: AbortSignal;
+	abortSignal?: AbortSignal;
+	deadlineMs?: number;
+	maxRuntimeMs: number;
 	onEvent: (event: AgyStreamEvent) => void;
 }): Promise<StepRunOutcome> {
 	let spillPromptPath: string | undefined;
 	let aborted = false;
+	let timedOut = false;
 	let abortReason: string | undefined;
+	let settledAfterResult = false;
 	let conversationId = params.conversationId;
 	let model = params.model;
 	let streamedText = "";
@@ -347,8 +389,9 @@ async function runSingleAgyStep(params: {
 	let stepLastContext: number | undefined;
 	let cp: ptree.ChildProcess | undefined;
 	let cancelStdout: (() => Promise<void>) | undefined;
+	let postResultTimer: ReturnType<typeof setTimeout> | undefined;
 
-	const zeroUsage = (): StepUsageTotals => ({
+	const currentUsage = (): StepUsageTotals => ({
 		requests: stepRequests,
 		inputTokens: stepInput,
 		outputTokens: stepOutput,
@@ -356,71 +399,98 @@ async function runSingleAgyStep(params: {
 		lastContextTokens: stepLastContext,
 	});
 
-	const onAbort = () => {
-		aborted = true;
+	if (params.abortSignal?.aborted) {
 		abortReason = abortReasonOf(params.abortSignal, "Cancelled");
-		if (cp) {
-			cp.kill(new ptree.AbortError(abortReason, cp.peekStderr()));
-		}
-	};
-
-	if (params.abortSignal.aborted) {
-		onAbort();
 		return {
 			exitCode: 1,
 			response: "",
-			usage: zeroUsage(),
+			usage: currentUsage(),
 			error: abortReason,
-			stderr: abortReason ?? "Cancelled",
+			stderr: abortReason,
 			aborted: true,
+			timedOut: false,
 			abortReason,
 		};
 	}
 
-	params.abortSignal.addEventListener("abort", onAbort, { once: true });
+	if (params.deadlineMs !== undefined && Date.now() >= params.deadlineMs) {
+		abortReason = `Subagent exceeded task.maxRuntimeMs (${params.maxRuntimeMs}ms)`;
+		return {
+			exitCode: 1,
+			response: "",
+			usage: currentUsage(),
+			error: abortReason,
+			stderr: abortReason,
+			aborted: true,
+			timedOut: true,
+			abortReason,
+		};
+	}
 
 	try {
-		let promptArg = params.promptText;
-		if (Buffer.byteLength(params.promptText, "utf8") > MAX_INLINE_PROMPT_BYTES) {
-			const spillDir = params.artifactsDir ?? os.tmpdir();
-			spillPromptPath = path.join(spillDir, `${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`);
-			await fs.writeFile(spillPromptPath, params.promptText, { mode: 0o600 });
-			promptArg = `Read the complete task instructions from ${spillPromptPath} and execute them thoroughly.`;
-		}
-
-		if (params.abortSignal.aborted) {
-			onAbort();
-			return {
-				exitCode: 1,
-				response: "",
-				usage: zeroUsage(),
-				error: abortReason,
-				stderr: abortReason ?? "Cancelled",
-				aborted: true,
-				abortReason,
-			};
-		}
-
-		const cmd = buildStepArgs({
+		let cmd = buildStepArgs({
 			binary: params.binary,
 			model: params.model,
 			conversationId: params.conversationId,
 			additionalDirectories: params.additionalDirectories,
 			jsonSchema: params.jsonSchema,
-			promptArg,
+			promptArg: params.promptText,
 		});
 
-		// Supervise the entire process tree (detached + Linux subreaper) so abort/timeout kills descendants too.
+		if (exceedsInlineLaunchLimit(cmd)) {
+			const spillDir = params.artifactsDir ?? os.tmpdir();
+			spillPromptPath = path.join(spillDir, `${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`);
+			await fs.writeFile(spillPromptPath, params.promptText, { mode: 0o600 });
+			cmd = buildStepArgs({
+				binary: params.binary,
+				model: params.model,
+				conversationId: params.conversationId,
+				additionalDirectories: params.additionalDirectories,
+				jsonSchema: params.jsonSchema,
+				promptArg: `Read the complete task instructions from ${spillPromptPath} and execute them thoroughly.`,
+			});
+		}
+
+		if (params.abortSignal?.aborted) {
+			abortReason = abortReasonOf(params.abortSignal, "Cancelled");
+			return {
+				exitCode: 1,
+				response: "",
+				usage: currentUsage(),
+				error: abortReason,
+				stderr: abortReason,
+				aborted: true,
+				timedOut: false,
+				abortReason,
+			};
+		}
+
+		const remainingMs = params.deadlineMs !== undefined ? params.deadlineMs - Date.now() : undefined;
+		if (remainingMs !== undefined && remainingMs <= 0) {
+			abortReason = `Subagent exceeded task.maxRuntimeMs (${params.maxRuntimeMs}ms)`;
+			return {
+				exitCode: 1,
+				response: "",
+				usage: currentUsage(),
+				error: abortReason,
+				stderr: abortReason,
+				aborted: true,
+				timedOut: true,
+				abortReason,
+			};
+		}
+
+		// Supervise the entire process tree (detached + Linux subreaper) with ptree's hard timeout path
+		// (`gracefulMs: -1` SIGKILL sweep) so deadlines kill SIGTERM-ignoring descendants immediately.
 		cp = ptree.spawn(cmd, {
 			cwd: params.cwd,
 			stdin: "ignore",
 			detached: true,
 			subreaper: true,
-			signal: params.abortSignal,
-			stderr: "full",
+			...(params.abortSignal ? { signal: params.abortSignal } : {}),
+			...(remainingMs !== undefined ? { timeout: remainingMs } : {}),
 			env: { ...Bun.env, AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
 		});
-		cp.nothrow();
 
 		const readStdout = (async () => {
 			const reader = cp.stdout.getReader();
@@ -447,13 +517,26 @@ async function runSingleAgyStep(params: {
 								stepInput += inp;
 								stepOutput += out;
 								stepCacheRead += cacheRead;
-								stepLastContext = inp + cacheRead;
+								const ctx = inp + cacheRead;
+								if (ctx > 0) stepLastContext = ctx;
 							}
 						}
 					}
 				} else if (parsed.event === "result") {
 					resultEvent = parsed.result;
 					if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
+					// Bound settlement from agy's terminal result frame so a lingering descendant holding
+					// inherited pipes open (or keeping the Linux subreaper alive) cannot stall settlement.
+					if (!postResultTimer) {
+						postResultTimer = setTimeout(() => {
+							postResultTimer = undefined;
+							if (!cp || cp.exitCode !== null || params.abortSignal?.aborted || timedOut) return;
+							settledAfterResult = true;
+							void cancelStdout?.().catch(() => {});
+							cp.kill(new ptree.AbortError("post-result descendant cleanup", cp.peekStderr()), -1);
+						}, POST_RESULT_SETTLE_MS);
+						postResultTimer.unref?.();
+					}
 				}
 				params.onEvent(parsed);
 			};
@@ -478,39 +561,64 @@ async function runSingleAgyStep(params: {
 		try {
 			exitCode = await cp.exited;
 		} catch (err) {
-			if (err instanceof ptree.AbortError || params.abortSignal.aborted) {
+			if (err instanceof ptree.TimeoutError) {
+				timedOut = true;
+				aborted = true;
+				abortReason = `Subagent exceeded task.maxRuntimeMs (${params.maxRuntimeMs}ms)`;
+			} else if (settledAfterResult && !params.abortSignal?.aborted) {
+				exitCode = resultEvent?.status === "SUCCESS" ? 0 : 1;
+			} else if (err instanceof ptree.AbortError || params.abortSignal?.aborted) {
 				aborted = true;
 				abortReason = abortReason ?? abortReasonOf(params.abortSignal, "Cancelled");
 			} else {
 				exitCode = 1;
 			}
+		} finally {
+			if (postResultTimer) {
+				clearTimeout(postResultTimer);
+				postResultTimer = undefined;
+			}
 		}
 
 		// Bound post-exit stdout drain so an orphaned descendant holding stdout open cannot hang settlement.
-		const drainWinner = await Promise.race([
-			readStdout.then(() => "drained" as const),
-			Bun.sleep(POST_ABORT_DRAIN_MS).then(() => "timeout" as const),
-		]);
-		if (drainWinner === "timeout") {
+		if (aborted || timedOut || settledAfterResult) {
 			await cancelStdout?.().catch(() => {});
+			await readStdout.catch(() => {});
+		} else {
+			const drainWinner = await waitForDrainOrTimeout(readStdout, POST_EXIT_DRAIN_MS);
+			if (drainWinner === "timeout") {
+				await cancelStdout?.().catch(() => {});
+				cp.kill(new ptree.AbortError("post-exit descendant cleanup", cp.peekStderr()), -1);
+				await readStdout.catch(() => {});
+			}
 		}
 
 		stderrText = cp.peekStderr().trim();
 
-		// Reconcile per-step usage against the step's terminal result frame (when step_update omitted usage).
+		// Prefer authoritative terminal result totals when present; retain streamed totals as fallback
+		// and preserve the latest per-request context size separately from multi-turn aggregates.
 		const resUsage = resultEvent?.usage;
 		const resTurns = resultEvent?.num_turns;
-		if (stepRequests === 0 && typeof resTurns === "number" && resTurns > 0) {
+		if (typeof resTurns === "number" && resTurns > 0) {
 			stepRequests = resTurns;
 		}
-		if (stepInput === 0 && stepOutput === 0 && resUsage) {
-			const inp = resUsage.input_tokens ?? 0;
-			const out = resUsage.output_tokens ?? 0;
-			const cacheRead = resUsage.cache_read_tokens ?? 0;
-			stepInput = inp;
-			stepOutput = out;
-			stepCacheRead = cacheRead;
-			if (inp + cacheRead > 0) stepLastContext = inp + cacheRead;
+		if (resUsage) {
+			if (typeof resUsage.input_tokens === "number" && (resUsage.input_tokens > 0 || stepInput === 0)) {
+				stepInput = resUsage.input_tokens;
+			}
+			if (typeof resUsage.output_tokens === "number" && (resUsage.output_tokens > 0 || stepOutput === 0)) {
+				stepOutput = resUsage.output_tokens;
+			}
+			if (
+				typeof resUsage.cache_read_tokens === "number" &&
+				(resUsage.cache_read_tokens > 0 || stepCacheRead === 0)
+			) {
+				stepCacheRead = resUsage.cache_read_tokens;
+			}
+			if (stepLastContext === undefined) {
+				const ctx = (resUsage.input_tokens ?? 0) + (resUsage.cache_read_tokens ?? 0);
+				if (ctx > 0) stepLastContext = ctx;
+			}
 		}
 
 		const hasTerminalSuccess = resultEvent !== undefined && resultEvent.status === "SUCCESS";
@@ -531,10 +639,11 @@ async function runSingleAgyStep(params: {
 			model,
 			response: finalResponse,
 			structuredOutput: resultEvent?.structured_output,
-			usage: zeroUsage(),
+			usage: currentUsage(),
 			error: errorMessage,
 			stderr: stderrText || errorMessage || "",
 			aborted,
+			timedOut,
 			abortReason,
 		};
 	} catch (err) {
@@ -544,16 +653,20 @@ async function runSingleAgyStep(params: {
 			conversationId,
 			model,
 			response: streamedText,
-			usage: zeroUsage(),
+			usage: currentUsage(),
 			error: aborted ? (abortReason ?? message) : message,
 			stderr: stderrText || message,
 			aborted,
+			timedOut,
 			abortReason,
 		};
 	} finally {
-		params.abortSignal.removeEventListener("abort", onAbort);
+		if (postResultTimer) {
+			clearTimeout(postResultTimer);
+			postResultTimer = undefined;
+		}
 		if (cp && cp.exitCode === null) {
-			cp.kill(new ptree.AbortError("agy step cleanup", cp.peekStderr()));
+			cp.kill(new ptree.AbortError("agy step cleanup", cp.peekStderr()), -1);
 		}
 		if (spillPromptPath) {
 			await fs.rm(spillPromptPath, { force: true }).catch(() => {});
@@ -834,30 +947,33 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	});
 	scheduleProgress(true);
 
-	const runAbort = new AbortController();
+	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
 	let runtimeExceeded = false;
-	const onSignalAbort = () => {
-		if (!runAbort.signal.aborted) {
-			runAbort.abort(abortReasonOf(signal, "Cancelled"));
-		}
-	};
-	signal?.addEventListener("abort", onSignalAbort, { once: true });
-
-	const runtimeTimer =
-		maxRuntimeMs > 0
-			? setTimeout(() => {
-					runtimeExceeded = true;
-					if (!runAbort.signal.aborted) {
-						runAbort.abort(`Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`);
-					}
-				}, maxRuntimeMs)
-			: undefined;
 
 	let jsonSchemaStr: string | undefined;
+	let jsonPromptInstruction: string | undefined;
 	if (outputSchema !== undefined) {
-		const { jsonSchema } = buildOutputValidator(outputSchema);
-		if (jsonSchema !== undefined) {
-			jsonSchemaStr = JSON.stringify(jsonSchema);
+		const { jsonSchema, normalized, error: schemaErr } = buildOutputValidator(outputSchema);
+		if (!schemaErr && normalized !== undefined) {
+			if (jsonSchema && jsonSchema.type === "object") {
+				// Official `agy --json-schema` requires root `"type": "object"`.
+				jsonSchemaStr = JSON.stringify(jsonSchema);
+			} else if (jsonSchema && Object.keys(jsonSchema).length > 0) {
+				jsonPromptInstruction = [
+					"<output_format>",
+					"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose) conforming to this JSON Schema:",
+					JSON.stringify(jsonSchema),
+					"</output_format>",
+				].join("\n");
+			} else {
+				// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
+				// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
+				jsonPromptInstruction = [
+					"<output_format>",
+					"Your final response MUST be a single raw valid JSON value (no markdown code fences and no surrounding prose).",
+					"</output_format>",
+				].join("\n");
+			}
 		}
 	}
 
@@ -870,22 +986,27 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
 		stderr: "",
 		aborted: false,
+		timedOut: false,
 	};
 	// Accumulated totals across completed steps; live step deltas are tracked inside each step and added on step end.
 	let completedRequests = 0;
 	let completedInputTokens = 0;
 	let completedOutputTokens = 0;
 	let completedCacheReadTokens = 0;
-	let activeToolName: string | undefined;
-	let activeToolArgs = "";
-	let activeToolArgsKey: string | undefined;
 
 	try {
 		for (let i = 0; i < stepPrompts.length; i++) {
+			if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
+				runtimeExceeded = true;
+				break;
+			}
 			const isFinalStep = i === stepPrompts.length - 1;
-			const fullPrompt = buildAgyPrompt(options, stepPrompts[i]!, i === 0);
+			const basePrompt = buildAgyPrompt(options, stepPrompts[i]!, i === 0);
+			const fullPrompt =
+				isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt;
 			let liveStepRequests = 0;
 			let liveStepTokens = 0;
+			const activeToolsByStep = new Map<number, { tool: string; args: string; argsKey?: string }>();
 
 			lastOutcome = await runSingleAgyStep({
 				binary: config.binary,
@@ -898,7 +1019,9 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				artifactsDir: options.artifactsDir,
 				id,
 				stepIndex: i,
-				abortSignal: runAbort.signal,
+				abortSignal: signal,
+				deadlineMs,
+				maxRuntimeMs,
 				onEvent: ev => {
 					if (ev.event === "init") {
 						if (ev.init?.model) {
@@ -912,12 +1035,18 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 					if (ev.event === "step_update" && ev.step_update) {
 						const su = ev.step_update;
 						if (su.step_type === "tool") {
-							const toolName = su.tool_name || su.tool_info?.name || "tool";
+							const frameToolName = su.tool_name || su.tool_info?.name;
+							const stepKey = su.step_index;
 							if (su.state === "ACTIVE") {
+								const toolName = frameToolName || "tool";
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
-								activeToolName = toolName;
-								activeToolArgs = summarized.args;
-								activeToolArgsKey = summarized.argsKey;
+								if (stepKey !== undefined) {
+									activeToolsByStep.set(stepKey, {
+										tool: toolName,
+										args: summarized.args,
+										argsKey: summarized.argsKey,
+									});
+								}
 								progress.currentTool = toolName;
 								progress.currentToolArgs = summarized.args;
 								progress.currentToolArgsKey = summarized.argsKey;
@@ -925,25 +1054,33 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								progress.streaming = undefined;
 								scheduleProgress();
 							} else if (su.state === "DONE") {
+								const prior = stepKey !== undefined ? activeToolsByStep.get(stepKey) : undefined;
+								if (stepKey !== undefined) activeToolsByStep.delete(stepKey);
+								const resolvedName = frameToolName || prior?.tool || "tool";
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
-								const resolvedName = activeToolName ?? toolName;
+								const resolvedArgs = summarized.args || prior?.args || "";
+								const resolvedArgsKey = summarized.argsKey ?? prior?.argsKey;
 								progress.toolCount += 1;
 								progress.recentTools.push({
 									tool: resolvedName,
-									args: summarized.args || activeToolArgs,
-									argsKey: summarized.argsKey ?? activeToolArgsKey,
+									args: resolvedArgs,
+									argsKey: resolvedArgsKey,
 									endMs: Date.now(),
 								});
 								if (progress.recentTools.length > RECENT_TOOLS_LIMIT) {
 									progress.recentTools.shift();
 								}
-								activeToolName = undefined;
-								activeToolArgs = "";
-								activeToolArgsKey = undefined;
-								progress.currentTool = undefined;
-								progress.currentToolArgs = undefined;
-								progress.currentToolArgsKey = undefined;
-								progress.currentToolStartMs = undefined;
+								const remaining = activeToolsByStep.values().next().value;
+								if (remaining) {
+									progress.currentTool = remaining.tool;
+									progress.currentToolArgs = remaining.args;
+									progress.currentToolArgsKey = remaining.argsKey;
+								} else {
+									progress.currentTool = undefined;
+									progress.currentToolArgs = undefined;
+									progress.currentToolArgsKey = undefined;
+									progress.currentToolStartMs = undefined;
+								}
 								options.onToolResult?.({
 									tool: resolvedName,
 									text: su.tool_info?.output ?? "",
@@ -966,7 +1103,8 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 									const out = su.usage.output_tokens ?? 0;
 									const cacheRead = su.usage.cache_read_tokens ?? 0;
 									liveStepTokens += inp + out;
-									progress.contextTokens = inp + cacheRead;
+									const ctx = inp + cacheRead;
+									if (ctx > 0) progress.contextTokens = ctx;
 								}
 								progress.requests = completedRequests + liveStepRequests;
 								progress.tokens = completedInputTokens + completedOutputTokens + liveStepTokens;
@@ -977,7 +1115,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				},
 			});
 
-			// Fold reconciled per-step totals into run totals (covers steps where usage appeared only on `result`).
+			// Fold reconciled per-step totals into run totals.
 			completedRequests += lastOutcome.usage.requests;
 			completedInputTokens += lastOutcome.usage.inputTokens;
 			completedOutputTokens += lastOutcome.usage.outputTokens;
@@ -986,6 +1124,9 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			progress.tokens = completedInputTokens + completedOutputTokens;
 			if (lastOutcome.usage.lastContextTokens !== undefined) {
 				progress.contextTokens = lastOutcome.usage.lastContextTokens;
+			}
+			if (lastOutcome.timedOut) {
+				runtimeExceeded = true;
 			}
 
 			conversationId = lastOutcome.conversationId ?? conversationId;
@@ -999,8 +1140,6 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			}
 		}
 	} finally {
-		if (runtimeTimer) clearTimeout(runtimeTimer);
-		signal?.removeEventListener("abort", onSignalAbort);
 		if (progressTimer) {
 			clearTimeout(progressTimer);
 			progressTimer = null;
