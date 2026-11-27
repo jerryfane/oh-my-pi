@@ -7,6 +7,7 @@
  * structured results straight into OMP's `Subagents` (`Alt+A`) HUD, `wait`, and `proc://`.
  */
 
+import * as crypto from "node:crypto";
 import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
@@ -37,6 +38,10 @@ const POST_EXIT_DRAIN_MS = 250;
 const RECENT_TOOLS_LIMIT = 10;
 const RECENT_OUTPUT_LINES = 8;
 const RECENT_OUTPUT_TAIL_BYTES = 8 * 1024;
+const TRANSCRIPT_MAX_TOOL_ARGS_BYTES = 16 * 1024;
+const TRANSCRIPT_MAX_TOOL_OUTPUT_BYTES = 64 * 1024;
+const TRANSCRIPT_MAX_TOOL_OUTPUT_LINES = 1000;
+const SAFE_TRANSCRIPT_ID_RE = /^[A-Za-z0-9_.-]+$/;
 const DISABLED_VALUES = new Set(["off", "false", "none", "disabled", "0"]);
 const DEFAULT_MODEL_VALUES = new Set(["default", "auto", "true", "on", "1"]);
 
@@ -945,6 +950,318 @@ function finalizeStructuredOutput(params: {
 	};
 }
 
+function sanitizeTranscriptToolArgs(
+	parameters: Record<string, unknown> | undefined,
+	previewArgs: string,
+): Record<string, unknown> {
+	if (!parameters) {
+		return previewArgs ? { preview: previewArgs } : {};
+	}
+	try {
+		const serialized = JSON.stringify(parameters);
+		if (serialized !== undefined && Buffer.byteLength(serialized, "utf8") <= TRANSCRIPT_MAX_TOOL_ARGS_BYTES) {
+			return parameters;
+		}
+	} catch {
+		// Fall back to bounded preview if parameters contain non-serializable values.
+	}
+	return previewArgs ? { preview: previewArgs, truncated: true } : { truncated: true };
+}
+
+function truncateTranscriptText(text: string): string {
+	if (!text) return "";
+	return truncateTail(text, {
+		maxBytes: TRANSCRIPT_MAX_TOOL_OUTPUT_BYTES,
+		maxLines: TRANSCRIPT_MAX_TOOL_OUTPUT_LINES,
+	}).content;
+}
+
+/**
+ * Streams a standard OMP child session `.jsonl` transcript (`<artifactsDir>/<id>.jsonl`)
+ * so Herdr / Herdrup Chat view can:
+ * - open live and finished `agy` subagent transcripts (`has_transcript: true`),
+ * - display the resolved `agy-cli/<model>` via `model_change`,
+ * - show live tool intents via `tool_execution_start`, and
+ * - settle completed/failed/aborted runs via `session_exit` even when `wait` consumes `async-result`.
+ *
+ * All filesystem errors are isolated and disable further writes so transcript I/O can never
+ * fail or reject a subagent run.
+ */
+class AgyTranscriptWriter {
+	readonly filePath: string;
+	readonly #cwd: string;
+	readonly #parentSession?: string;
+	readonly #agentId: string;
+	#queue: Promise<void> = Promise.resolve();
+	#disabled = false;
+	#closed = false;
+	#entrySeq = 0;
+	#lastEntryId: string | null = null;
+	#lastModel: string;
+
+	constructor(params: {
+		filePath: string;
+		cwd: string;
+		parentSession?: string;
+		agentId: string;
+		initialModel: string;
+	}) {
+		this.filePath = params.filePath;
+		this.#cwd = params.cwd;
+		this.#parentSession = params.parentSession;
+		this.#agentId = params.agentId;
+		this.#lastModel = params.initialModel;
+
+		const nowIso = new Date().toISOString();
+		const header = {
+			type: "session",
+			version: 3,
+			id: crypto.randomUUID(),
+			timestamp: nowIso,
+			cwd: this.#cwd,
+			...(this.#parentSession ? { parentSession: this.#parentSession } : {}),
+		};
+		const modelEntry = this.#buildEntry("model_change", nowIso, {
+			model: params.initialModel,
+		});
+		const initialPayload = `${JSON.stringify(header)}\n${JSON.stringify(modelEntry)}\n`;
+
+		this.#queue = this.#queue.then(async () => {
+			if (this.#disabled) return;
+			try {
+				await fs.writeFile(this.filePath, initialPayload, { encoding: "utf8", mode: 0o600 });
+			} catch (err) {
+				this.#disabled = true;
+				logger.warn("agy transcript init failed", {
+					id: this.#agentId,
+					path: this.filePath,
+					error: formatErrorMessage(err),
+				});
+			}
+		});
+	}
+
+	static createIfEnabled(params: {
+		artifactsDir?: string;
+		id: string;
+		cwd: string;
+		parentSession?: string | null;
+		initialModel: string;
+	}): AgyTranscriptWriter | undefined {
+		if (!params.artifactsDir) return undefined;
+		if (
+			!SAFE_TRANSCRIPT_ID_RE.test(params.id) ||
+			params.id === "." ||
+			params.id === ".." ||
+			params.id.includes("..")
+		) {
+			return undefined;
+		}
+		return new AgyTranscriptWriter({
+			filePath: path.join(params.artifactsDir, `${params.id}.jsonl`),
+			cwd: params.cwd,
+			parentSession: params.parentSession ?? undefined,
+			agentId: params.id,
+			initialModel: params.initialModel,
+		});
+	}
+
+	async ready(): Promise<void> {
+		await this.#queue;
+	}
+
+	get activePath(): string | undefined {
+		return this.#disabled ? undefined : this.filePath;
+	}
+
+	#buildEntry(type: string, timestamp: string, extra: Record<string, unknown>): Record<string, unknown> {
+		const id = `agy-${++this.#entrySeq}`;
+		const parentId = this.#lastEntryId;
+		this.#lastEntryId = id;
+		// Keep `type` and `id` as the first two keys so Herdr's 256-byte prefix intactness check hits directly.
+		return { type, id, parentId, timestamp, ...extra };
+	}
+
+	#enqueue(type: string, extra: Record<string, unknown>, timestamp = new Date().toISOString()): void {
+		if (this.#disabled || this.#closed) return;
+		const entry = this.#buildEntry(type, timestamp, extra);
+		let line: string;
+		try {
+			line = `${JSON.stringify(entry)}\n`;
+		} catch (err) {
+			logger.warn("agy transcript serialize failed", {
+				id: this.#agentId,
+				type,
+				error: formatErrorMessage(err),
+			});
+			return;
+		}
+		this.#queue = this.#queue.then(async () => {
+			if (this.#disabled) return;
+			try {
+				await fs.appendFile(this.filePath, line, { encoding: "utf8", mode: 0o600 });
+			} catch (err) {
+				this.#disabled = true;
+				logger.warn("agy transcript append failed", {
+					id: this.#agentId,
+					path: this.filePath,
+					error: formatErrorMessage(err),
+				});
+			}
+		});
+	}
+
+	recordModelChange(modelDisplay: string): void {
+		if (!modelDisplay || modelDisplay === this.#lastModel) return;
+		this.#lastModel = modelDisplay;
+		this.#enqueue("model_change", { model: modelDisplay });
+	}
+
+	recordUserPrompt(text: string): void {
+		const now = Date.now();
+		this.#enqueue(
+			"message",
+			{
+				message: {
+					role: "user",
+					content: [{ type: "text", text }],
+					timestamp: now,
+				},
+			},
+			new Date(now).toISOString(),
+		);
+	}
+
+	recordToolStart(params: {
+		callId: string;
+		toolName: string;
+		toolArgs: Record<string, unknown>;
+		intent: string;
+		precedingText?: string;
+	}): void {
+		const now = Date.now();
+		const iso = new Date(now).toISOString();
+		const content: Array<Record<string, unknown>> = [];
+		if (params.precedingText?.trim()) {
+			content.push({ type: "text", text: params.precedingText.trim() });
+		}
+		content.push({
+			type: "toolCall",
+			id: params.callId,
+			name: params.toolName,
+			arguments: params.toolArgs,
+		});
+		this.#enqueue(
+			"message",
+			{
+				message: {
+					role: "assistant",
+					content,
+					provider: "agy-cli",
+					model: this.#lastModel,
+					stopReason: "toolUse",
+					timestamp: now,
+				},
+			},
+			iso,
+		);
+		this.#enqueue(
+			"custom",
+			{
+				customType: "tool_execution_start",
+				data: {
+					toolCallId: params.callId,
+					toolName: params.toolName,
+					startedAt: iso,
+					intent: params.intent,
+				},
+			},
+			iso,
+		);
+	}
+
+	recordToolResult(params: { callId: string; toolName: string; output: string; isError?: boolean }): void {
+		const now = Date.now();
+		const bounded = truncateTranscriptText(params.output);
+		this.#enqueue(
+			"message",
+			{
+				message: {
+					role: "toolResult",
+					toolCallId: params.callId,
+					toolName: params.toolName,
+					isError: Boolean(params.isError),
+					content: bounded ? [{ type: "text", text: bounded }] : [],
+					timestamp: now,
+				},
+			},
+			new Date(now).toISOString(),
+		);
+	}
+
+	recordAssistantTurn(params: {
+		text: string;
+		stopReason: "stop" | "error" | "aborted";
+		errorMessage?: string;
+	}): void {
+		const now = Date.now();
+		const content: Array<Record<string, unknown>> = params.text ? [{ type: "text", text: params.text }] : [];
+		this.#enqueue(
+			"message",
+			{
+				message: {
+					role: "assistant",
+					content,
+					provider: "agy-cli",
+					model: this.#lastModel,
+					stopReason: params.stopReason,
+					...(params.errorMessage ? { errorMessage: params.errorMessage } : {}),
+					timestamp: now,
+				},
+			},
+			new Date(now).toISOString(),
+		);
+	}
+
+	async finish(params: {
+		status: "completed" | "failed" | "aborted";
+		text: string;
+		errorMessage?: string;
+		modelDisplay?: string;
+	}): Promise<void> {
+		if (this.#closed) {
+			await this.#queue;
+			return;
+		}
+		if (params.modelDisplay) {
+			this.recordModelChange(params.modelDisplay);
+		}
+		const stopReason: "stop" | "error" | "aborted" =
+			params.status === "completed" ? "stop" : params.status === "aborted" ? "aborted" : "error";
+		const finalText = params.text || params.errorMessage || (params.status === "aborted" ? "Cancelled" : "");
+		this.recordAssistantTurn({
+			text: finalText,
+			stopReason,
+			errorMessage: params.status === "completed" ? undefined : params.errorMessage,
+		});
+		const nowIso = new Date().toISOString();
+		this.#enqueue(
+			"custom",
+			{
+				customType: "session_exit",
+				data: {
+					reason: "dispose",
+					kind: "normal",
+					recordedAt: nowIso,
+				},
+			},
+			nowIso,
+		);
+		this.#closed = true;
+		await this.#queue;
+	}
+}
+
 /**
  * Execute a subagent via the official `agy -p --output-format stream-json` CLI while
  * preserving OMP's full `SingleResult`, `AgentProgress`, HUD lifecycle, and artifact contracts.
@@ -996,6 +1313,17 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	}
 
 	const initialResolvedModel = formatResolvedAgyModel(config.model);
+	const transcript = AgyTranscriptWriter.createIfEnabled({
+		artifactsDir: options.artifactsDir,
+		id,
+		cwd: runCwd,
+		parentSession: options.sessionFile,
+		initialModel: initialResolvedModel,
+	});
+	// Ensure the child transcript header exists on disk before announcing start so observers
+	// (e.g. Herdr Chat view) immediately see `has_transcript: true` and the resolved model.
+	await transcript?.ready();
+	const subtaskSessionFile = transcript?.activePath;
 	const progress: AgentProgress = {
 		index,
 		id,
@@ -1059,6 +1387,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			parentToolCallId: options.parentToolCallId,
 			detached: options.detached,
 			assignment,
+			...(subtaskSessionFile ? { sessionFile: subtaskSessionFile } : {}),
 			progress: { ...progress },
 		};
 		emitSubagentFrameSafely(
@@ -1109,6 +1438,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			detached: options.detached,
 			agentSource: agent.source,
 			description: options.description,
+			...(subtaskSessionFile ? { sessionFile: subtaskSessionFile } : {}),
 			status: "started" as const,
 			index,
 		},
@@ -1160,12 +1490,26 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				break;
 			}
 			const isFinalStep = i === stepPrompts.length - 1;
-			const basePrompt = buildAgyPrompt(options, stepPrompts[i]!, i === 0);
+			const stepPrompt = stepPrompts[i]!;
+			transcript?.recordUserPrompt(stepPrompt);
+			const basePrompt = buildAgyPrompt(options, stepPrompt, i === 0);
 			const fullPrompt =
 				isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt;
 			let liveStepRequests = 0;
 			let liveStepTokens = 0;
-			const activeToolsByStep = new Map<number, { tool: string; args: string; argsKey?: string; startMs: number }>();
+			let toolCallSeq = 0;
+			let pendingAssistantText = "";
+			const activeToolsByStep = new Map<
+				number,
+				{ callId: string; tool: string; args: string; argsKey?: string; startMs: number }
+			>();
+			const unindexedToolQueue: Array<{
+				callId: string;
+				tool: string;
+				args: string;
+				argsKey?: string;
+				startMs: number;
+			}> = [];
 
 			lastOutcome = await runSingleAgyStep({
 				binary: config.binary,
@@ -1187,6 +1531,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 							const display = formatResolvedAgyModel(ev.init.model);
 							progress.resolvedModel = display;
 							progress.resolvedModelIdentity = display;
+							transcript?.recordModelChange(display);
 							scheduleProgress();
 						}
 						return;
@@ -1200,14 +1545,28 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								const toolName = frameToolName || "tool";
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
 								const startedAt = Date.now();
+								const callId = `agy-call-${i}-${++toolCallSeq}`;
+								const activeEntry = {
+									callId,
+									tool: toolName,
+									args: summarized.args,
+									argsKey: summarized.argsKey,
+									startMs: startedAt,
+								};
 								if (stepKey !== undefined) {
-									activeToolsByStep.set(stepKey, {
-										tool: toolName,
-										args: summarized.args,
-										argsKey: summarized.argsKey,
-										startMs: startedAt,
-									});
+									activeToolsByStep.set(stepKey, activeEntry);
+								} else {
+									unindexedToolQueue.push(activeEntry);
 								}
+								const intent = summarized.args ? `${toolName}: ${summarized.args}` : toolName;
+								transcript?.recordToolStart({
+									callId,
+									toolName,
+									toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, summarized.args),
+									intent,
+									precedingText: pendingAssistantText,
+								});
+								pendingAssistantText = "";
 								progress.currentTool = toolName;
 								progress.currentToolArgs = summarized.args;
 								progress.currentToolArgsKey = summarized.argsKey;
@@ -1215,12 +1574,31 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								progress.streaming = undefined;
 								scheduleProgress();
 							} else if (su.state === "DONE") {
-								const prior = stepKey !== undefined ? activeToolsByStep.get(stepKey) : undefined;
+								const prior =
+									stepKey !== undefined ? activeToolsByStep.get(stepKey) : unindexedToolQueue.shift();
 								if (stepKey !== undefined) activeToolsByStep.delete(stepKey);
 								const resolvedName = frameToolName || prior?.tool || "tool";
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
 								const resolvedArgs = summarized.args || prior?.args || "";
 								const resolvedArgsKey = summarized.argsKey ?? prior?.argsKey;
+								let callId = prior?.callId;
+								if (!callId) {
+									callId = `agy-call-${i}-${++toolCallSeq}`;
+									const intent = resolvedArgs ? `${resolvedName}: ${resolvedArgs}` : resolvedName;
+									transcript?.recordToolStart({
+										callId,
+										toolName: resolvedName,
+										toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, resolvedArgs),
+										intent,
+										precedingText: pendingAssistantText,
+									});
+									pendingAssistantText = "";
+								}
+								transcript?.recordToolResult({
+									callId,
+									toolName: resolvedName,
+									output: su.tool_info?.output ?? "",
+								});
 								progress.toolCount += 1;
 								progress.recentTools.push({
 									tool: resolvedName,
@@ -1257,6 +1635,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 						} else if (su.step_type === "agent_response") {
 							if (su.text_delta) {
 								appendRecentText(su.text_delta);
+								pendingAssistantText += su.text_delta;
 							}
 							if (su.state === "ACTIVE") {
 								progress.streaming = { kind: "text" };
@@ -1300,9 +1679,15 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				const display = formatResolvedAgyModel(lastOutcome.model);
 				progress.resolvedModel = display;
 				progress.resolvedModelIdentity = display;
+				transcript?.recordModelChange(display);
 			}
 			if (lastOutcome.exitCode !== 0 || lastOutcome.aborted) {
 				break;
+			}
+			// For intermediate steps in a multi-step run, record the step's completed reply
+			// before the next step's user prompt is appended.
+			if (!isFinalStep && lastOutcome.response) {
+				transcript?.recordAssistantTurn({ text: lastOutcome.response, stopReason: "stop" });
 			}
 		}
 	} catch (err) {
@@ -1391,6 +1776,16 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	progress.currentToolStartMs = undefined;
 	progress.streaming = undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+
+	// Flush final assistant turn and `session_exit` to `<id>.jsonl` before announcing terminal
+	// lifecycle so observers (e.g. Herdr Chat view) immediately settle the subagent's status.
+	await transcript?.finish({
+		status: progress.status,
+		text: truncatedOutput,
+		errorMessage: error,
+		modelDisplay: progress.resolvedModel,
+	});
+
 	scheduleProgress(true);
 
 	emitSubagentFrameSafely(
@@ -1404,6 +1799,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			detached: options.detached,
 			agentSource: agent.source,
 			description: progress.description,
+			...(subtaskSessionFile ? { sessionFile: subtaskSessionFile } : {}),
 			status: progress.status,
 			index,
 		},

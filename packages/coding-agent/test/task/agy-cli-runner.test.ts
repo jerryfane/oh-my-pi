@@ -1158,4 +1158,162 @@ exit 0
 			process.off("unhandledRejection", onUnhandled);
 		}
 	}, 30_000);
+
+	it("streams Herdr-compatible child JSONL transcripts with model_change, tool calls, and session_exit", async () => {
+		const dir = await makeTempDir("omp-agy-transcript-");
+		const parentSession = path.join(dir, "parent-session.jsonl");
+		const artifactsDir = path.join(dir, "parent-session");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p1" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const toolBin = await createFakeAgyShell(
+			dir,
+			`printf '%s\\n' '{"event":"init","conversation_id":"conv-tr","init":{"model":"gemini-4-neon-medium"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"Checking files..."}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":1,"state":"ACTIVE","tool_name":"read_file","tool_info":{"parameters":{"Path":"src/app.ts"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":1,"state":"DONE","tool_name":"read_file","tool_info":{"parameters":{"Path":"src/app.ts"},"output":"export const x = 1;"}}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-tr","status":"SUCCESS","response":"All checked.","num_turns":2}}'
+exit 0
+`,
+			"fake-agy-transcript",
+		);
+
+		const bus = new EventBus();
+		const lifecycles: SubagentLifecyclePayload[] = [];
+		bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, p => lifecycles.push(p as SubagentLifecyclePayload));
+
+		const okRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Inspect src/app.ts and report",
+			index: 0,
+			id: "TranscriptOk",
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: bus,
+			settings: makeSettings(toolBin, { task: "default" }),
+		});
+		expect(okRes.exitCode).toBe(0);
+
+		const transcriptPath = path.join(artifactsDir, "TranscriptOk.jsonl");
+		expect(lifecycles.map(l => [l.status, l.sessionFile])).toEqual([
+			["started", transcriptPath],
+			["completed", transcriptPath],
+		]);
+
+		const lines = (await fs.readFile(transcriptPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		// Header must link back to exact parentSession for Herdr child_session() validation.
+		expect(lines[0]?.type).toBe("session");
+		expect(lines[0]?.version).toBe(3);
+		expect(lines[0]?.parentSession).toBe(parentSession);
+
+		// All non-header entries must form an intact linked parentId chain with unique ids.
+		let prevId: string | null = null;
+		for (const entry of lines.slice(1)) {
+			expect(typeof entry.id).toBe("string");
+			expect((entry.id as string).length).toBeGreaterThan(0);
+			expect(entry.parentId).toBe(prevId);
+			prevId = entry.id as string;
+		}
+
+		// Model changes include initial agy-cli/default and refined agy-cli/gemini-4-neon-medium.
+		const modelChanges = lines.filter(l => l.type === "model_change").map(l => l.model);
+		expect(modelChanges).toEqual(["agy-cli/default", "agy-cli/gemini-4-neon-medium"]);
+
+		// Contains user prompt, assistant toolCall + tool_execution_start intent, toolResult, final stop, and session_exit.
+		expect(
+			lines.some(
+				l =>
+					l.type === "message" &&
+					(l.message as Record<string, unknown>).role === "user" &&
+					JSON.stringify(l.message).includes("Inspect src/app.ts and report"),
+			),
+		).toBe(true);
+		const toolStart = lines.find(l => l.type === "custom" && l.customType === "tool_execution_start");
+		expect(toolStart).toBeDefined();
+		expect((toolStart?.data as Record<string, unknown>)?.intent).toBe("read_file: src/app.ts");
+		expect(
+			lines.some(
+				l =>
+					l.type === "message" &&
+					(l.message as Record<string, unknown>).role === "toolResult" &&
+					(l.message as Record<string, unknown>).toolName === "read_file" &&
+					JSON.stringify(l.message).includes("export const x = 1;"),
+			),
+		).toBe(true);
+
+		const lastMessage = lines.at(-2);
+		const lastEntry = lines.at(-1);
+		expect(lastMessage?.type).toBe("message");
+		expect((lastMessage?.message as Record<string, unknown>)?.stopReason).toBe("stop");
+		expect(lastEntry?.type).toBe("custom");
+		expect(lastEntry?.customType).toBe("session_exit");
+
+		// Failure path writes stopReason="error" before session_exit so Herdr marks it failed.
+		const failBin = await createFakeAgyShell(
+			dir,
+			`printf '%s\\n' '{"event":"init","conversation_id":"conv-fail","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-fail","status":"ERROR","error":"boom"}}'
+exit 1
+`,
+			"fake-agy-transcript-fail",
+		);
+		const failRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "fail cleanly",
+			index: 0,
+			id: "TranscriptFail",
+			artifactsDir,
+			sessionFile: parentSession,
+			settings: makeSettings(failBin, { task: "gemini-4-neon-low" }),
+		});
+		expect(failRes.exitCode).toBe(1);
+		const failLines = (await fs.readFile(path.join(artifactsDir, "TranscriptFail.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		expect((failLines.at(-2)?.message as Record<string, unknown>)?.stopReason).toBe("error");
+		expect(failLines.at(-1)?.customType).toBe("session_exit");
+
+		// Path traversal in id is safely refused without failing the subagent run.
+		const traversalRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "traversal guard",
+			index: 0,
+			id: "../escape",
+			artifactsDir,
+			sessionFile: parentSession,
+			settings: makeSettings(toolBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(traversalRes.exitCode).toBe(0);
+		expect(await Bun.file(path.join(dir, "escape.jsonl")).exists()).toBe(false);
+
+		// Unwritable artifactsDir (file where directory expected) disables transcript cleanly without failing the run.
+		const blockingFile = path.join(dir, "not-a-dir");
+		await fs.writeFile(blockingFile, "blocker");
+		const unwritableBus = new EventBus();
+		const unwritableLifecycles: SubagentLifecyclePayload[] = [];
+		unwritableBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, p => unwritableLifecycles.push(p as SubagentLifecyclePayload));
+		const unwritableRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "unwritable artifactsDir",
+			index: 0,
+			id: "TranscriptUnwritable",
+			artifactsDir: blockingFile,
+			sessionFile: parentSession,
+			eventBus: unwritableBus,
+			settings: makeSettings(toolBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(unwritableRes.exitCode).toBe(0);
+		expect(unwritableLifecycles.map(l => [l.status, l.sessionFile])).toEqual([
+			["started", undefined],
+			["completed", undefined],
+		]);
+	}, 30_000);
 });
