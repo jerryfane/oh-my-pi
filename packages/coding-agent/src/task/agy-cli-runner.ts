@@ -18,7 +18,7 @@ import { AgentRegistry } from "../registry/agent-registry";
 import { cfgSessionMaxCost } from "../session/settings";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { truncateTail } from "../tools/streaming-output";
-import { emitSubagentFrame } from "../utils/event-bus";
+import type { EventBus } from "../utils/event-bus";
 import { previewLine, shortenToolArgumentPaths, TRUNCATE_LENGTHS } from "../utils/render-utils";
 import type { ExecutorOptions } from "./executor";
 import { persistSubagentOutputArtifacts } from "./output-artifacts";
@@ -223,11 +223,44 @@ function isExecutableFile(candidate: string): boolean {
 }
 
 function formatErrorMessage(err: unknown): string {
-	if (err instanceof Error) return err.message;
 	try {
+		if (err instanceof Error) return String(err.message);
 		return String(err);
 	} catch {
 		return "unknown error";
+	}
+}
+
+function invokeObserverSafely(label: string, context: Record<string, unknown>, fn: () => unknown): void {
+	try {
+		const result = fn();
+		// Attach rejection handling for async/thenable observers without awaiting or delaying publication.
+		if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result) {
+			void Promise.resolve(result).catch(err => {
+				logger.warn(label, { ...context, error: formatErrorMessage(err) });
+			});
+		}
+	} catch (err) {
+		logger.warn(label, { ...context, error: formatErrorMessage(err) });
+	}
+}
+
+function emitSubagentFrameSafely(
+	eventBus: EventBus | undefined,
+	subagentEventBus: EventBus | undefined,
+	channel: string,
+	payload: unknown,
+	context: Record<string, unknown>,
+): void {
+	if (eventBus) {
+		invokeObserverSafely("agy eventBus emit failed", { ...context, channel, bus: "session" }, () =>
+			eventBus.emit(channel, payload),
+		);
+	}
+	if (subagentEventBus && subagentEventBus !== eventBus) {
+		invokeObserverSafely("agy subagentEventBus emit failed", { ...context, channel, bus: "observability" }, () =>
+			subagentEventBus.emit(channel, payload),
+		);
 	}
 }
 
@@ -378,9 +411,16 @@ function formatResolvedAgyModel(model: string | undefined): string {
 
 function abortReasonOf(signal: AbortSignal | undefined, fallback: string): string {
 	if (!signal?.aborted) return fallback;
-	const reason = signal.reason;
-	if (typeof reason === "string" && reason.trim()) return reason.trim();
-	if (reason instanceof Error && reason.message.trim()) return reason.message.trim();
+	try {
+		const reason = signal.reason;
+		if (typeof reason === "string" && reason.trim()) return reason.trim();
+		if (reason instanceof Error) {
+			const message = String(reason.message).trim();
+			if (message) return message;
+		}
+	} catch {
+		// Fall back if signal.reason or its getters throw.
+	}
 	return fallback;
 }
 
@@ -669,7 +709,7 @@ async function runSingleAgyStep(params: {
 			})
 			.catch(err => {
 				logger.warn("agy stdout reader failed", {
-					error: err instanceof Error ? err.message : String(err),
+					error: formatErrorMessage(err),
 				});
 			});
 
@@ -1000,15 +1040,9 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		refreshRecentOutput();
 		progress.durationMs = Date.now() - startTime;
 		if (onProgress) {
-			try {
-				onProgress({ ...progress });
-			} catch (err) {
-				logger.warn("agy onProgress callback threw", {
-					id,
-					status: progress.status,
-					error: formatErrorMessage(err),
-				});
-			}
+			invokeObserverSafely("agy onProgress callback failed", { id, status: progress.status }, () =>
+				onProgress({ ...progress }),
+			);
 		}
 		const progressPayload = {
 			index,
@@ -1020,15 +1054,13 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			assignment,
 			progress: { ...progress },
 		};
-		try {
-			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
-		} catch (err) {
-			logger.warn("agy progress event bus emit threw", {
-				id,
-				status: progress.status,
-				error: formatErrorMessage(err),
-			});
-		}
+		emitSubagentFrameSafely(
+			options.eventBus,
+			options.subagentEventBus,
+			TASK_SUBAGENT_PROGRESS_CHANNEL,
+			progressPayload,
+			{ id, status: progress.status },
+		);
 		lastProgressEmitMs = Date.now();
 	};
 
@@ -1059,8 +1091,11 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	};
 
 	// Emit lifecycle start event so OMP's Subagents (Alt+A) HUD registers the worker immediately.
-	try {
-		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+	emitSubagentFrameSafely(
+		options.eventBus,
+		options.subagentEventBus,
+		TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+		{
 			id,
 			agent: agent.name,
 			parentToolCallId: options.parentToolCallId,
@@ -1069,10 +1104,9 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			description: options.description,
 			status: "started" as const,
 			index,
-		});
-	} catch (err) {
-		logger.warn("agy start lifecycle emit threw", { id, error: formatErrorMessage(err) });
-	}
+		},
+		{ id, status: "started" },
+	);
 	scheduleProgress(true);
 
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
@@ -1203,20 +1237,16 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 									progress.currentToolArgsKey = undefined;
 									progress.currentToolStartMs = undefined;
 								}
-								try {
-									options.onToolResult?.({
-										tool: resolvedName,
-										text: su.tool_info?.output ?? "",
-										isError: false,
-									});
-								} catch (err) {
-									logger.warn("agy onToolResult callback threw", {
-										tool: resolvedName,
-										error: formatErrorMessage(err),
-									});
-								} finally {
-									scheduleProgress();
+								if (options.onToolResult) {
+									invokeObserverSafely("agy onToolResult callback failed", { id, tool: resolvedName }, () =>
+										options.onToolResult?.({
+											tool: resolvedName,
+											text: su.tool_info?.output ?? "",
+											isError: false,
+										}),
+									);
 								}
+								scheduleProgress();
 							}
 						} else if (su.step_type === "agent_response") {
 							if (su.text_delta) {
@@ -1343,8 +1373,11 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
-	try {
-		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+	emitSubagentFrameSafely(
+		options.eventBus,
+		options.subagentEventBus,
+		TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+		{
 			id,
 			agent: agent.name,
 			parentToolCallId: options.parentToolCallId,
@@ -1353,21 +1386,14 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			description: progress.description,
 			status: progress.status,
 			index,
-		});
-	} catch (err) {
-		logger.warn("agy terminal lifecycle emit threw", {
-			id,
-			status: progress.status,
-			error: formatErrorMessage(err),
-		});
-	}
+		},
+		{ id, status: progress.status },
+	);
 
 	if (outputPath) {
-		try {
+		invokeObserverSafely("agy setHistory failed", { id }, () => {
 			AgentRegistry.global().setHistory(id, { outputPath });
-		} catch (err) {
-			logger.warn("agy setHistory failed", { id, error: formatErrorMessage(err) });
-		}
+		});
 	}
 
 	const durationMs = Date.now() - startTime;

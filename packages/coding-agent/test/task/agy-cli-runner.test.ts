@@ -1004,37 +1004,88 @@ exit 0
 		expect(okResult.error).toBeUndefined();
 		expect(okLifecycle).toEqual(["started", "completed"]);
 
-		// Observer isolation: a throwing onProgress callback (both initial and terminal) must not
-		// suppress progress/lifecycle publication or replace the settled SingleResult.
-		for (const scenario of [
-			{ bin: resilientBin, expectedExit: 0, expectedLifecycle: "completed" as const },
-			{ bin: path.join(dir, "fake-agy-null-response"), expectedExit: 1, expectedLifecycle: "failed" as const },
-		]) {
-			const bus = new EventBus();
-			const lifecycle: string[] = [];
-			const progressStatuses: string[] = [];
-			bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
-				lifecycle.push((payload as SubagentLifecyclePayload).status);
+		// Observer isolation: throwing onProgress (including Error with throwing message getter),
+		// async rejecting onProgress, and a throwing primary session bus emit must not suppress
+		// observability bus publication, produce unhandled rejections, or replace the settled SingleResult.
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		try {
+			for (const scenario of [
+				{ bin: resilientBin, expectedExit: 0, expectedLifecycle: "completed" as const },
+				{ bin: path.join(dir, "fake-agy-null-response"), expectedExit: 1, expectedLifecycle: "failed" as const },
+			]) {
+				const sessionBus = new EventBus();
+				const origEmit = sessionBus.emit;
+				sessionBus.emit = (channel, data) => {
+					if (
+						channel === TASK_SUBAGENT_LIFECYCLE_CHANNEL &&
+						(data as SubagentLifecyclePayload).status !== "started"
+					) {
+						throw new Error("primary bus failed on terminal emit");
+					}
+					origEmit(channel, data);
+				};
+				const obsBus = new EventBus();
+				const obsLifecycle: string[] = [];
+				const obsProgressStatuses: string[] = [];
+				obsBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+					obsLifecycle.push((payload as SubagentLifecyclePayload).status);
+				});
+				obsBus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+					obsProgressStatuses.push((payload as SubagentProgressPayload).progress.status);
+				});
+				const hostileError = new Error("hidden");
+				Object.defineProperty(hostileError, "message", {
+					get() {
+						throw new Error("message getter exploded");
+					},
+				});
+				const res = await runSubprocess({
+					cwd: dir,
+					agent: makeAgent(),
+					task: "check hostile progress observer and failing primary bus",
+					index: 0,
+					id: `HostileObserver-${scenario.expectedLifecycle}`,
+					eventBus: sessionBus,
+					subagentEventBus: obsBus,
+					onProgress: () => {
+						throw hostileError;
+					},
+					settings: makeSettings(scenario.bin, { "*": "gemini-4-neon-low" }),
+				});
+				expect(res.exitCode).toBe(scenario.expectedExit);
+				expect(obsLifecycle).toEqual(["started", scenario.expectedLifecycle]);
+				expect(obsProgressStatuses).toContain("running");
+				expect(obsProgressStatuses.at(-1)).toBe(scenario.expectedLifecycle);
+			}
+
+			// Async rejecting onProgress must not trigger unhandledRejection.
+			const asyncBus = new EventBus();
+			const asyncLifecycle: string[] = [];
+			asyncBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+				asyncLifecycle.push((payload as SubagentLifecyclePayload).status);
 			});
-			bus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
-				progressStatuses.push((payload as SubagentProgressPayload).progress.status);
-			});
-			const res = await runSubprocess({
+			const asyncRes = await runSubprocess({
 				cwd: dir,
 				agent: makeAgent(),
-				task: "check throwing progress observer",
+				task: "check async rejecting progress observer",
 				index: 0,
-				id: `ThrowingObserver-${scenario.expectedLifecycle}`,
-				eventBus: bus,
-				onProgress: p => {
-					throw new Error(`observer exploded on ${p.status}`);
-				},
-				settings: makeSettings(scenario.bin, { "*": "gemini-4-neon-low" }),
+				id: "AsyncObserver-completed",
+				eventBus: asyncBus,
+				onProgress: (async (p: AgentProgress) => {
+					throw new Error(`async observer failed on ${p.status}`);
+				}) as unknown as (progress: AgentProgress) => void,
+				settings: makeSettings(resilientBin, { "*": "gemini-4-neon-low" }),
 			});
-			expect(res.exitCode).toBe(scenario.expectedExit);
-			expect(lifecycle).toEqual(["started", scenario.expectedLifecycle]);
-			expect(progressStatuses).toContain("running");
-			expect(progressStatuses.at(-1)).toBe(scenario.expectedLifecycle);
+			await Bun.sleep(20);
+			expect(asyncRes.exitCode).toBe(0);
+			expect(asyncLifecycle).toEqual(["started", "completed"]);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
 		}
 	}, 30_000);
 });
