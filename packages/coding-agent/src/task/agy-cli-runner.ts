@@ -592,6 +592,16 @@ async function runSingleAgyStep(params: {
 		// Wait for both tracked pipes and any pending post-exit descendant cleanup to settle
 		// (bounded by ptree's descendantDrainMs / timeout / abort cutoff).
 		await Promise.all([readStdout, cp.stderrDone.catch(() => {}), cp.drainDone.catch(() => {})]);
+		if (!aborted && cp.exitReason?.aborted) {
+			if (cp.exitReason instanceof ptree.TimeoutError) {
+				timedOut = true;
+				aborted = true;
+				abortReason = `Subagent exceeded task.maxRuntimeMs (${params.maxRuntimeMs}ms)`;
+			} else {
+				aborted = true;
+				abortReason = abortReason ?? abortReasonOf(params.abortSignal, "Cancelled");
+			}
+		}
 
 		stderrText = cp.peekStderr().trim();
 

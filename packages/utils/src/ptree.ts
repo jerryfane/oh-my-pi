@@ -518,24 +518,35 @@ export class ChildProcess<In extends InMask = InMask> {
 		if (
 			this.proc.exitCode !== null &&
 			this.#terminateGroup &&
-			this.#openPipeReaders > 0 &&
+			(this.#openPipeReaders > 0 || this.#drainDone !== undefined) &&
 			process.platform !== "win32"
 		) {
 			// Bun detached children are POSIX session/process-group leaders. If
 			// the leader has exited, the native Process handle cannot rediscover
-			// its PGID, but a pipe-holding descendant keeps that exact group alive.
+			// its PGID, but an open pipe or live post-exit drain proves that exact group is still alive.
+			this.#descendantsCleaned = true;
 			try {
 				process.kill(-this.proc.pid, "SIGKILL");
 			} catch {}
+			this.#clearDrainTimer();
 			this.#terminating = Promise.resolve();
 			return;
 		}
-		if (this.proc.exitCode !== null && this.#windowsRootProcess && this.#openPipeReaders > 0) {
+		if (
+			this.proc.exitCode !== null &&
+			this.#windowsRootProcess &&
+			(this.#openPipeReaders > 0 || this.#drainDone !== undefined)
+		) {
 			// The retained handle keeps the dead root PID reserved, making the
 			// Windows Toolhelp descendant walk identity-safe after root exit.
+			this.#descendantsCleaned = true;
 			this.#windowsRootProcess.killTree();
+			this.#clearDrainTimer();
 			this.#terminating = Promise.resolve();
 			return;
+		}
+		if (this.proc.exitCode !== null && this.#drainDone !== undefined) {
+			this.#clearDrainTimer();
 		}
 		if (!this.proc.killed) {
 			const options =
@@ -816,6 +827,11 @@ export class ChildProcess<In extends InMask = InMask> {
 			if (err instanceof Exception) exitError = err;
 			else throw err;
 		}
+		// Keep command timeout and abort signal active through post-exit descendant settlement
+		// on non-subreaper spawns (0ms no-op when no descendants remain).
+		if (!exitError?.aborted && !this.#hardKillTree && this.#descendantDrainMs !== undefined) {
+			await this.drainDone;
+		}
 		this.#clearTimeout();
 		if (!exitError) exitError = this.exitReason;
 		if (!exitError && this.exitCode !== null && this.exitCode !== 0) {
@@ -826,15 +842,9 @@ export class ChildProcess<In extends InMask = InMask> {
 		// native terminate() is graceful-first, and reporting before it finishes
 		// would leave timed-out descendants alive past the caller's budget.
 		if (exitError?.aborted && this.#terminating) await this.#terminating;
-		// When post-exit descendant drain is configured on a non-subreaper spawn,
-		// ensure any remaining same-group/child descendants settle or are killed
-		// before wait() returns (0ms no-op when no descendants remain).
-		if (!exitError?.aborted && !this.#hardKillTree && this.#descendantDrainMs !== undefined) {
-			await this.drainDone;
-		}
 
 		const exitCode = this.exitCode ?? (exitError && !exitError.aborted ? exitError.exitCode : null);
-		const ok = exitCode === 0;
+		const ok = !exitError && exitCode === 0;
 
 		if (exitError) {
 			if ((exitError.aborted && !allowAbort) || (!exitError.aborted && !allowNonZero)) throw exitError;
@@ -852,7 +862,7 @@ export class ChildProcess<In extends InMask = InMask> {
 			// The { once: true } listener has removed itself at this point.
 			attached = false;
 			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			if (rootRunning || this.#openPipeReaders > 0) {
+			if (rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined) {
 				this.#abortRegistrations?.delete(sync);
 			}
 			this.kill(new AbortError(signal.reason, "<cancelled>"));
@@ -860,7 +870,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		};
 		const sync = () => {
 			const rootRunning = this.proc.exitCode === null && this.proc.signalCode === null;
-			const active = rootRunning || this.#openPipeReaders > 0;
+			const active = rootRunning || this.#openPipeReaders > 0 || this.#drainDone !== undefined;
 			if (signal.aborted) {
 				if (active) onAbort();
 				return;
@@ -1033,7 +1043,8 @@ export class ChildProcess<In extends InMask = InMask> {
 			// group still has a live member; this avoids stale-PGID reuse.
 			if (
 				this.proc.exitCode === null ||
-				(this.#openPipeReaders > 0 && (this.#terminateGroup || this.#windowsRootProcess))
+				((this.#openPipeReaders > 0 || this.#drainDone !== undefined) &&
+					(this.#terminateGroup || this.#windowsRootProcess))
 			) {
 				this.kill(new TimeoutError(ms, this.#stderrTail), -1);
 			}

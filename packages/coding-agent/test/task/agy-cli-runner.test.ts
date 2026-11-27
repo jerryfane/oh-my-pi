@@ -6,6 +6,7 @@ import { Settings } from "../../src/config/settings";
 import { CostGate } from "../../src/session/cost-gate";
 import { resolveAgySubagentConfig } from "../../src/task/agy-cli-runner";
 import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "../../src/task/executor";
+import { runIsolatedSubprocess } from "../../src/task/isolation-runner";
 import type { AgentProgress } from "../../src/task/task-details";
 import type { AgentDefinition, SubagentLifecyclePayload, SubagentProgressPayload } from "../../src/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../../src/task/types";
@@ -418,13 +419,13 @@ if (!conv) {
 			"fake-agy-steps",
 		);
 
-		// 90,000-byte multiline prompt (< 96 KiB raw, > 128 KiB JSON-encoded for Linux subreaper) must spill instead of E2BIG
-		const multilinePrompt = "a\n".repeat(45_000);
+		// Portable spill (> 96 KiB direct Unix argv limit) works on all platforms
+		const hugePrompt = "a\n".repeat(55_000);
 		const result = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
-			task: multilinePrompt,
-			steps: [multilinePrompt, "Step 2: wrap up"],
+			task: hugePrompt,
+			steps: [hugePrompt, "Step 2: wrap up"],
 			index: 0,
 			id: "MultiStep",
 			artifactsDir: dir,
@@ -449,6 +450,26 @@ if (!conv) {
 		const leftovers = (await fs.readdir(dir)).filter(f => f.includes("agy-prompt-"));
 		expect(leftovers).toEqual([]);
 
+		// Linux-only subreaper JSON-env transport: a 90,000-byte multiline prompt (< 96 KiB raw, > 128 KiB JSON-encoded) must spill instead of E2BIG
+		if (process.platform === "linux") {
+			const linuxMultilinePrompt = "a\n".repeat(45_000);
+			const linuxSpillRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: linuxMultilinePrompt,
+				index: 0,
+				id: "LinuxJsonEnvSpill",
+				artifactsDir: dir,
+				settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
+			});
+			expect(linuxSpillRes.exitCode).toBe(0);
+			const allCalls = (await fs.readFile(logPath, "utf8"))
+				.trim()
+				.split("\n")
+				.map(l => JSON.parse(l) as { printLen: number });
+			expect(allCalls.at(-1)?.printLen).toBeLessThan(1024);
+		}
+
 		// Single-step partial step_update usage preserves latest per-request contextTokens separately from aggregate usage
 		const singlePartial = await runSubprocess({
 			cwd: dir,
@@ -471,7 +492,7 @@ if (!conv) {
 		const spillFail = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
-			task: multilinePrompt,
+			task: hugePrompt,
 			index: 0,
 			id: "SpillFail",
 			artifactsDir: path.join(dir, "missing-nonexistent-dir"),
@@ -823,5 +844,79 @@ emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCES
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
 		}
+
+		// 7. Isolated agy task with omitted keepAlive must NOT tear down the workspace before run-end patch capture
+		const isoRoot = await makeTempDir("agy-runner-iso-repo-");
+		const isoArtifacts = path.join(isoRoot, "artifacts");
+		await fs.mkdir(isoArtifacts, { recursive: true });
+		const initGit = Bun.spawnSync(["git", "init", "-q"], { cwd: isoRoot });
+		expect(initGit.exitCode).toBe(0);
+		await fs.writeFile(path.join(isoRoot, "base.txt"), "initial\n");
+		Bun.spawnSync(["git", "config", "user.email", "test@example.com"], { cwd: isoRoot });
+		Bun.spawnSync(["git", "config", "user.name", "Test"], { cwd: isoRoot });
+		Bun.spawnSync(["git", "add", "base.txt"], { cwd: isoRoot });
+		Bun.spawnSync(["git", "commit", "-q", "-m", "init"], { cwd: isoRoot });
+
+		const isoWorkspaceDir = path.join(isoRoot, "isolated-wt");
+		const isoWorktreeAdd = Bun.spawnSync(["git", "worktree", "add", "-q", "--detach", isoWorkspaceDir], {
+			cwd: isoRoot,
+		});
+		expect(isoWorktreeAdd.exitCode).toBe(0);
+		const isoWriterBin = await createFakeAgyShell(
+			dir,
+			`printf 'from-agy\\n' > created.txt
+printf '%s\\n' '{"event":"init","conversation_id":"conv-iso","init":{"model":"gemini-4-neon-low"}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-iso","status":"SUCCESS","response":"wrote created.txt","num_turns":1}}'
+exit 0
+`,
+			"fake-agy-iso-writer",
+		);
+		const order: string[] = [];
+		const isoResult = await runIsolatedSubprocess({
+			context: { repoRoot: isoRoot },
+			agentId: "IsoAgyWorker",
+			artifactsDir: isoArtifacts,
+			mergeMode: "patch",
+			openWorkspace: async () => ({
+				dir: isoWorkspaceDir,
+				backend: "rcopy",
+				cleanup: async () => {
+					order.push("cleanup");
+					await fs.rm(isoWorkspaceDir, { recursive: true, force: true });
+				},
+				retain: async () => ({ dir: isoWorkspaceDir, sidecarOk: true }),
+			}),
+			baseOptions: {
+				cwd: isoRoot,
+				agent: makeAgent(),
+				task: "write created.txt",
+				index: 0,
+				id: "IsoAgyWorker",
+				artifactsDir: isoArtifacts,
+				settings: makeSettings(isoWriterBin, { "*": "gemini-4-neon-low" }),
+			},
+			buildFailureResult: err => ({
+				index: 0,
+				id: "IsoAgyWorker",
+				agent: "task",
+				agentSource: "bundled",
+				task: "write created.txt",
+				exitCode: 1,
+				output: "",
+				stderr: String(err),
+				truncated: false,
+				durationMs: 0,
+				tokens: 0,
+				requests: 0,
+				error: String(err),
+			}),
+		});
+		expect(isoResult.exitCode).toBe(0);
+		expect(isoResult.error).toBeUndefined();
+		expect(isoResult.patchPath).toBeDefined();
+		const capturedPatch = await fs.readFile(isoResult.patchPath!, "utf8");
+		expect(capturedPatch).toContain("created.txt");
+		expect(capturedPatch).toContain("+from-agy");
+		expect(order).toEqual(["cleanup"]);
 	}, 30_000);
 });

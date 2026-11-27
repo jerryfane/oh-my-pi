@@ -652,16 +652,17 @@ ${createLinuxSubreaperScript()}
 					}
 				}
 
-				// 7. Backward wall-clock jump (Date.now) does not extend the monotonic post-exit drain deadline
-				//    Use a setsid stdout holder outside the managed group so it stays alive until the late reader starts.
+				// 7. Backward wall-clock jump (Date.now) does not extend the monotonic post-exit drain deadline.
+				//    Use detached:false with a finite-lived inherited stdout holder (portable across macOS/Linux without setsid)
+				//    so the holder remains alive when the late reader starts.
 				const holderPidFile = path.join(dir, "clock-holder.pid");
 				const cpClock = spawn(
 					[
 						"/bin/sh",
 						"-c",
-						`setsid sh -c 'echo $$ > ${JSON.stringify(holderPidFile)}; sleep 0.6' </dev/null 2>/dev/null & printf clock-ok; exit 0`,
+						`(sh -c 'echo $$ > ${JSON.stringify(holderPidFile)}; sleep 0.6' </dev/null 2>/dev/null) & printf clock-ok; exit 0`,
 					],
-					{ detached: true, subreaper: false, descendantDrainMs: 50 },
+					{ detached: false, subreaper: false, descendantDrainMs: 50 },
 				);
 				expect(await cpClock.exited).toBe(0);
 				await Bun.sleep(130);
@@ -674,7 +675,7 @@ ${createLinuxSubreaperScript()}
 					10,
 				);
 				expect(holderPid).toBeGreaterThan(1);
-				// Confirm the external stdout holder is still alive when the late reader starts
+				// Confirm the stdout holder is still alive when the late reader starts
 				expect(() => process.kill(holderPid, 0)).not.toThrow();
 				const realDateNow = Date.now;
 				const dateNowSpy = spyOn(Date, "now").mockImplementation(() => realDateNow() - 10_000);
@@ -715,6 +716,43 @@ process.stdout.write(res.stdout + ":" + res.exitCode);
 				expect(callerOut).toBe("root-ok:0");
 				await Bun.sleep(550);
 				expect(await Bun.file(closedPipeSentinel).exists()).toBe(false);
+
+				// 9. Closed-pipe descendant settlement honors both command timeout and AbortSignal
+				for (const kind of ["timeout", "abort"] as const) {
+					const cutSentinel = path.join(dir, `closed-pipe-${kind}.txt`);
+					const ac = new AbortController();
+					const tCut = performance.now();
+					const cpCut = spawn(
+						[
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.4 && echo lived > ${JSON.stringify(cutSentinel)}) </dev/null >/dev/null 2>&1 & printf cut-ok; exit 0`,
+						],
+						{
+							detached: true,
+							subreaper: false,
+							descendantDrainMs: 750,
+							...(kind === "timeout" ? { timeout: 150 } : { signal: ac.signal }),
+						},
+					);
+					const abortTimer = kind === "abort" ? setTimeout(() => ac.abort("stop-drain"), 150) : undefined;
+					let caught: unknown;
+					try {
+						await cpCut.wait();
+					} catch (err) {
+						caught = err;
+					} finally {
+						if (abortTimer) clearTimeout(abortTimer);
+					}
+					expect(performance.now() - tCut).toBeLessThan(500);
+					if (kind === "timeout") {
+						expect(caught).toBeInstanceOf(TimeoutError);
+					} else {
+						expect(caught).toBeInstanceOf(AbortError);
+					}
+					await Bun.sleep(450);
+					expect(await Bun.file(cutSentinel).exists()).toBe(false);
+				}
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}

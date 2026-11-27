@@ -33,6 +33,7 @@ import { generateCommitMessage } from "../utils/commit-message-generator";
 import { patchSectionPaths, splitPatchSections } from "../utils/git-diff-paths";
 import { trackLateCleanup } from "../utils/late-cleanup";
 import { withRepoLock } from "../utils/repo-lock";
+import { resolveAgySubagentConfig } from "./agy-cli-runner";
 import type { ExecutorOptions } from "./executor";
 import { runSubprocess } from "./executor";
 import { needsNativeTeardown, writeRetainedBackend } from "./isolation-ownership";
@@ -588,12 +589,15 @@ export async function runIsolatedSubprocess(opts: IsolatedRunOptions): Promise<S
 				deferredCleanup = completion;
 				opts.baseOptions.onCleanupDeferred?.(completion);
 			},
-			// One-shot runs get `releaseBase` (never touches the worktree): their
-			// `finalizeSubagentLifecycle` calls `onRelease` before this function's
-			// post-run capture, so the handle must survive until the `finally`
-			// below cleans it up. Only kept-alive runs hand full capture+cleanup
-			// (`releaseIsolation`) to the agent lifecycle.
-			onRelease: opts.baseOptions.keepAlive === false ? releaseBase : releaseIsolation,
+			// One-shot runs (explicit `keepAlive: false` or external `agy` CLI subagents, which
+			// never register a kept-alive agent handle) get `releaseBase` (never touches the
+			// worktree): their finalize path calls `onRelease` before this function's post-run
+			// capture, so the handle must survive until the `finally` below cleans it up. Only
+			// kept-alive native runs hand full capture+cleanup (`releaseIsolation`) to the agent lifecycle.
+			onRelease:
+				opts.baseOptions.keepAlive === false || resolveAgySubagentConfig(opts.baseOptions) !== undefined
+					? releaseBase
+					: releaseIsolation,
 			deferIrcWakeRelease: release => {
 				releaseIrcWakes = release;
 			},
