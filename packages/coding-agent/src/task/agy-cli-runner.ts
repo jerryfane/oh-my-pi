@@ -11,16 +11,17 @@ import * as fsSync from "node:fs";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { $env, $which, isRecord, logger } from "@oh-my-pi/pi-utils";
-import { AgentRegistry } from "../registry/agent-registry";
-import { writeArtifact } from "../session/artifacts";
+import { $env, $which, isRecord, logger, ptree } from "@oh-my-pi/pi-utils";
+import { cfgOffline } from "../config/auxiliary-model-policy";
 import { Settings } from "../config/settings";
+import { AgentRegistry } from "../registry/agent-registry";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { truncateTail } from "../tools/streaming-output";
 import { emitSubagentFrame } from "../utils/event-bus";
 import { previewLine, shortenToolArgumentPaths, TRUNCATE_LENGTHS } from "../utils/render-utils";
+import { type ExecutorOptions, persistSubagentOutputArtifacts } from "./executor";
 import { isReadOnlyAgent } from "./read-only-policy";
-import { cfgTaskAgyBinary, cfgTaskAgySubagents, cfgTaskMaxRuntimeMs, validateAgySubagents } from "./settings";
+import { cfgTaskAgyBinary, cfgTaskAgySubagents, cfgTaskMaxRuntimeMs } from "./settings";
 import type { AgentProgress, SingleResult, StructuredSubagentOutput } from "./task-details";
 import {
 	MAX_OUTPUT_BYTES,
@@ -28,17 +29,16 @@ import {
 	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 } from "./types";
-import type { ExecutorOptions } from "./executor";
 
-const PROGRESS_COALESCE_MS = 500;
-const KILL_GRACE_MS = 3_000;
+const PROGRESS_COALESCE_MS = 150;
+const POST_ABORT_DRAIN_MS = 1_000;
 const RECENT_TOOLS_LIMIT = 10;
 const RECENT_OUTPUT_LINES = 8;
+const RECENT_OUTPUT_TAIL_BYTES = 8 * 1024;
 /** Keep argv strings safely below Linux MAX_ARG_STRLEN (128 KiB). */
 const MAX_INLINE_PROMPT_BYTES = 96 * 1024;
 const DISABLED_VALUES = new Set(["off", "false", "none", "disabled", "0"]);
 const DEFAULT_MODEL_VALUES = new Set(["default", "auto", "true", "on", "1"]);
-const MODEL_EFFORT_SUFFIX_RE = /-(low|medium|high|xhigh|max)$/;
 
 export interface AgySubagentConfig {
 	binary: string;
@@ -135,11 +135,13 @@ function resolveAgyBinaryPath(settings: Settings): string | undefined {
 	return $which("agy") ?? undefined;
 }
 
-function applyCoarseEffort(model: string, effort: ExecutorOptions["effort"]): string {
-	if (!effort || MODEL_EFFORT_SUFFIX_RE.test(model)) return model;
-	if (model.startsWith("gpt-oss-") || model.startsWith("gemini-pro-orchestrator")) return model;
-	const suffix = effort === "lo" ? "low" : effort === "med" ? "medium" : "high";
-	return `${model}-${suffix}`;
+function normalizeSelector(raw: unknown): string | undefined {
+	if (typeof raw === "boolean") return raw ? "default" : "off";
+	if (typeof raw === "string") {
+		const trimmed = raw.trim();
+		return trimmed.length > 0 ? trimmed : undefined;
+	}
+	return undefined;
 }
 
 /**
@@ -150,25 +152,32 @@ export function resolveAgySubagentConfig(options: ExecutorOptions): AgySubagentC
 	const settings = options.settings;
 	if (!settings) return undefined;
 
-	// Preserve strict OMP-only capabilities and explicit caller model pins.
+	// Enforce OMP security, offline, transcript-epoch, and resumable-lifecycle boundaries natively.
+	if (cfgOffline.get(settings)) return undefined;
+	if (isReadOnlyAgent(options.agent)) return undefined;
 	if (options.perCallModelGrants !== undefined) return undefined;
 	if (options.restrictToolNames === true) return undefined;
 	if (options.customTools !== undefined && options.customTools.length > 0) return undefined;
 	if (options.workPoolYieldItems !== undefined && options.workPoolYieldItems.length > 0) return undefined;
+	if (options.keepAlive === true) return undefined;
 	if (options.topicBoard !== undefined) return undefined;
+	if (options.launchPreamble !== undefined) return undefined;
+	if (options.launchSignal !== undefined) return undefined;
+	if (options.onFirstTurn !== undefined) return undefined;
 
-	const mapping = validateAgySubagents(cfgTaskAgySubagents.get(settings));
+	const rawMapping: unknown = cfgTaskAgySubagents.get(settings);
+	if (!isRecord(rawMapping)) return undefined;
 	const agentName = options.agent.name;
-	const rawSelector = Object.hasOwn(mapping, agentName)
-		? mapping[agentName]
-		: Object.hasOwn(mapping, "*")
-			? mapping["*"]
+	const rawEntry = Object.hasOwn(rawMapping, agentName)
+		? rawMapping[agentName]
+		: Object.hasOwn(rawMapping, "*")
+			? rawMapping["*"]
 			: undefined;
-	if (!rawSelector) return undefined;
+	const normalized = normalizeSelector(rawEntry);
+	if (!normalized) return undefined;
 
-	const normalized = rawSelector.trim();
 	const lower = normalized.toLowerCase();
-	if (!normalized || DISABLED_VALUES.has(lower)) return undefined;
+	if (DISABLED_VALUES.has(lower)) return undefined;
 
 	const binary = resolveAgyBinaryPath(settings);
 	if (!binary) {
@@ -178,23 +187,19 @@ export function resolveAgySubagentConfig(options: ExecutorOptions): AgySubagentC
 		return undefined;
 	}
 
-	const model = DEFAULT_MODEL_VALUES.has(lower) ? undefined : applyCoarseEffort(normalized, options.effort);
+	const model = DEFAULT_MODEL_VALUES.has(lower) ? undefined : normalized;
 	return { binary, model };
 }
 
 export function buildAgyPrompt(options: ExecutorOptions, stepPrompt: string, includeHeader: boolean): string {
 	const sections: string[] = [];
 	if (includeHeader) {
-		const roleLines: string[] = [
-			`You are executing a delegated "${options.agent.name}" subagent task inside a larger workflow.`,
-			"Return a concise, accurate final answer directly addressing the assignment (no meta-commentary about being a subagent).",
-		];
-		if (isReadOnlyAgent(options.agent)) {
-			roleLines.push(
-				"IMPORTANT: This agent role is READ-ONLY. Do NOT create, edit, or delete repository files and do NOT run mutating commands.",
-			);
-		}
-		sections.push(roleLines.join("\n"));
+		sections.push(
+			[
+				`You are executing a delegated "${options.agent.name}" subagent task inside a larger workflow.`,
+				"Return a concise, accurate final answer directly addressing the assignment (no meta-commentary about being a subagent).",
+			].join("\n"),
+		);
 
 		const agentSystemPrompt = options.agent.systemPrompt?.trim();
 		if (agentSystemPrompt) {
@@ -252,13 +257,6 @@ function summarizeToolArgs(
 	return { args: "" };
 }
 
-function inferContextWindow(model: string | undefined): number | undefined {
-	if (!model) return undefined;
-	if (model.startsWith("gpt-oss-")) return 131_072;
-	if (model.startsWith("gemini-") || model.startsWith("claude-")) return 1_000_000;
-	return undefined;
-}
-
 function formatResolvedAgyModel(model: string | undefined): string {
 	return model ? `agy-cli/${model}` : "agy-cli/default";
 }
@@ -299,14 +297,21 @@ function buildStepArgs(params: {
 	return args;
 }
 
+interface StepUsageTotals {
+	requests: number;
+	inputTokens: number;
+	outputTokens: number;
+	cacheReadTokens: number;
+	lastContextTokens?: number;
+}
+
 interface StepRunOutcome {
 	exitCode: number;
 	conversationId?: string;
 	model?: string;
 	response: string;
 	structuredOutput?: unknown;
-	usage?: AgyUsage;
-	numTurns?: number;
+	usage: StepUsageTotals;
 	error?: string;
 	stderr: string;
 	aborted: boolean;
@@ -328,54 +333,43 @@ async function runSingleAgyStep(params: {
 	onEvent: (event: AgyStreamEvent) => void;
 }): Promise<StepRunOutcome> {
 	let spillPromptPath: string | undefined;
-	let promptArg = params.promptText;
-	if (Buffer.byteLength(params.promptText, "utf8") > MAX_INLINE_PROMPT_BYTES) {
-		const spillDir = params.artifactsDir ?? os.tmpdir();
-		spillPromptPath = path.join(spillDir, `${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`);
-		await fs.writeFile(spillPromptPath, params.promptText, { mode: 0o600 });
-		promptArg = `Read the complete task instructions from ${spillPromptPath} and execute them thoroughly.`;
-	}
-
-	const cmd = buildStepArgs({
-		binary: params.binary,
-		model: params.model,
-		conversationId: params.conversationId,
-		additionalDirectories: params.additionalDirectories,
-		jsonSchema: params.jsonSchema,
-		promptArg,
-	});
-
-	let proc: ReturnType<typeof Bun.spawn> | undefined;
-	let killTimer: ReturnType<typeof setTimeout> | undefined;
 	let aborted = false;
 	let abortReason: string | undefined;
+	let conversationId = params.conversationId;
+	let model = params.model;
+	let streamedText = "";
+	let resultEvent: AgyStreamResult["result"] | undefined;
+	let stderrText = "";
+	let stepRequests = 0;
+	let stepInput = 0;
+	let stepOutput = 0;
+	let stepCacheRead = 0;
+	let stepLastContext: number | undefined;
+	let cp: ptree.ChildProcess | undefined;
+	let cancelStdout: (() => Promise<void>) | undefined;
 
-	const terminateChild = () => {
-		if (!proc) return;
-		try {
-			proc.kill("SIGTERM");
-		} catch {}
-		if (!killTimer) {
-			killTimer = setTimeout(() => {
-				try {
-					proc?.kill("SIGKILL");
-				} catch {}
-			}, KILL_GRACE_MS);
-		}
-	};
+	const zeroUsage = (): StepUsageTotals => ({
+		requests: stepRequests,
+		inputTokens: stepInput,
+		outputTokens: stepOutput,
+		cacheReadTokens: stepCacheRead,
+		lastContextTokens: stepLastContext,
+	});
 
 	const onAbort = () => {
 		aborted = true;
 		abortReason = abortReasonOf(params.abortSignal, "Cancelled");
-		terminateChild();
+		if (cp) {
+			cp.kill(new ptree.AbortError(abortReason, cp.peekStderr()));
+		}
 	};
 
 	if (params.abortSignal.aborted) {
 		onAbort();
-		if (spillPromptPath) await fs.rm(spillPromptPath, { force: true }).catch(() => {});
 		return {
 			exitCode: 1,
 			response: "",
+			usage: zeroUsage(),
 			error: abortReason,
 			stderr: abortReason ?? "Cancelled",
 			aborted: true,
@@ -385,41 +379,52 @@ async function runSingleAgyStep(params: {
 
 	params.abortSignal.addEventListener("abort", onAbort, { once: true });
 
-	let conversationId = params.conversationId;
-	let model = params.model;
-	let streamedText = "";
-	let resultEvent: AgyStreamResult["result"] | undefined;
-	let stderrText = "";
-
 	try {
-		proc = Bun.spawn(cmd, {
-			cwd: params.cwd,
-			stdin: "ignore",
-			stdout: "pipe",
-			stderr: "pipe",
-			env: { ...Bun.env, AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
+		let promptArg = params.promptText;
+		if (Buffer.byteLength(params.promptText, "utf8") > MAX_INLINE_PROMPT_BYTES) {
+			const spillDir = params.artifactsDir ?? os.tmpdir();
+			spillPromptPath = path.join(spillDir, `${params.id}.agy-prompt-${params.stepIndex}-${Date.now()}.txt`);
+			await fs.writeFile(spillPromptPath, params.promptText, { mode: 0o600 });
+			promptArg = `Read the complete task instructions from ${spillPromptPath} and execute them thoroughly.`;
+		}
+
+		if (params.abortSignal.aborted) {
+			onAbort();
+			return {
+				exitCode: 1,
+				response: "",
+				usage: zeroUsage(),
+				error: abortReason,
+				stderr: abortReason ?? "Cancelled",
+				aborted: true,
+				abortReason,
+			};
+		}
+
+		const cmd = buildStepArgs({
+			binary: params.binary,
+			model: params.model,
+			conversationId: params.conversationId,
+			additionalDirectories: params.additionalDirectories,
+			jsonSchema: params.jsonSchema,
+			promptArg,
 		});
 
-		const stdoutStream = proc.stdout;
-		const stderrStream = proc.stderr;
-
-		const readStderr = (async () => {
-			if (!stderrStream || typeof stderrStream === "number") return;
-			const reader = stderrStream.getReader();
-			const decoder = new TextDecoder();
-			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					stderrText += decoder.decode(value, { stream: true });
-				}
-				stderrText += decoder.decode();
-			} catch {}
-		})();
+		// Supervise the entire process tree (detached + Linux subreaper) so abort/timeout kills descendants too.
+		cp = ptree.spawn(cmd, {
+			cwd: params.cwd,
+			stdin: "ignore",
+			detached: true,
+			subreaper: true,
+			signal: params.abortSignal,
+			stderr: "full",
+			env: { ...Bun.env, AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
+		});
+		cp.nothrow();
 
 		const readStdout = (async () => {
-			if (!stdoutStream || typeof stdoutStream === "number") return;
-			const reader = stdoutStream.getReader();
+			const reader = cp.stdout.getReader();
+			cancelStdout = () => reader.cancel();
 			const decoder = new TextDecoder();
 			let pending = "";
 			const handleLine = (rawLine: string) => {
@@ -429,9 +434,22 @@ async function runSingleAgyStep(params: {
 					if (parsed.conversation_id) conversationId = parsed.conversation_id;
 					if (parsed.init?.model) model = parsed.init.model;
 				} else if (parsed.event === "step_update") {
-					if (parsed.step_update?.conversation_id) conversationId = parsed.step_update.conversation_id;
-					if (parsed.step_update?.step_type === "agent_response" && parsed.step_update.text_delta) {
-						streamedText += parsed.step_update.text_delta;
+					const su = parsed.step_update;
+					if (su?.conversation_id) conversationId = su.conversation_id;
+					if (su?.step_type === "agent_response") {
+						if (su.text_delta) streamedText += su.text_delta;
+						if (su.state === "DONE") {
+							stepRequests += 1;
+							if (su.usage) {
+								const inp = su.usage.input_tokens ?? 0;
+								const out = su.usage.output_tokens ?? 0;
+								const cacheRead = su.usage.cache_read_tokens ?? 0;
+								stepInput += inp;
+								stepOutput += out;
+								stepCacheRead += cacheRead;
+								stepLastContext = inp + cacheRead;
+							}
+						}
 					}
 				} else if (parsed.event === "result") {
 					resultEvent = parsed.result;
@@ -456,27 +474,66 @@ async function runSingleAgyStep(params: {
 			} catch {}
 		})();
 
-		const exitCode = await proc.exited;
-		await Promise.allSettled([readStdout, readStderr]);
+		let exitCode = 1;
+		try {
+			exitCode = await cp.exited;
+		} catch (err) {
+			if (err instanceof ptree.AbortError || params.abortSignal.aborted) {
+				aborted = true;
+				abortReason = abortReason ?? abortReasonOf(params.abortSignal, "Cancelled");
+			} else {
+				exitCode = 1;
+			}
+		}
 
-		const statusIsError = resultEvent?.status !== undefined && resultEvent.status !== "SUCCESS";
+		// Bound post-exit stdout drain so an orphaned descendant holding stdout open cannot hang settlement.
+		const drainWinner = await Promise.race([
+			readStdout.then(() => "drained" as const),
+			Bun.sleep(POST_ABORT_DRAIN_MS).then(() => "timeout" as const),
+		]);
+		if (drainWinner === "timeout") {
+			await cancelStdout?.().catch(() => {});
+		}
+
+		stderrText = cp.peekStderr().trim();
+
+		// Reconcile per-step usage against the step's terminal result frame (when step_update omitted usage).
+		const resUsage = resultEvent?.usage;
+		const resTurns = resultEvent?.num_turns;
+		if (stepRequests === 0 && typeof resTurns === "number" && resTurns > 0) {
+			stepRequests = resTurns;
+		}
+		if (stepInput === 0 && stepOutput === 0 && resUsage) {
+			const inp = resUsage.input_tokens ?? 0;
+			const out = resUsage.output_tokens ?? 0;
+			const cacheRead = resUsage.cache_read_tokens ?? 0;
+			stepInput = inp;
+			stepOutput = out;
+			stepCacheRead = cacheRead;
+			if (inp + cacheRead > 0) stepLastContext = inp + cacheRead;
+		}
+
+		const hasTerminalSuccess = resultEvent !== undefined && resultEvent.status === "SUCCESS";
+		const statusIsError = resultEvent !== undefined && resultEvent.status !== "SUCCESS";
+		const missingResultOnZeroExit = !aborted && exitCode === 0 && !hasTerminalSuccess;
 		const finalResponse = resultEvent?.response !== undefined ? resultEvent.response : streamedText;
 		const errorMessage =
 			resultEvent?.error ||
 			(aborted ? abortReason : undefined) ||
 			(statusIsError ? `agy exited with status ${resultEvent?.status}` : undefined) ||
-			(exitCode !== 0 ? stderrText.trim() || `agy exited with code ${exitCode}` : undefined);
+			(missingResultOnZeroExit ? "agy exited without emitting a terminal result frame" : undefined) ||
+			(exitCode !== 0 ? stderrText || `agy exited with code ${exitCode}` : undefined);
 
+		const effectiveExitCode = aborted || statusIsError || missingResultOnZeroExit ? 1 : exitCode;
 		return {
-			exitCode: aborted ? 1 : statusIsError ? 1 : exitCode,
+			exitCode: effectiveExitCode,
 			conversationId,
 			model,
 			response: finalResponse,
 			structuredOutput: resultEvent?.structured_output,
-			usage: resultEvent?.usage,
-			numTurns: resultEvent?.num_turns,
+			usage: zeroUsage(),
 			error: errorMessage,
-			stderr: stderrText.trim() || errorMessage || "",
+			stderr: stderrText || errorMessage || "",
 			aborted,
 			abortReason,
 		};
@@ -487,14 +544,17 @@ async function runSingleAgyStep(params: {
 			conversationId,
 			model,
 			response: streamedText,
+			usage: zeroUsage(),
 			error: aborted ? (abortReason ?? message) : message,
-			stderr: stderrText.trim() || message,
+			stderr: stderrText || message,
 			aborted,
 			abortReason,
 		};
 	} finally {
 		params.abortSignal.removeEventListener("abort", onAbort);
-		if (killTimer) clearTimeout(killTimer);
+		if (cp && cp.exitCode === null) {
+			cp.kill(new ptree.AbortError("agy step cleanup", cp.peekStderr()));
+		}
 		if (spillPromptPath) {
 			await fs.rm(spillPromptPath, { force: true }).catch(() => {});
 		}
@@ -538,8 +598,8 @@ function finalizeStructuredOutput(params: {
 		} catch {}
 	}
 
-	const { validator, error: schemaErr } = buildOutputValidator(params.outputSchema);
-	if (!validator || schemaErr) {
+	const { validator, normalized, error: schemaErr } = buildOutputValidator(params.outputSchema);
+	if (schemaErr || normalized === undefined) {
 		return {
 			rawOutput: params.rawOutput,
 			exitCode: params.exitCode,
@@ -549,6 +609,36 @@ function finalizeStructuredOutput(params: {
 				mode,
 				status: "unavailable",
 				...(schemaErr ? { error: schemaErr } : {}),
+			},
+		};
+	}
+
+	// Valid unconstrained schema (`true` / `{}`): accept any parsed JSON payload as valid.
+	if (!validator) {
+		if (parsedOk) {
+			const normalizedJson = JSON.stringify(candidate, null, 2);
+			return {
+				rawOutput: normalizedJson ?? params.rawOutput,
+				exitCode: 0,
+				error: params.error,
+				structuredOutput: {
+					source,
+					mode,
+					status: "valid",
+					data: candidate,
+				},
+			};
+		}
+		const invalidError = "Output schema validation failed: agy response was not valid JSON";
+		return {
+			rawOutput: params.rawOutput,
+			exitCode: mode === "strict" ? 1 : params.exitCode,
+			error: mode === "strict" ? invalidError : params.error,
+			structuredOutput: {
+				source,
+				mode,
+				status: "invalid",
+				error: invalidError,
 			},
 		};
 	}
@@ -583,7 +673,7 @@ function finalizeStructuredOutput(params: {
 			source,
 			mode,
 			status: "invalid",
-			...(parsedOk ? { data: candidate } : {}),
+			...(parsedOk ? { data: normalizedCandidate } : {}),
 			error: invalidError,
 		},
 	};
@@ -613,8 +703,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	const settings = options.settings ?? Settings.isolated();
 	const maxRuntimeMs = Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? cfgTaskMaxRuntimeMs.get(settings)) || 0));
 
-	if (signal?.aborted || options.launchSignal?.aborted) {
-		options.onFirstTurn?.({ kind: "cancelled" });
+	if (signal?.aborted) {
 		return {
 			index,
 			id,
@@ -655,7 +744,6 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		toolCount: 0,
 		requests: 0,
 		tokens: 0,
-		contextWindow: inferContextWindow(config.model),
 		cost: 0,
 		durationMs: 0,
 		modelOverride,
@@ -666,15 +754,27 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 
 	let lastProgressEmitMs = 0;
 	let progressTimer: ReturnType<typeof setTimeout> | null = null;
-	const recentTextChunks: string[] = [];
+	// Bounded rolling tail (matches native executor's newest-first 8-line preview without unbounded memory growth).
+	let recentOutputTail = "";
+	let recentOutputDirty = false;
+
+	const appendRecentText = (delta: string) => {
+		recentOutputTail += delta;
+		if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES * 2) {
+			recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
+		}
+		recentOutputDirty = true;
+	};
 
 	const refreshRecentOutput = () => {
-		const combined = recentTextChunks.join("");
-		const lines = combined
-			.split("\n")
-			.map(l => l.trimEnd())
-			.filter(l => l.length > 0);
-		progress.recentOutput = lines.slice(-RECENT_OUTPUT_LINES);
+		if (!recentOutputDirty) return;
+		recentOutputDirty = false;
+		const tail =
+			recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES
+				? recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES)
+				: recentOutputTail;
+		const filtered = tail.split("\n").filter(line => line.trim());
+		progress.recentOutput = filtered.slice(-RECENT_OUTPUT_LINES).reverse();
 	};
 
 	const emitProgressNow = () => {
@@ -736,15 +836,12 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 
 	const runAbort = new AbortController();
 	let runtimeExceeded = false;
-	const forwardAbort = (src: AbortSignal | undefined, fallback: string) => () => {
+	const onSignalAbort = () => {
 		if (!runAbort.signal.aborted) {
-			runAbort.abort(abortReasonOf(src, fallback));
+			runAbort.abort(abortReasonOf(signal, "Cancelled"));
 		}
 	};
-	const onSignalAbort = forwardAbort(signal, "Cancelled");
-	const onLaunchAbort = forwardAbort(options.launchSignal, "Parent transcript replaced");
 	signal?.addEventListener("abort", onSignalAbort, { once: true });
-	options.launchSignal?.addEventListener("abort", onLaunchAbort, { once: true });
 
 	const runtimeTimer =
 		maxRuntimeMs > 0
@@ -770,21 +867,25 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let lastOutcome: StepRunOutcome = {
 		exitCode: 1,
 		response: "",
+		usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
 		stderr: "",
 		aborted: false,
 	};
-	let totalInputTokens = 0;
-	let totalOutputTokens = 0;
-	let totalCacheReadTokens = 0;
+	// Accumulated totals across completed steps; live step deltas are tracked inside each step and added on step end.
+	let completedRequests = 0;
+	let completedInputTokens = 0;
+	let completedOutputTokens = 0;
+	let completedCacheReadTokens = 0;
 	let activeToolName: string | undefined;
 	let activeToolArgs = "";
 	let activeToolArgsKey: string | undefined;
-	let firstTurnNotified = false;
 
 	try {
 		for (let i = 0; i < stepPrompts.length; i++) {
 			const isFinalStep = i === stepPrompts.length - 1;
 			const fullPrompt = buildAgyPrompt(options, stepPrompts[i]!, i === 0);
+			let liveStepRequests = 0;
+			let liveStepTokens = 0;
 
 			lastOutcome = await runSingleAgyStep({
 				binary: config.binary,
@@ -800,15 +901,10 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				abortSignal: runAbort.signal,
 				onEvent: ev => {
 					if (ev.event === "init") {
-						if (!firstTurnNotified) {
-							firstTurnNotified = true;
-							options.onFirstTurn?.({ kind: "started" });
-						}
 						if (ev.init?.model) {
 							const display = formatResolvedAgyModel(ev.init.model);
 							progress.resolvedModel = display;
 							progress.resolvedModelIdentity = display;
-							progress.contextWindow = inferContextWindow(ev.init.model);
 							scheduleProgress();
 						}
 						return;
@@ -830,9 +926,10 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								scheduleProgress();
 							} else if (su.state === "DONE") {
 								const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
+								const resolvedName = activeToolName ?? toolName;
 								progress.toolCount += 1;
 								progress.recentTools.push({
-									tool: activeToolName ?? toolName,
+									tool: resolvedName,
 									args: summarized.args || activeToolArgs,
 									argsKey: summarized.argsKey ?? activeToolArgsKey,
 									endMs: Date.now(),
@@ -847,28 +944,32 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 								progress.currentToolArgs = undefined;
 								progress.currentToolArgsKey = undefined;
 								progress.currentToolStartMs = undefined;
+								options.onToolResult?.({
+									tool: resolvedName,
+									text: su.tool_info?.output ?? "",
+									isError: false,
+								});
 								scheduleProgress();
 							}
 						} else if (su.step_type === "agent_response") {
 							if (su.text_delta) {
-								recentTextChunks.push(su.text_delta);
+								appendRecentText(su.text_delta);
 							}
 							if (su.state === "ACTIVE") {
 								progress.streaming = { kind: "text" };
 								scheduleProgress();
 							} else if (su.state === "DONE") {
 								progress.streaming = undefined;
-								progress.requests += 1;
+								liveStepRequests += 1;
 								if (su.usage) {
 									const inp = su.usage.input_tokens ?? 0;
 									const out = su.usage.output_tokens ?? 0;
 									const cacheRead = su.usage.cache_read_tokens ?? 0;
-									totalInputTokens += inp;
-									totalOutputTokens += out;
-									totalCacheReadTokens += cacheRead;
-									progress.tokens += inp + out;
+									liveStepTokens += inp + out;
 									progress.contextTokens = inp + cacheRead;
 								}
+								progress.requests = completedRequests + liveStepRequests;
+								progress.tokens = completedInputTokens + completedOutputTokens + liveStepTokens;
 								scheduleProgress();
 							}
 						}
@@ -876,25 +977,22 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 				},
 			});
 
+			// Fold reconciled per-step totals into run totals (covers steps where usage appeared only on `result`).
+			completedRequests += lastOutcome.usage.requests;
+			completedInputTokens += lastOutcome.usage.inputTokens;
+			completedOutputTokens += lastOutcome.usage.outputTokens;
+			completedCacheReadTokens += lastOutcome.usage.cacheReadTokens;
+			progress.requests = completedRequests;
+			progress.tokens = completedInputTokens + completedOutputTokens;
+			if (lastOutcome.usage.lastContextTokens !== undefined) {
+				progress.contextTokens = lastOutcome.usage.lastContextTokens;
+			}
+
 			conversationId = lastOutcome.conversationId ?? conversationId;
-			if (progress.requests === 0 && lastOutcome.numTurns && lastOutcome.numTurns > 0) {
-				progress.requests = lastOutcome.numTurns;
-			}
-			if (totalInputTokens === 0 && totalOutputTokens === 0 && lastOutcome.usage) {
-				const inp = lastOutcome.usage.input_tokens ?? 0;
-				const out = lastOutcome.usage.output_tokens ?? 0;
-				const cacheRead = lastOutcome.usage.cache_read_tokens ?? 0;
-				totalInputTokens += inp;
-				totalOutputTokens += out;
-				totalCacheReadTokens += cacheRead;
-				progress.tokens += inp + out;
-				progress.contextTokens = inp + cacheRead;
-			}
 			if (lastOutcome.model) {
 				const display = formatResolvedAgyModel(lastOutcome.model);
 				progress.resolvedModel = display;
 				progress.resolvedModelIdentity = display;
-				progress.contextWindow = inferContextWindow(lastOutcome.model);
 			}
 			if (lastOutcome.exitCode !== 0 || lastOutcome.aborted) {
 				break;
@@ -903,18 +1001,14 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	} finally {
 		if (runtimeTimer) clearTimeout(runtimeTimer);
 		signal?.removeEventListener("abort", onSignalAbort);
-		options.launchSignal?.removeEventListener("abort", onLaunchAbort);
 		if (progressTimer) {
 			clearTimeout(progressTimer);
 			progressTimer = null;
 		}
+		await options.onRelease?.().catch(() => {});
 	}
 
 	const wasAborted = runtimeExceeded || lastOutcome.aborted || Boolean(signal?.aborted);
-	if (wasAborted && !firstTurnNotified) {
-		firstTurnNotified = true;
-		options.onFirstTurn?.({ kind: "cancelled" });
-	}
 	const abortReason = wasAborted
 		? runtimeExceeded
 			? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
@@ -924,8 +1018,8 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let error = wasAborted ? (abortReason ?? lastOutcome.error) : lastOutcome.error;
 
 	let rawOutput = lastOutcome.response;
-	if (wasAborted && !rawOutput.trim() && recentTextChunks.length > 0) {
-		const snippet = previewLine(recentTextChunks.join("").trim(), 200);
+	if (wasAborted && !rawOutput.trim() && recentOutputTail.trim().length > 0) {
+		const snippet = previewLine(recentOutputTail.trim(), 200);
 		rawOutput = `[cancelled after ${progress.requests} req, ${progress.tokens} tok — last activity: "${snippet}"]`;
 	}
 
@@ -950,34 +1044,14 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let outputPath: string | undefined;
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	if (options.artifactsDir) {
-		const candidatePath = path.join(options.artifactsDir, `${id}.md`);
-		try {
-			await writeArtifact(candidatePath, rawOutput);
-			outputPath = candidatePath;
-			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
-				charCount: rawOutput.length,
-			};
-		} catch (err) {
-			logger.warn("Failed to persist agy subagent output artifact", {
-				agentId: id,
-				path: candidatePath,
-				error: err instanceof Error ? err.message : String(err),
-			});
-		}
-		if (outputPath && structured.structuredOutput && Object.hasOwn(structured.structuredOutput, "data")) {
-			const sidecarPath = path.join(options.artifactsDir, `${id}.json`);
-			try {
-				const serialized = JSON.stringify(structured.structuredOutput.data, null, 2);
-				if (serialized !== undefined) await writeArtifact(sidecarPath, `${serialized}\n`);
-			} catch (err) {
-				logger.warn("Failed to persist agy subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: err instanceof Error ? err.message : String(err),
-				});
-			}
-		}
+		const persisted = await persistSubagentOutputArtifacts({
+			artifactsDir: options.artifactsDir,
+			id,
+			rawOutput,
+			structuredOutput: structured.structuredOutput,
+		});
+		outputPath = persisted.outputPath;
+		outputMeta = persisted.outputMeta;
 	}
 
 	progress.currentTool = undefined;
@@ -1029,11 +1103,11 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		error,
 		...(wasAborted ? { aborted: true, abortReason } : {}),
 		usage: {
-			input: totalInputTokens,
-			output: totalOutputTokens,
-			cacheRead: totalCacheReadTokens,
+			input: completedInputTokens,
+			output: completedOutputTokens,
+			cacheRead: completedCacheReadTokens,
 			cacheWrite: 0,
-			totalTokens: totalInputTokens + totalOutputTokens + totalCacheReadTokens,
+			totalTokens: completedInputTokens + completedOutputTokens + completedCacheReadTokens,
 			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
 		},
 		outputPath,
