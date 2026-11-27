@@ -6,7 +6,6 @@
  * progress tracking.
  */
 
-import * as fs from "node:fs/promises";
 import path from "node:path";
 import type { AgentEvent, AgentIdentity, AgentMessage, AgentTelemetryConfig } from "@oh-my-pi/pi-agent-core";
 import { AgentBusyError, extractIntent, recordHandoff, resolveTelemetry } from "@oh-my-pi/pi-agent-core";
@@ -87,7 +86,7 @@ import {
 } from "../session/agent-session";
 import { isLocalAgentSession } from "../session/agent-session-handle";
 import type { AgentSessionDisposeOptions } from "../session/agent-session-types";
-import { type ArtifactManagerApi, writeArtifact } from "../session/artifacts";
+import type { ArtifactManagerApi } from "../session/artifacts";
 import { ASYNC_RESULT_MESSAGE_TYPE } from "../session/async-job-delivery";
 import type { AuthStorage } from "../session/auth-storage";
 import { type FirstTurnOutcome, type TranscriptPreamble, watchFirstTurn } from "../session/inbox-epoch";
@@ -132,6 +131,8 @@ import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { resolveSubagentStartModel } from "./subagent-start-model";
+import { resolveAgySubagentConfig, runAgySubagent } from "./agy-cli-runner";
+import { persistSubagentOutputArtifacts } from "./output-artifacts";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { recordStepsSent, type StepProgress, type StepReportRoute, sendStepReport } from "./steps";
 import type { WorkPoolYieldItem } from "./workpool-yield";
@@ -3305,66 +3306,14 @@ async function finalizeRunResult(args: FinalizeRunArgs): Promise<SingleResult> {
 		!monitor.runtimeLimitExceeded() &&
 		rawOutput.trim().length > 0;
 	if (args.artifactsDir && (!args.followUpTurn || hasYield || hasMessageResult)) {
-		const candidatePath = path.join(args.artifactsDir, `${id}.md`);
-		try {
-			await writeArtifact(candidatePath, rawOutput);
-			outputPath = candidatePath;
-			outputMeta = {
-				lineCount: rawOutput.split("\n").length,
-				charCount: rawOutput.length,
-			};
-		} catch (error) {
-			logger.warn("Failed to persist subagent output artifact", {
-				agentId: id,
-				path: candidatePath,
-				error: error instanceof Error ? error.message : String(error),
-			});
-		}
-		const structured = finalized.structuredOutput;
-		const sidecarPath = path.join(args.artifactsDir, `${id}.json`);
-		if (outputPath && structured && Object.hasOwn(structured, "data")) {
-			try {
-				const serialized = JSON.stringify(structured.data, null, 2);
-				// `structured.data === undefined` (an own "data" key holding
-				// `undefined`) makes JSON.stringify return `undefined` too —
-				// neither a write nor a removal, which would leave a stale
-				// sidecar from an earlier turn answering agent://<id>/<field>
-				// with superseded data (PR #10625 review).
-				if (serialized !== undefined) await writeArtifact(sidecarPath, `${serialized}\n`);
-				else await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to persist subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-				// A stale sidecar from an earlier turn must not outlive this
-				// turn's <id>.md just because the replacement write failed —
-				// agent://<id>/<field> would keep answering with superseded data.
-				try {
-					await fs.rm(sidecarPath, { force: true });
-				} catch (rmError) {
-					logger.warn("Failed to drop stale subagent structured output sidecar", {
-						agentId: id,
-						path: sidecarPath,
-						error: rmError instanceof Error ? rmError.message : String(rmError),
-					});
-				}
-			}
-		} else if (outputPath) {
-			// This turn republished <id>.md; a stale sidecar from an earlier
-			// turn would keep answering agent://<id>/<field> with the
-			// superseded payload, so it must not outlive its <id>.md.
-			try {
-				await fs.rm(sidecarPath, { force: true });
-			} catch (error) {
-				logger.warn("Failed to drop stale subagent structured output sidecar", {
-					agentId: id,
-					path: sidecarPath,
-					error: error instanceof Error ? error.message : String(error),
-				});
-			}
-		}
+		const persisted = await persistSubagentOutputArtifacts({
+			artifactsDir: args.artifactsDir,
+			id,
+			rawOutput,
+			structuredOutput: finalized.structuredOutput,
+		});
+		outputPath = persisted.outputPath;
+		outputMeta = persisted.outputMeta;
 	}
 
 	// Update final progress. A wall-clock timeout always wins: if the runtime
@@ -4732,6 +4681,10 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  * read from `options.settings`; a call without settings runs here.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	const agyConfig = resolveAgySubagentConfig(options);
+	if (agyConfig) {
+		return runAgySubagent(options, agyConfig);
+	}
 	const pool = isMainThread() && options.settings ? subagentWorkerPool(options.settings) : undefined;
 	return pool ? runSubprocessPlaced(pool, options, runSubprocessOnThisThread) : runSubprocessOnThisThread(options);
 }

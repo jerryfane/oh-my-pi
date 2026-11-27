@@ -520,6 +520,309 @@ ${createLinuxSubreaperScript()}
 			expect(threw).toBeInstanceOf(TimeoutError);
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"bounds post-exit drain across stdout and stderr on detached non-subreaper spawns while preserving real exit code and killing helpers",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-nonsub-"));
+			try {
+				// 1. Helper holds ONLY stderr open on exit 23
+				const stderrSentinel = path.join(dir, "stderr-helper.txt");
+				const t1 = Date.now();
+				const cp1 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(stderrSentinel)}) >/dev/null & echo err-msg >&2; exit 23`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				expect(await cp1.exited).toBe(23);
+				expect(cp1.peekStderr()).toContain("err-msg");
+				expect(Date.now() - t1).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(stderrSentinel).exists()).toBe(false);
+
+				// 2. wait() with helper holding ONLY stdout open (stderr closes immediately)
+				const stdoutSentinel = path.join(dir, "stdout-helper.txt");
+				const t2 = Date.now();
+				const cp2 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(stdoutSentinel)}) 2>/dev/null & echo out-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				const res2 = await cp2.wait({ allowNonZero: true });
+				expect(res2.exitCode).toBe(0);
+				expect(res2.stdout).toContain("out-ok");
+				expect(Date.now() - t2).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(stdoutSentinel).exists()).toBe(false);
+
+				// 3. wait() with stderr closing 40ms into the drain while stdout stays open
+				const mixedSentinel = path.join(dir, "mixed-helper.txt");
+				const t3 = Date.now();
+				const cp3 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.04) >/dev/null & (trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(mixedSentinel)}) 2>/dev/null & echo mixed-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				const res3 = await cp3.wait({ allowNonZero: true });
+				expect(res3.exitCode).toBe(0);
+				expect(res3.stdout).toContain("mixed-ok");
+				expect(Date.now() - t3).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(mixedSentinel).exists()).toBe(false);
+
+				// 4. Streaming readStdout() with exit 23 and stdout-only helper
+				const streamSentinel = path.join(dir, "stream-helper.txt");
+				const t4 = Date.now();
+				const cp4 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(streamSentinel)}) 2>/dev/null & echo stream-ok; exit 23`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				let streamed = "";
+				const dec = new TextDecoder();
+				const readP = cp4.readStdout(chunk => {
+					streamed += dec.decode(chunk, { stream: true });
+				});
+				expect(await cp4.exited).toBe(23);
+				await Promise.all([readP, cp4.stderrDone]);
+				expect(streamed).toContain("stream-ok");
+				expect(Date.now() - t4).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(streamSentinel).exists()).toBe(false);
+
+				// 5. Late readStdout() registered after the post-exit drain deadline preserves ready stdout, expires immediately, and kills helper
+				const lateSentinel = path.join(dir, "late-helper.txt");
+				const cp5 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(lateSentinel)}) 2>/dev/null & printf late-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 60 },
+				);
+				expect(await cp5.exited).toBe(0);
+				await Bun.sleep(140);
+				const tLate = performance.now();
+				let lateOut = "";
+				const lateDec = new TextDecoder();
+				await cp5.readStdout(chunk => {
+					lateOut += lateDec.decode(chunk, { stream: true });
+				});
+				lateOut += lateDec.decode();
+				expect(lateOut).toBe("late-ok");
+				expect(performance.now() - tLate).toBeLessThan(60);
+				await Bun.sleep(550);
+				expect(await Bun.file(lateSentinel).exists()).toBe(false);
+
+				// 6. Late readStdout(), wait(), and bytes() after deadline with NO descendants preserve ready stdout
+				for (const mode of ["readStdout", "wait", "bytes"] as const) {
+					const cpNoHelper = spawn(["/bin/sh", "-c", "printf normal-output; exit 0"], {
+						detached: true,
+						subreaper: false,
+						descendantDrainMs: 40,
+					});
+					expect(await cpNoHelper.exited).toBe(0);
+					await Bun.sleep(100);
+					if (mode === "readStdout") {
+						let out = "";
+						const d = new TextDecoder();
+						await cpNoHelper.readStdout(c => {
+							out += d.decode(c, { stream: true });
+						});
+						out += d.decode();
+						expect(out).toBe("normal-output");
+					} else if (mode === "wait") {
+						const r = await cpNoHelper.wait();
+						expect(r.stdout).toBe("normal-output");
+					} else {
+						const b = await cpNoHelper.bytes();
+						expect(new TextDecoder().decode(b)).toBe("normal-output");
+					}
+				}
+
+				// 7. Backward wall-clock jump (Date.now) does not extend the monotonic post-exit drain deadline.
+				//    Use detached:false with a finite-lived inherited stdout holder (portable across macOS/Linux without setsid)
+				//    so the holder remains alive when the late reader starts.
+				const holderPidFile = path.join(dir, "clock-holder.pid");
+				const cpClock = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(sh -c 'echo $$ > ${JSON.stringify(holderPidFile)}; sleep 0.6' </dev/null 2>/dev/null) & printf clock-ok; exit 0`,
+					],
+					{ detached: false, subreaper: false, descendantDrainMs: 50 },
+				);
+				expect(await cpClock.exited).toBe(0);
+				await Bun.sleep(130);
+				const holderPid = Number.parseInt(
+					(
+						await Bun.file(holderPidFile)
+							.text()
+							.catch(() => "")
+					).trim(),
+					10,
+				);
+				expect(holderPid).toBeGreaterThan(1);
+				// Confirm the stdout holder is still alive when the late reader starts
+				expect(() => process.kill(holderPid, 0)).not.toThrow();
+				const realDateNow = Date.now;
+				const dateNowSpy = spyOn(Date, "now").mockImplementation(() => realDateNow() - 10_000);
+				try {
+					const tClock = performance.now();
+					let clockOut = "";
+					const d = new TextDecoder();
+					await cpClock.readStdout(c => {
+						clockOut += d.decode(c, { stream: true });
+					});
+					clockOut += d.decode();
+					expect(clockOut).toBe("clock-ok");
+					expect(performance.now() - tClock).toBeLessThan(60);
+				} finally {
+					dateNowSpy.mockRestore();
+					try {
+						process.kill(holderPid, "SIGKILL");
+					} catch {}
+				}
+
+				// 8. Standalone one-shot caller awaiting wait() kills closed-pipe same-group helpers before exiting
+				const closedPipeSentinel = path.join(dir, "closed-pipe-helper.txt");
+				const oneShotScript = path.join(dir, "one-shot-wait.ts");
+				await Bun.write(
+					oneShotScript,
+					`import { spawn } from ${JSON.stringify(path.join(import.meta.dir, "../src/ptree.ts"))};
+const cp = spawn(
+	["/bin/sh", "-c", ${JSON.stringify(`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(closedPipeSentinel)}) </dev/null >/dev/null 2>&1 & printf root-ok; exit 0`)}],
+	{ detached: true, subreaper: false, descendantDrainMs: 120 },
+);
+const res = await cp.wait();
+process.stdout.write(res.stdout + ":" + res.exitCode);
+`,
+				);
+				const caller = Bun.spawn([process.execPath, oneShotScript], { stdout: "pipe", stderr: "pipe" });
+				const [callerExit, callerOut] = await Promise.all([caller.exited, new Response(caller.stdout).text()]);
+				expect(callerExit).toBe(0);
+				expect(callerOut).toBe("root-ok:0");
+				await Bun.sleep(550);
+				expect(await Bun.file(closedPipeSentinel).exists()).toBe(false);
+
+				// 9. Closed-pipe descendant settlement honors both command timeout and AbortSignal
+				for (const kind of ["timeout", "abort"] as const) {
+					const cutSentinel = path.join(dir, `closed-pipe-${kind}.txt`);
+					const ac = new AbortController();
+					const tCut = performance.now();
+					const cpCut = spawn(
+						[
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.4 && echo lived > ${JSON.stringify(cutSentinel)}) </dev/null >/dev/null 2>&1 & printf cut-ok; exit 0`,
+						],
+						{
+							detached: true,
+							subreaper: false,
+							descendantDrainMs: 750,
+							...(kind === "timeout" ? { timeout: 150 } : { signal: ac.signal }),
+						},
+					);
+					const abortTimer = kind === "abort" ? setTimeout(() => ac.abort("stop-drain"), 150) : undefined;
+					let caught: unknown;
+					try {
+						await cpCut.wait();
+					} catch (err) {
+						caught = err;
+					} finally {
+						if (abortTimer) clearTimeout(abortTimer);
+					}
+					expect(performance.now() - tCut).toBeLessThan(500);
+					if (kind === "timeout") {
+						expect(caught).toBeInstanceOf(TimeoutError);
+					} else {
+						expect(caught).toBeInstanceOf(AbortError);
+					}
+					await Bun.sleep(450);
+					expect(await Bun.file(cutSentinel).exists()).toBe(false);
+				}
+
+				// 10. A late abort after drain settlement (natural exit, closed-stdio expiry, and pipe-holding expiry) must not fail a completed wait()
+				for (const mode of ["natural", "expired", "expired-piped"] as const) {
+					const acLate = new AbortController();
+					const helperSleep = mode === "natural" ? "0.04" : "0.5";
+					const drainBudget = mode === "natural" ? 300 : 60;
+					const cmd =
+						mode === "expired-piped"
+							? `(trap '' TERM; sleep ${helperSleep}) </dev/null & printf finished; exit 0`
+							: `(trap '' TERM; sleep ${helperSleep}) </dev/null >/dev/null 2>&1 & printf finished; exit 0`;
+					const cpLateAbort = spawn(["/bin/sh", "-c", cmd], {
+						detached: true,
+						subreaper: false,
+						descendantDrainMs: drainBudget,
+						signal: acLate.signal,
+					});
+					const waitP = cpLateAbort.wait({ allowAbort: true });
+					void cpLateAbort.exited.then(() =>
+						cpLateAbort.drainDone.then(() => {
+							acLate.abort("too-late");
+						}),
+					);
+					const resLate = await waitP;
+					expect(resLate.stdout).toBe("finished");
+					expect(resLate.exitCode).toBe(0);
+					expect(resLate.ok).toBe(true);
+					expect(resLate.exitError).toBeUndefined();
+					expect(cpLateAbort.exitReason).toBeUndefined();
+				}
+
+				// 11. Aborting closed-stdio drain after a signal-terminated leader kills descendants and reports AbortError
+				{
+					const sigSentinel = path.join(dir, "signal-drain-abort.txt");
+					const acSig = new AbortController();
+					const cpSig = spawn(
+						[
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.25; echo survived > "$1") </dev/null >/dev/null 2>&1 & kill -TERM $$`,
+							"_",
+							sigSentinel,
+						],
+						{ detached: true, subreaper: false, descendantDrainMs: 2500, signal: acSig.signal },
+					);
+					const tSig = performance.now();
+					let sigAbortTimer: ReturnType<typeof setTimeout> | undefined;
+					void cpSig.exited
+						.catch(() => {})
+						.then(() => {
+							sigAbortTimer = setTimeout(() => acSig.abort("cancel-after-signal"), 30);
+						});
+					let caught: unknown;
+					try {
+						await cpSig.wait();
+					} catch (err) {
+						caught = err;
+					} finally {
+						if (sigAbortTimer) clearTimeout(sigAbortTimer);
+					}
+					expect(performance.now() - tSig).toBeLessThan(600);
+					expect(caught).toBeInstanceOf(AbortError);
+					await Bun.sleep(350);
+					expect(await Bun.file(sigSentinel).exists()).toBe(false);
+				}
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+		30_000,
+	);
 });
 
 describe.skipIf(process.platform !== "linux")("ptree subreaper stop", () => {
@@ -718,4 +1021,69 @@ console.log("settled");
 			}
 		}, 60_000);
 	}
+
+	it.skipIf(process.platform !== "linux")(
+		"kills pgrp helpers and fails closed on surviving setsid helpers when procfs discovery fails",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-noproc-"));
+			const pgrpSentinel = path.join(dir, "pgrp-lived.txt");
+			const setsidPidFile = path.join(dir, "setsid.pid");
+			const brokenProcScript = createLinuxSubreaperScript().replaceAll('"/proc/"', '"/nonexistent-proc-dir/"');
+			try {
+				// Non-setsid helper is still killed via kill(-child.pid, 9) even when /proc fails
+				const pgrpProc = Bun.spawn([process.execPath, "-e", brokenProcScript], {
+					env: {
+						...Bun.env,
+						BUN_BE_BUN: "1",
+						OMP_PTREE_SUBREAPER_COMMAND: JSON.stringify([
+							"/bin/sh",
+							"-c",
+							`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(pgrpSentinel)}) >/dev/null 2>&1 & exit 0`,
+						]),
+						OMP_PTREE_SUBREAPER_DRAIN_MS: "80",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				expect(await pgrpProc.exited).toBe(0);
+				await Bun.sleep(750);
+				expect(await Bun.file(pgrpSentinel).exists()).toBe(false);
+
+				// Session-detached helper that cannot be discovered without /proc forces nonzero exit (fail closed)
+				const setsidProc = Bun.spawn([process.execPath, "-e", brokenProcScript], {
+					env: {
+						...Bun.env,
+						BUN_BE_BUN: "1",
+						OMP_PTREE_SUBREAPER_COMMAND: JSON.stringify([
+							"/bin/sh",
+							"-c",
+							`setsid sh -c 'echo $$ > ${JSON.stringify(setsidPidFile)}; sleep 5' </dev/null >/dev/null 2>&1 & sleep 0.05; exit 0`,
+						]),
+						OMP_PTREE_SUBREAPER_DRAIN_MS: "80",
+					},
+					stdin: "ignore",
+					stdout: "pipe",
+					stderr: "pipe",
+				});
+				const [setsidExit, setsidStderr] = await Promise.all([
+					setsidProc.exited,
+					new Response(setsidProc.stderr).text(),
+				]);
+				expect(setsidExit).toBe(1);
+				expect(setsidStderr).toContain("failed to terminate lingering descendants");
+			} finally {
+				const rawPid = await Bun.file(setsidPidFile)
+					.text()
+					.catch(() => "");
+				const pid = Number.parseInt(rawPid.trim(), 10);
+				if (pid > 1) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });

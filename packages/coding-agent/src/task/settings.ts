@@ -21,6 +21,28 @@ const EMPTY_AGENT_ACCOUNT_POOLS: Record<string, OAuthAccountPools> = {};
 const EMPTY_AGENT_SOFT_REQUEST_BUDGET: Record<string, number | null> = {};
 
 const DEFAULT_AGENT_MODEL_OVERRIDES: Record<string, string | string[]> = {};
+const EMPTY_AGY_SUBAGENTS: Record<string, string> = {};
+
+/**
+ * Validate `task.agySubagents` entries at write/load time.
+ * Every value must be a non-empty string selector (model ID, `"default"`, or `"off"`) or a boolean.
+ */
+export function validateAgySubagents(value: unknown): void {
+	if (value === undefined) return;
+	if (!isRecord(value)) {
+		throw new Error("Invalid value for task.agySubagents: expected a record of agent name to agy model selector");
+	}
+	for (const [key, raw] of Object.entries(value)) {
+		if (!key.trim()) {
+			throw new Error("Invalid key in task.agySubagents: agent name must be non-empty");
+		}
+		if (typeof raw === "boolean") continue;
+		if (typeof raw === "string" && raw.trim().length > 0) continue;
+		throw new Error(
+			`Invalid value for task.agySubagents.${key}: expected a non-empty model string (e.g. "gemini-4-neon-medium", "default", "off") or boolean`,
+		);
+	}
+}
 
 // Delegation. Task and isolation settings declare `protocolDefault`: protocol hosts get neutral
 // defaults instead of the local user's interactive preferences.
@@ -674,6 +696,27 @@ export const cfgTaskAgentModelOverrides = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "record",
 	default: DEFAULT_AGENT_MODEL_OVERRIDES,
+});
+
+export const cfgTaskAgySubagents = register({
+	id: "task.agySubagents",
+	protocolDefault: ["rpc", "acp"],
+	type: "record",
+	default: EMPTY_AGY_SUBAGENTS,
+	validate: validateAgySubagents,
+});
+
+export const cfgTaskAgyBinary = register({
+	id: "task.agyBinary",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Antigravity CLI Binary (agy)",
+		description:
+			"Path to the official `agy` executable used by `task.agySubagents`; unset falls back to OMP_AGY_SUBAGENT_BIN or `agy` on PATH",
+	},
 });
 
 export const cfgTaskAgentServiceTierOverrides = register({
