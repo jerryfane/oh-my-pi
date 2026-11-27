@@ -21,6 +21,23 @@ const EMPTY_AGENT_ACCOUNT_POOLS: Record<string, OAuthAccountPools> = {};
 const EMPTY_AGENT_SOFT_REQUEST_BUDGET: Record<string, number | null> = {};
 
 const DEFAULT_AGENT_MODEL_OVERRIDES: Record<string, string | string[]> = {};
+const EMPTY_AGY_SUBAGENTS: Record<string, string> = {};
+
+export function validateAgySubagents(value: unknown): Record<string, string> {
+	if (!isRecord(value)) return {};
+	const out: Record<string, string> = {};
+	for (const [key, raw] of Object.entries(value)) {
+		const agentName = key.trim();
+		if (!agentName) continue;
+		if (typeof raw === "string") {
+			const trimmed = raw.trim();
+			if (trimmed) out[agentName] = trimmed;
+		} else if (typeof raw === "boolean") {
+			out[agentName] = raw ? "default" : "off";
+		}
+	}
+	return out;
+}
 
 // Delegation. Task and isolation settings declare `protocolDefault`: protocol hosts get neutral
 // defaults instead of the local user's interactive preferences.
@@ -674,6 +691,27 @@ export const cfgTaskAgentModelOverrides = register({
 	protocolDefault: ["rpc", "acp"],
 	type: "record",
 	default: DEFAULT_AGENT_MODEL_OVERRIDES,
+});
+
+export const cfgTaskAgySubagents = register({
+	id: "task.agySubagents",
+	protocolDefault: ["rpc", "acp"],
+	type: "record",
+	default: EMPTY_AGY_SUBAGENTS,
+	validate: validateAgySubagents,
+});
+
+export const cfgTaskAgyBinary = register({
+	id: "task.agyBinary",
+	type: "string",
+	default: undefined,
+	ui: {
+		tab: "tasks",
+		group: "Subagents",
+		label: "Antigravity CLI Binary (agy)",
+		description:
+			"Path to the official `agy` executable used by `task.agySubagents`; unset falls back to OMP_AGY_SUBAGENT_BIN or `agy` on PATH",
+	},
 });
 
 export const cfgTaskAgentServiceTierOverrides = register({

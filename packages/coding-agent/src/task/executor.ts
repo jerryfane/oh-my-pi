@@ -132,6 +132,7 @@ import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { resolveSubagentStartModel } from "./subagent-start-model";
+import { resolveAgySubagentConfig, runAgySubagent } from "./agy-cli-runner";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { recordStepsSent, type StepProgress, type StepReportRoute, sendStepReport } from "./steps";
 import type { WorkPoolYieldItem } from "./workpool-yield";
@@ -4732,6 +4733,10 @@ function createWarmSubagentReviver(capture: WarmReviveCapture): AgentReviver {
  * read from `options.settings`; a call without settings runs here.
  */
 export async function runSubprocess(options: ExecutorOptions): Promise<SingleResult> {
+	const agyConfig = resolveAgySubagentConfig(options);
+	if (agyConfig) {
+		return runAgySubagent(options, agyConfig);
+	}
 	const pool = isMainThread() && options.settings ? subagentWorkerPool(options.settings) : undefined;
 	return pool ? runSubprocessPlaced(pool, options, runSubprocessOnThisThread) : runSubprocessOnThisThread(options);
 }
