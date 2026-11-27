@@ -303,6 +303,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	#abortRegistrations?: Set<() => void>;
 	#timeoutTimer?: NodeJS.Timeout;
 	#drainTimer?: ReturnType<typeof setTimeout>;
+	#drainDeadlineMs?: number;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -370,6 +371,9 @@ export class ChildProcess<In extends InMask = InMask> {
 		proc.exited
 			.catch(() => null)
 			.then(async exitCode => {
+				if (!this.#hardKillTree && this.#descendantDrainMs !== undefined && this.#drainDeadlineMs === undefined) {
+					this.#drainDeadlineMs = Date.now() + this.#descendantDrainMs;
+				}
 				this.#syncAbortListeners();
 				if (this.#exitReasonPending) {
 					this.#clearDrainTimer();
@@ -659,12 +663,19 @@ export class ChildProcess<In extends InMask = InMask> {
 					await reader.cancel().catch(() => {});
 					break;
 				}
-				const r = await reader.read();
+				let r: Awaited<ReturnType<typeof reader.read>>;
+				try {
+					r = await reader.read();
+				} catch {
+					// A cancelled or failed pipe read stops cleanly and keeps whatever was already processed.
+					break;
+				}
 				if (r.done) break;
 				onChunk(r.value);
 			}
-		} catch {
-			// A cancelled or failed read stops cleanly and keeps whatever was already processed.
+		} catch (err) {
+			await reader.cancel().catch(() => {});
+			throw err;
 		} finally {
 			this.#pipeReaders.delete(reader);
 			this.#openPipeReaders--;
@@ -851,10 +862,24 @@ export class ChildProcess<In extends InMask = InMask> {
 		this.#drainTimer = undefined;
 	}
 
+	#expireDrain(): void {
+		if (this.#openPipeReaders <= 0) return;
+		if (this.#terminateGroup && process.platform !== "win32") {
+			try {
+				process.kill(-this.proc.pid, "SIGKILL");
+			} catch {}
+		} else if (this.#windowsRootProcess) {
+			try {
+				this.#windowsRootProcess.killTree();
+			} catch {}
+		}
+		this.#cutoffOutput();
+	}
+
 	/**
 	 * On non-subreaper spawns with `descendantDrainMs`, run one post-exit timer
-	 * covering all tracked pipe readers (stderr + any tracked stdout reader) and
-	 * cancel it only once every pipe reader has finished.
+	 * anchored at process exit covering all tracked pipe readers (stderr + any
+	 * tracked stdout reader) and cancel it only once every pipe reader has finished.
 	 */
 	#syncDrainTimer(): void {
 		if (this.#hardKillTree || this.#descendantDrainMs === undefined) return;
@@ -862,27 +887,22 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#clearDrainTimer();
 			return;
 		}
-		if (this.proc.exitCode === null && this.proc.signalCode === null) return;
+		const deadline = this.#drainDeadlineMs;
+		if (deadline === undefined) return;
 		if (this.#openPipeReaders <= 0) {
 			this.#clearDrainTimer();
 			return;
 		}
 		if (this.#drainTimer) return;
+		const remainingMs = Math.max(0, deadline - Date.now());
+		if (remainingMs === 0) {
+			this.#expireDrain();
+			return;
+		}
 		const timer = setTimeout(() => {
 			this.#drainTimer = undefined;
-			if (this.#openPipeReaders > 0) {
-				if (this.#terminateGroup && process.platform !== "win32") {
-					try {
-						process.kill(-this.proc.pid, "SIGKILL");
-					} catch {}
-				} else if (this.#windowsRootProcess) {
-					try {
-						this.#windowsRootProcess.killTree();
-					} catch {}
-				}
-				this.#cutoffOutput();
-			}
-		}, this.#descendantDrainMs);
+			this.#expireDrain();
+		}, remainingMs);
 		timer.unref?.();
 		this.#drainTimer = timer;
 	}

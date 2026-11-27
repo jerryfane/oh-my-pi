@@ -747,5 +747,45 @@ emit({ event: "result", result: { conversation_id: "conv-timer", status: "SUCCES
 		expect(firstB.startMs).toBeDefined();
 		expect(firstB.startMs!).toBeGreaterThan(firstA.startMs!);
 		expect(restoredA.startMs).toBe(firstA.startMs);
+
+		// 6. A throwing onToolResult callback must NOT replay the frame, abort stream reading, or leak an unhandled rejection
+		const throwingBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: "conv-throw", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-throw", step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", output: "tool payload" } } });
+await Bun.sleep(200);
+emit({ event: "result", result: { conversation_id: "conv-throw", status: "SUCCESS", response: "completed after throw", num_turns: 1 } });
+`,
+			"fake-agy-throw-cb",
+		);
+		const unhandled: unknown[] = [];
+		const onUnhandled = (reason: unknown) => {
+			unhandled.push(reason);
+		};
+		process.on("unhandledRejection", onUnhandled);
+		let cbCalls = 0;
+		try {
+			const cbRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "callback throws",
+				index: 0,
+				id: "ThrowCallbackJob",
+				settings: makeSettings(throwingBin, { "*": "gemini-4-neon-low" }),
+				onToolResult: () => {
+					cbCalls += 1;
+					throw new Error("widget callback boom");
+				},
+			});
+			await Bun.sleep(20);
+			expect(cbRes.exitCode).toBe(0);
+			expect(cbRes.output).toBe("completed after throw");
+			expect(cbCalls).toBe(1);
+			expect(unhandled).toEqual([]);
+		} finally {
+			process.off("unhandledRejection", onUnhandled);
+		}
 	});
 });

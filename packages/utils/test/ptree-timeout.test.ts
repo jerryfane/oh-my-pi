@@ -601,6 +601,24 @@ ${createLinuxSubreaperScript()}
 				expect(Date.now() - t4).toBeLessThan(450);
 				await Bun.sleep(550);
 				expect(await Bun.file(streamSentinel).exists()).toBe(false);
+
+				// 5. Late readStdout() registered after the post-exit drain deadline expires immediately (no fresh budget)
+				const lateSentinel = path.join(dir, "late-helper.txt");
+				const cp5 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.6 && echo lived > ${JSON.stringify(lateSentinel)}) 2>/dev/null & echo late-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 80 },
+				);
+				expect(await cp5.exited).toBe(0);
+				await Bun.sleep(160);
+				const tLate = Date.now();
+				await cp5.readStdout(() => {});
+				expect(Date.now() - tLate).toBeLessThan(60);
+				await Bun.sleep(550);
+				expect(await Bun.file(lateSentinel).exists()).toBe(false);
 			} finally {
 				await fs.rm(dir, { recursive: true, force: true });
 			}

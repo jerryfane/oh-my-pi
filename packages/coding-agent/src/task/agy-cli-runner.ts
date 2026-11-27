@@ -522,22 +522,37 @@ async function runSingleAgyStep(params: {
 				resultEvent = parsed.result;
 				if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
 			}
-			params.onEvent(parsed);
+			try {
+				params.onEvent(parsed);
+			} catch (err) {
+				logger.warn("agy stream event callback threw", {
+					error: err instanceof Error ? err.message : String(err),
+				});
+			}
 		};
 		// Use ptree's tracked stdout reader so one post-exit descendantDrainMs timer covers both pipes.
+		// Consume each framed line before dispatch and handle any stream error at creation so a throwing
+		// callback cannot replay a frame or leak an unhandled rejection while awaiting cp.exited.
 		const readStdout = cp
 			.readStdout(chunk => {
 				pending += decoder.decode(chunk, { stream: true });
 				let nl = pending.indexOf("\n");
 				while (nl !== -1) {
-					handleLine(pending.slice(0, nl));
+					const line = pending.slice(0, nl);
 					pending = pending.slice(nl + 1);
+					handleLine(line);
 					nl = pending.indexOf("\n");
 				}
 			})
 			.then(() => {
-				pending += decoder.decode();
-				if (pending.trim()) handleLine(pending);
+				const tail = pending + decoder.decode();
+				pending = "";
+				if (tail.trim()) handleLine(tail);
+			})
+			.catch(err => {
+				logger.warn("agy stdout reader failed", {
+					error: err instanceof Error ? err.message : String(err),
+				});
 			});
 
 		let exitCode = 1;
@@ -557,7 +572,7 @@ async function runSingleAgyStep(params: {
 		}
 
 		// Wait for both tracked pipes to settle (bounded by ptree's descendantDrainMs / timeout / abort cutoff).
-		await Promise.all([readStdout.catch(() => {}), cp.stderrDone.catch(() => {})]);
+		await Promise.all([readStdout, cp.stderrDone.catch(() => {})]);
 
 		stderrText = cp.peekStderr().trim();
 
