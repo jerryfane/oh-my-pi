@@ -706,21 +706,20 @@ async function runSingleAgyStep(params: {
 		stderrText = cp.peekStderr().trim();
 
 		// Prefer authoritative terminal result counters whenever present (including explicit zeros);
-		// fall back to streamed counters only for absent fields, and infer context from terminal usage
-		// only when it represents a single request.
+		// wire-boundary parsing already guarantees finite non-negative numbers. Fall back to streamed
+		// counters only for absent fields, and infer context from terminal usage only for single-request runs.
 		const resUsage = resultEvent?.usage;
-		const resTurns = resultEvent?.num_turns;
-		if (typeof resTurns === "number" && Number.isFinite(resTurns) && resTurns >= 0) {
-			stepRequests = resTurns;
+		if (resultEvent?.num_turns !== undefined) {
+			stepRequests = resultEvent.num_turns;
 		}
 		if (resUsage) {
-			if (typeof resUsage.input_tokens === "number" && Number.isFinite(resUsage.input_tokens)) {
+			if (resUsage.input_tokens !== undefined) {
 				stepInput = resUsage.input_tokens;
 			}
-			if (typeof resUsage.output_tokens === "number" && Number.isFinite(resUsage.output_tokens)) {
+			if (resUsage.output_tokens !== undefined) {
 				stepOutput = resUsage.output_tokens;
 			}
-			if (typeof resUsage.cache_read_tokens === "number" && Number.isFinite(resUsage.cache_read_tokens)) {
+			if (resUsage.cache_read_tokens !== undefined) {
 				stepCacheRead = resUsage.cache_read_tokens;
 			}
 			if (stepLastContext === undefined && stepRequests === 1) {
@@ -1000,7 +999,17 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	const emitProgressNow = () => {
 		refreshRecentOutput();
 		progress.durationMs = Date.now() - startTime;
-		onProgress?.({ ...progress });
+		if (onProgress) {
+			try {
+				onProgress({ ...progress });
+			} catch (err) {
+				logger.warn("agy onProgress callback threw", {
+					id,
+					status: progress.status,
+					error: formatErrorMessage(err),
+				});
+			}
+		}
 		const progressPayload = {
 			index,
 			agent: agent.name,
@@ -1011,7 +1020,15 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 			assignment,
 			progress: { ...progress },
 		};
-		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
+		try {
+			emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_PROGRESS_CHANNEL, progressPayload);
+		} catch (err) {
+			logger.warn("agy progress event bus emit threw", {
+				id,
+				status: progress.status,
+				error: formatErrorMessage(err),
+			});
+		}
 		lastProgressEmitMs = Date.now();
 	};
 
@@ -1042,16 +1059,20 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	};
 
 	// Emit lifecycle start event so OMP's Subagents (Alt+A) HUD registers the worker immediately.
-	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-		id,
-		agent: agent.name,
-		parentToolCallId: options.parentToolCallId,
-		detached: options.detached,
-		agentSource: agent.source,
-		description: options.description,
-		status: "started" as const,
-		index,
-	});
+	try {
+		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id,
+			agent: agent.name,
+			parentToolCallId: options.parentToolCallId,
+			detached: options.detached,
+			agentSource: agent.source,
+			description: options.description,
+			status: "started" as const,
+			index,
+		});
+	} catch (err) {
+		logger.warn("agy start lifecycle emit threw", { id, error: formatErrorMessage(err) });
+	}
 	scheduleProgress(true);
 
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
@@ -1322,19 +1343,31 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 	scheduleProgress(true);
 
-	emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
-		id,
-		agent: agent.name,
-		parentToolCallId: options.parentToolCallId,
-		detached: options.detached,
-		agentSource: agent.source,
-		description: progress.description,
-		status: progress.status,
-		index,
-	});
+	try {
+		emitSubagentFrame(options.eventBus, options.subagentEventBus, TASK_SUBAGENT_LIFECYCLE_CHANNEL, {
+			id,
+			agent: agent.name,
+			parentToolCallId: options.parentToolCallId,
+			detached: options.detached,
+			agentSource: agent.source,
+			description: progress.description,
+			status: progress.status,
+			index,
+		});
+	} catch (err) {
+		logger.warn("agy terminal lifecycle emit threw", {
+			id,
+			status: progress.status,
+			error: formatErrorMessage(err),
+		});
+	}
 
 	if (outputPath) {
-		AgentRegistry.global().setHistory(id, { outputPath });
+		try {
+			AgentRegistry.global().setHistory(id, { outputPath });
+		} catch (err) {
+			logger.warn("agy setHistory failed", { id, error: formatErrorMessage(err) });
+		}
 	}
 
 	const durationMs = Date.now() - startTime;

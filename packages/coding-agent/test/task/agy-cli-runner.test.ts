@@ -1003,5 +1003,38 @@ exit 0
 		expect(okResult.output).toBe("valid-after-noise");
 		expect(okResult.error).toBeUndefined();
 		expect(okLifecycle).toEqual(["started", "completed"]);
+
+		// Observer isolation: a throwing onProgress callback (both initial and terminal) must not
+		// suppress progress/lifecycle publication or replace the settled SingleResult.
+		for (const scenario of [
+			{ bin: resilientBin, expectedExit: 0, expectedLifecycle: "completed" as const },
+			{ bin: path.join(dir, "fake-agy-null-response"), expectedExit: 1, expectedLifecycle: "failed" as const },
+		]) {
+			const bus = new EventBus();
+			const lifecycle: string[] = [];
+			const progressStatuses: string[] = [];
+			bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+				lifecycle.push((payload as SubagentLifecyclePayload).status);
+			});
+			bus.on(TASK_SUBAGENT_PROGRESS_CHANNEL, payload => {
+				progressStatuses.push((payload as SubagentProgressPayload).progress.status);
+			});
+			const res = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "check throwing progress observer",
+				index: 0,
+				id: `ThrowingObserver-${scenario.expectedLifecycle}`,
+				eventBus: bus,
+				onProgress: p => {
+					throw new Error(`observer exploded on ${p.status}`);
+				},
+				settings: makeSettings(scenario.bin, { "*": "gemini-4-neon-low" }),
+			});
+			expect(res.exitCode).toBe(scenario.expectedExit);
+			expect(lifecycle).toEqual(["started", scenario.expectedLifecycle]);
+			expect(progressStatuses).toContain("running");
+			expect(progressStatuses.at(-1)).toBe(scenario.expectedLifecycle);
+		}
 	}, 30_000);
 });
