@@ -232,16 +232,23 @@ function formatErrorMessage(err: unknown): string {
 }
 
 function invokeObserverSafely(label: string, context: Record<string, unknown>, fn: () => unknown): void {
+	let result: unknown;
 	try {
-		const result = fn();
-		// Attach rejection handling for async/thenable observers without awaiting or delaying publication.
-		if (result !== null && (typeof result === "object" || typeof result === "function") && "then" in result) {
-			void Promise.resolve(result).catch(err => {
-				logger.warn(label, { ...context, error: formatErrorMessage(err) });
-			});
-		}
+		result = fn();
 	} catch (err) {
 		logger.warn(label, { ...context, error: formatErrorMessage(err) });
+		return;
+	}
+	if (result !== null && (typeof result === "object" || typeof result === "function")) {
+		// Assimilate any Promise/PromiseLike (including virtual-then proxies and promises with
+		// shadowed `.catch`) via native `await` in a detached async wrapper without delaying callers.
+		void (async () => {
+			try {
+				await result;
+			} catch (err) {
+				logger.warn(label, { ...context, error: formatErrorMessage(err) });
+			}
+		})();
 	}
 }
 

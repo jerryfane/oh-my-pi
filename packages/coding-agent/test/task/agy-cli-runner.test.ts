@@ -1062,27 +1062,60 @@ exit 0
 				expect(obsProgressStatuses.at(-1)).toBe(scenario.expectedLifecycle);
 			}
 
-			// Async rejecting onProgress must not trigger unhandledRejection.
-			const asyncBus = new EventBus();
-			const asyncLifecycle: string[] = [];
-			asyncBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
-				asyncLifecycle.push((payload as SubagentLifecyclePayload).status);
-			});
-			const asyncRes = await runSubprocess({
-				cwd: dir,
-				agent: makeAgent(),
-				task: "check async rejecting progress observer",
-				index: 0,
-				id: "AsyncObserver-completed",
-				eventBus: asyncBus,
-				onProgress: (async (p: AgentProgress) => {
-					throw new Error(`async observer failed on ${p.status}`);
-				}) as unknown as (progress: AgentProgress) => void,
-				settings: makeSettings(resilientBin, { "*": "gemini-4-neon-low" }),
-			});
-			await Bun.sleep(20);
-			expect(asyncRes.exitCode).toBe(0);
-			expect(asyncLifecycle).toEqual(["started", "completed"]);
+			// Async rejecting onProgress (native async, virtual-then Proxy, and Promise with shadowed catch)
+			// must not trigger unhandledRejection or fail the settled run.
+			const asyncCases: Array<{ name: string; observer: (progress: AgentProgress) => unknown }> = [
+				{
+					name: "native-async",
+					observer: async p => {
+						throw new Error(`async observer failed on ${p.status}`);
+					},
+				},
+				{
+					name: "virtual-then-proxy",
+					observer: p =>
+						new Proxy(
+							{},
+							{
+								has: () => false,
+								get: (_target, prop) =>
+									prop === "then"
+										? (_resolve: unknown, reject: (reason: unknown) => void) => {
+												queueMicrotask(() => reject(new Error(`proxy thenable failed on ${p.status}`)));
+											}
+										: undefined,
+							},
+						),
+				},
+				{
+					name: "shadowed-catch-promise",
+					observer: p => {
+						const rejected = Promise.reject(new Error(`shadowed-catch failed on ${p.status}`));
+						Object.defineProperty(rejected, "catch", { value: undefined });
+						return rejected;
+					},
+				},
+			];
+			for (const ac of asyncCases) {
+				const asyncBus = new EventBus();
+				const asyncLifecycle: string[] = [];
+				asyncBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload => {
+					asyncLifecycle.push((payload as SubagentLifecyclePayload).status);
+				});
+				const asyncRes = await runSubprocess({
+					cwd: dir,
+					agent: makeAgent(),
+					task: `check ${ac.name} progress observer`,
+					index: 0,
+					id: `AsyncObserver-${ac.name}`,
+					eventBus: asyncBus,
+					onProgress: ac.observer as unknown as (progress: AgentProgress) => void,
+					settings: makeSettings(resilientBin, { "*": "gemini-4-neon-low" }),
+				});
+				await Bun.sleep(20);
+				expect(asyncRes.exitCode).toBe(0);
+				expect(asyncLifecycle).toEqual(["started", "completed"]);
+			}
 			expect(unhandled).toEqual([]);
 		} finally {
 			process.off("unhandledRejection", onUnhandled);
