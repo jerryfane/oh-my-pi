@@ -312,21 +312,6 @@ function buildJsonSchemaPromptInstruction(jsonSchema?: string): string {
 	].join("\n");
 }
 
-async function waitForDrainOrTimeout(promise: Promise<void>, timeoutMs: number): Promise<"drained" | "timeout"> {
-	let timer: ReturnType<typeof setTimeout> | undefined;
-	try {
-		return await Promise.race([
-			promise.then(() => "drained" as const),
-			new Promise<"timeout">(resolve => {
-				timer = setTimeout(() => resolve("timeout"), timeoutMs);
-				timer.unref?.();
-			}),
-		]);
-	} finally {
-		if (timer) clearTimeout(timer);
-	}
-}
-
 interface StepUsageTotals {
 	requests: number;
 	inputTokens: number;
@@ -380,7 +365,6 @@ async function runSingleAgyStep(params: {
 	let stepCacheRead = 0;
 	let stepLastContext: number | undefined;
 	let cp: ptree.ChildProcess | undefined;
-	let cancelStdout: (() => Promise<void>) | undefined;
 
 	const currentUsage = (): StepUsageTotals => ({
 		requests: stepRequests,
@@ -507,58 +491,54 @@ async function runSingleAgyStep(params: {
 			env: { ...Bun.env, AGY_CLI_DISABLE_AUTO_UPDATE: "1" },
 		});
 
-		const readStdout = (async () => {
-			const reader = cp.stdout.getReader();
-			cancelStdout = () => reader.cancel();
-			const decoder = new TextDecoder();
-			let pending = "";
-			const handleLine = (rawLine: string) => {
-				const parsed = parseAgyStreamLine(rawLine);
-				if (!parsed) return;
-				if (parsed.event === "init") {
-					if (parsed.conversation_id) conversationId = parsed.conversation_id;
-					if (parsed.init?.model) model = parsed.init.model;
-				} else if (parsed.event === "step_update") {
-					const su = parsed.step_update;
-					if (su?.conversation_id) conversationId = su.conversation_id;
-					if (su?.step_type === "agent_response") {
-						if (su.text_delta) streamedText += su.text_delta;
-						if (su.state === "DONE") {
-							stepRequests += 1;
-							if (su.usage) {
-								const inp = su.usage.input_tokens ?? 0;
-								const out = su.usage.output_tokens ?? 0;
-								const cacheRead = su.usage.cache_read_tokens ?? 0;
-								stepInput += inp;
-								stepOutput += out;
-								stepCacheRead += cacheRead;
-								const ctx = inp + cacheRead;
-								if (ctx > 0) stepLastContext = ctx;
-							}
+		const decoder = new TextDecoder();
+		let pending = "";
+		const handleLine = (rawLine: string) => {
+			const parsed = parseAgyStreamLine(rawLine);
+			if (!parsed) return;
+			if (parsed.event === "init") {
+				if (parsed.conversation_id) conversationId = parsed.conversation_id;
+				if (parsed.init?.model) model = parsed.init.model;
+			} else if (parsed.event === "step_update") {
+				const su = parsed.step_update;
+				if (su?.conversation_id) conversationId = su.conversation_id;
+				if (su?.step_type === "agent_response") {
+					if (su.text_delta) streamedText += su.text_delta;
+					if (su.state === "DONE") {
+						stepRequests += 1;
+						if (su.usage) {
+							const inp = su.usage.input_tokens ?? 0;
+							const out = su.usage.output_tokens ?? 0;
+							const cacheRead = su.usage.cache_read_tokens ?? 0;
+							stepInput += inp;
+							stepOutput += out;
+							stepCacheRead += cacheRead;
+							const ctx = inp + cacheRead;
+							if (ctx > 0) stepLastContext = ctx;
 						}
 					}
-				} else if (parsed.event === "result") {
-					resultEvent = parsed.result;
-					if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
 				}
-				params.onEvent(parsed);
-			};
-			try {
-				while (true) {
-					const { done, value } = await reader.read();
-					if (done) break;
-					pending += decoder.decode(value, { stream: true });
-					let nl = pending.indexOf("\n");
-					while (nl !== -1) {
-						handleLine(pending.slice(0, nl));
-						pending = pending.slice(nl + 1);
-						nl = pending.indexOf("\n");
-					}
+			} else if (parsed.event === "result") {
+				resultEvent = parsed.result;
+				if (parsed.result?.conversation_id) conversationId = parsed.result.conversation_id;
+			}
+			params.onEvent(parsed);
+		};
+		// Use ptree's tracked stdout reader so one post-exit descendantDrainMs timer covers both pipes.
+		const readStdout = cp
+			.readStdout(chunk => {
+				pending += decoder.decode(chunk, { stream: true });
+				let nl = pending.indexOf("\n");
+				while (nl !== -1) {
+					handleLine(pending.slice(0, nl));
+					pending = pending.slice(nl + 1);
+					nl = pending.indexOf("\n");
 				}
+			})
+			.then(() => {
 				pending += decoder.decode();
 				if (pending.trim()) handleLine(pending);
-			} catch {}
-		})();
+			});
 
 		let exitCode = 1;
 		try {
@@ -576,19 +556,8 @@ async function runSingleAgyStep(params: {
 			}
 		}
 
-		// Bound post-exit stdout drain so an orphaned descendant holding stdout open on non-subreaper
-		// platforms cannot hang settlement.
-		if (aborted || timedOut) {
-			await cancelStdout?.().catch(() => {});
-			await readStdout.catch(() => {});
-		} else {
-			const drainWinner = await waitForDrainOrTimeout(readStdout, POST_EXIT_DRAIN_MS);
-			if (drainWinner === "timeout") {
-				await cancelStdout?.().catch(() => {});
-				cp.kill(new ptree.AbortError("post-exit descendant cleanup", cp.peekStderr()), -1);
-				await readStdout.catch(() => {});
-			}
-		}
+		// Wait for both tracked pipes to settle (bounded by ptree's descendantDrainMs / timeout / abort cutoff).
+		await Promise.all([readStdout.catch(() => {}), cp.stderrDone.catch(() => {})]);
 
 		stderrText = cp.peekStderr().trim();
 

@@ -302,6 +302,7 @@ export class ChildProcess<In extends InMask = InMask> {
 	// Keeping the registration after idle lets a later output read re-arm the signal.
 	#abortRegistrations?: Set<() => void>;
 	#timeoutTimer?: NodeJS.Timeout;
+	#drainTimer?: ReturnType<typeof setTimeout>;
 	#stderrStream?: ReadableStream<Uint8Array>;
 	// Termination in flight after kill(); aborted exits await it before reporting.
 	#terminating?: Promise<boolean | void>;
@@ -371,30 +372,10 @@ export class ChildProcess<In extends InMask = InMask> {
 			.then(async exitCode => {
 				this.#syncAbortListeners();
 				if (this.#exitReasonPending) {
+					this.#clearDrainTimer();
 					this.#exitReason = this.#exitReasonPending;
 					reject(this.#exitReasonPending);
 					return;
-				}
-				// On non-subreaper platforms (or detached spawns without a Linux subreaper),
-				// bound post-exit pipe drain from the raw command exit so a lingering descendant
-				// holding inherited stderr/stdout open cannot block settlement or alter the exit code.
-				if (!this.#hardKillTree && this.#descendantDrainMs !== undefined && this.#openPipeReaders > 0) {
-					const drainTimer = setTimeout(() => {
-						if (this.#openPipeReaders > 0) {
-							if (this.#terminateGroup && process.platform !== "win32") {
-								try {
-									process.kill(-this.proc.pid, "SIGKILL");
-								} catch {}
-							} else if (this.#windowsRootProcess) {
-								try {
-									this.#windowsRootProcess.killTree();
-								} catch {}
-							}
-							this.#cutoffOutput();
-						}
-					}, this.#descendantDrainMs);
-					drainTimer.unref?.();
-					void this.#stderrDone.finally(() => clearTimeout(drainTimer));
 				}
 				if (exitCode === 0) {
 					resolve(0);
@@ -451,6 +432,11 @@ export class ChildProcess<In extends InMask = InMask> {
 	/** Optional stderr stream (only when requested in spawn options). */
 	get stderr() {
 		return this.#stderrStream;
+	}
+
+	/** Resolves once the internal stderr drain finishes (on EOF or cutoff). */
+	get stderrDone(): Promise<void> {
+		return this.#stderrDone;
 	}
 
 	get exitedCleanly(): Promise<number> {
@@ -659,6 +645,35 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	/**
+	 * Stream stdout chunks through a tracked pipe reader so post-exit descendant
+	 * drain, abort signals, and command timeouts cover streaming consumers too.
+	 */
+	async readStdout(onChunk: (chunk: Uint8Array) => void): Promise<void> {
+		const reader = this.proc.stdout.getReader();
+		this.#openPipeReaders++;
+		this.#pipeReaders.add(reader);
+		this.#syncAbortListeners();
+		try {
+			for (;;) {
+				if (this.#cutoff) {
+					await reader.cancel().catch(() => {});
+					break;
+				}
+				const r = await reader.read();
+				if (r.done) break;
+				onChunk(r.value);
+			}
+		} catch {
+			// A cancelled or failed read stops cleanly and keeps whatever was already processed.
+		} finally {
+			this.#pipeReaders.delete(reader);
+			this.#openPipeReaders--;
+			reader.releaseLock();
+			this.#syncAbortListeners();
+		}
+	}
+
+	/**
 	 * Read a pipe fully, stopping early only at an explicit command deadline or abort.
 	 */
 	async #readStream(stream: ReadableStream<Uint8Array>): Promise<string> {
@@ -825,8 +840,51 @@ export class ChildProcess<In extends InMask = InMask> {
 	}
 
 	#syncAbortListeners(): void {
+		this.#syncDrainTimer();
 		if (!this.#abortRegistrations) return;
 		for (const sync of this.#abortRegistrations) sync();
+	}
+
+	#clearDrainTimer(): void {
+		if (!this.#drainTimer) return;
+		clearTimeout(this.#drainTimer);
+		this.#drainTimer = undefined;
+	}
+
+	/**
+	 * On non-subreaper spawns with `descendantDrainMs`, run one post-exit timer
+	 * covering all tracked pipe readers (stderr + any tracked stdout reader) and
+	 * cancel it only once every pipe reader has finished.
+	 */
+	#syncDrainTimer(): void {
+		if (this.#hardKillTree || this.#descendantDrainMs === undefined) return;
+		if (this.#exitReasonPending) {
+			this.#clearDrainTimer();
+			return;
+		}
+		if (this.proc.exitCode === null && this.proc.signalCode === null) return;
+		if (this.#openPipeReaders <= 0) {
+			this.#clearDrainTimer();
+			return;
+		}
+		if (this.#drainTimer) return;
+		const timer = setTimeout(() => {
+			this.#drainTimer = undefined;
+			if (this.#openPipeReaders > 0) {
+				if (this.#terminateGroup && process.platform !== "win32") {
+					try {
+						process.kill(-this.proc.pid, "SIGKILL");
+					} catch {}
+				} else if (this.#windowsRootProcess) {
+					try {
+						this.#windowsRootProcess.killTree();
+					} catch {}
+				}
+				this.#cutoffOutput();
+			}
+		}, this.#descendantDrainMs);
+		timer.unref?.();
+		this.#drainTimer = timer;
 	}
 
 	#cutoffOutput(): void {

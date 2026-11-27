@@ -520,6 +520,92 @@ ${createLinuxSubreaperScript()}
 			expect(threw).toBeInstanceOf(TimeoutError);
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"bounds post-exit drain across stdout and stderr on detached non-subreaper spawns while preserving real exit code and killing helpers",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-nonsub-"));
+			try {
+				// 1. Helper holds ONLY stderr open on exit 23
+				const stderrSentinel = path.join(dir, "stderr-helper.txt");
+				const t1 = Date.now();
+				const cp1 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(stderrSentinel)}) >/dev/null & echo err-msg >&2; exit 23`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				expect(await cp1.exited).toBe(23);
+				expect(cp1.peekStderr()).toContain("err-msg");
+				expect(Date.now() - t1).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(stderrSentinel).exists()).toBe(false);
+
+				// 2. wait() with helper holding ONLY stdout open (stderr closes immediately)
+				const stdoutSentinel = path.join(dir, "stdout-helper.txt");
+				const t2 = Date.now();
+				const cp2 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(stdoutSentinel)}) 2>/dev/null & echo out-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				const res2 = await cp2.wait({ allowNonZero: true });
+				expect(res2.exitCode).toBe(0);
+				expect(res2.stdout).toContain("out-ok");
+				expect(Date.now() - t2).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(stdoutSentinel).exists()).toBe(false);
+
+				// 3. wait() with stderr closing 40ms into the drain while stdout stays open
+				const mixedSentinel = path.join(dir, "mixed-helper.txt");
+				const t3 = Date.now();
+				const cp3 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.04) >/dev/null & (trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(mixedSentinel)}) 2>/dev/null & echo mixed-ok; exit 0`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				const res3 = await cp3.wait({ allowNonZero: true });
+				expect(res3.exitCode).toBe(0);
+				expect(res3.stdout).toContain("mixed-ok");
+				expect(Date.now() - t3).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(mixedSentinel).exists()).toBe(false);
+
+				// 4. Streaming readStdout() with exit 23 and stdout-only helper
+				const streamSentinel = path.join(dir, "stream-helper.txt");
+				const t4 = Date.now();
+				const cp4 = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`(trap '' TERM; sleep 0.5 && echo lived > ${JSON.stringify(streamSentinel)}) 2>/dev/null & echo stream-ok; exit 23`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 120 },
+				);
+				let streamed = "";
+				const dec = new TextDecoder();
+				const readP = cp4.readStdout(chunk => {
+					streamed += dec.decode(chunk, { stream: true });
+				});
+				expect(await cp4.exited).toBe(23);
+				await Promise.all([readP, cp4.stderrDone]);
+				expect(streamed).toContain("stream-ok");
+				expect(Date.now() - t4).toBeLessThan(450);
+				await Bun.sleep(550);
+				expect(await Bun.file(streamSentinel).exists()).toBe(false);
+			} finally {
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });
 
 describe.skipIf(process.platform !== "linux")("ptree subreaper stop", () => {
@@ -718,34 +804,6 @@ console.log("settled");
 			}
 		}, 60_000);
 	}
-
-	it.skipIf(process.platform === "win32")(
-		"bounds nonzero stderr drain on detached non-subreaper spawns while preserving real exit code",
-		async () => {
-			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "pi-utils-drain-nonsub-"));
-			const sentinel = path.join(dir, "helper-lived.txt");
-			try {
-				const t0 = Date.now();
-				const cp = spawn(
-					[
-						"/bin/sh",
-						"-c",
-						`(trap '' TERM; sleep 2 && echo lived > ${JSON.stringify(sentinel)}) >/dev/null & echo err-msg >&2; exit 23`,
-					],
-					{ detached: true, subreaper: false, descendantDrainMs: 150 },
-				);
-				const exitCode = await cp.exited;
-				const elapsed = Date.now() - t0;
-				expect(exitCode).toBe(23);
-				expect(cp.peekStderr()).toContain("err-msg");
-				expect(elapsed).toBeLessThan(1_000);
-				await Bun.sleep(400);
-				expect(await Bun.file(sentinel).exists()).toBe(false);
-			} finally {
-				await fs.rm(dir, { recursive: true, force: true });
-			}
-		},
-	);
 
 	it.skipIf(process.platform !== "linux")(
 		"kills pgrp helpers and fails closed on surviving setsid helpers when procfs discovery fails",
