@@ -243,6 +243,7 @@ describe("notices of a prompt's batch (#21-#24 review)", () => {
 		await session.prompt("next");
 		await session.waitForIdle();
 		expect(requests[1]).toContain("mcp__nucleus_fetch");
+		expect(requests[1]).not.toContain("mcp__nucleus_search");
 	});
 
 	it("a refused bound batch records nothing, not even a take that emitted no notice: a later request with a replaced prompt still announces the device (#24 review)", async () => {

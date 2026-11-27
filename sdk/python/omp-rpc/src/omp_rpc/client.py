@@ -354,7 +354,8 @@ class HostToolCompletedEvent:
     top-level call, a tool command run inside a `bash` call, or the eval
     bridge — unlike `tool_execution_end`, which only names the transport tool
     the agent invoked. `tool_call_id` is the id omp dispatched with; for
-    eval-bridged calls it is synthetic and matches no `tool_execution_*` event.
+    bash tool-command (`<bash_call_id>:cmd:<n>`) and eval-bridged calls it is
+    a child/synthetic id and matches no `tool_execution_*` event.
     """
 
     tool_name: str
@@ -531,7 +532,6 @@ class RpcClient(WireClient):
         self._event_condition = threading.Condition()
         self._pending: dict[str, _PendingRequest] = {}
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
-        self._host_tool_dispatch_names: dict[str, str] = {}
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
         self._request_id = 0
         self._events = _BoundedHistory[JsonObject](self._max_event_history)
@@ -755,7 +755,6 @@ class RpcClient(WireClient):
             # reader's exception path) returns early.
             self._mark_closed(RpcProcessExitError("RPC process stopped"))
             self._pending_host_tool_calls.clear()
-            self._host_tool_dispatch_names.clear()
             self._pending_host_uri_requests.clear()
             self._process = None
             self._pgid = None
@@ -1533,31 +1532,6 @@ class RpcClient(WireClient):
             return cast(JsonObject, dict(result))
         raise RpcError("Host tool handlers must return a string or a result mapping")
 
-    def _normalize_host_tool_event(self, payload: JsonObject) -> None:
-        """Rename transport tool events for in-flight host-tool dispatches.
-
-        With `tools.commands` enabled, omp mounts custom tools as commands in
-        the embedded bash engine and the agent runs them inside a `bash` call,
-        so `tool_execution_update`/`tool_execution_end` events report the
-        transport tool (`bash`) rather than the host tool that actually ran.
-        The `host_tool_call` frame carries the outer call's `toolCallId` (the
-        bash run forwards it verbatim), which lets events for that call be
-        renamed to the executed host tool — consumers observe the same tool
-        names regardless of dispatch path. A top-level call (tool commands off)
-        maps the name onto itself. `tool_execution_start` precedes the
-        `host_tool_call` frame on the wire, so start events keep the transport
-        name.
-        """
-        tool_call_id = payload.get("toolCallId")
-        if not isinstance(tool_call_id, str):
-            return
-        if payload.get("type") == "tool_execution_end":
-            tool_name = self._host_tool_dispatch_names.pop(tool_call_id, None)
-        else:
-            tool_name = self._host_tool_dispatch_names.get(tool_call_id)
-        if tool_name is not None:
-            payload["toolName"] = tool_name
-
     def _handle_host_tool_call(self, payload: JsonObject) -> None:
         request_id = payload.get("id")
         tool_name = payload.get("toolName")
@@ -1569,10 +1543,6 @@ class RpcClient(WireClient):
             or not isinstance(tool_call_id, str)
         ):
             return
-        # Remember the dispatch so tool_execution_* events for this call id can
-        # be renamed from the transport tool to the host tool that ran; see
-        # _normalize_host_tool_event.
-        self._host_tool_dispatch_names[tool_call_id] = tool_name
         if not isinstance(raw_arguments, Mapping):
             self._send_notification(
                 {
@@ -1980,8 +1950,6 @@ class RpcClient(WireClient):
                     continue
 
                 payload_type = payload.get("type")
-                if payload_type in ("tool_execution_update", "tool_execution_end"):
-                    self._normalize_host_tool_event(payload)
                 try:
                     notification = parse_notification(payload)
                 except (TypeError, ValueError) as exc:

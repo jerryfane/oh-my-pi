@@ -650,7 +650,7 @@ FAKE_SERVER = textwrap.dedent(
                         {
                             "type": "host_tool_call",
                             "id": "host-call-2",
-                            "toolCallId": "toolu_bash_1",
+                            "toolCallId": "toolu_bash_1:cmd:0",
                             "toolName": "echo_host",
                             "arguments": {"message": "hello"},
                         }
@@ -1651,23 +1651,21 @@ class RpcClientTests(unittest.TestCase):
             self.assertEqual(len(end_events), 1)
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
 
-    def test_tool_command_events_carry_host_tool_name(self) -> None:
-        """Events for a tool command run inside a `bash` call are renamed to the executed host tool.
+    def test_bash_tool_command_reports_completion_and_keeps_bash_event_name(self) -> None:
+        """A host tool run as a command inside `bash` reports via `on_host_tool_completed`.
 
-        With `tools.commands` on, omp mounts a custom tool as a command in the
-        embedded bash engine and the agent runs it inside a `bash` call, so the
-        wire events carry the transport tool (`bash`). Consumers must observe
-        the host-tool name on update/end events regardless of dispatch path —
-        roboomp's terminal-action detection triple-posted PR reviews when end
-        events only said `bash` (oh-my-pi#6696). `tool_execution_start`
-        precedes the `host_tool_call` frame on the wire and keeps the transport
-        name.
+        With `tools.commands` on, omp mounts custom tools as commands in the
+        embedded bash engine and dispatches each command under a child id
+        (`<bash_call_id>:cmd:<index>`). Aggregate `tool_execution_*` events keep
+        the outer `bash` name and id, while individual host-tool completions are
+        reported through `on_host_tool_completed`.
         """
 
         def echo_host(args: dict[str, str], context) -> str:
             context.send_update(f"working:{args['message']}")
             return f"host:{args['message']}"
 
+        completed: list[HostToolCompletedEvent] = []
         with self.make_client(
             custom_tools=(
                 host_tool(
@@ -1683,6 +1681,7 @@ class RpcClientTests(unittest.TestCase):
                 ),
             )
         ) as client:
+            client.on_host_tool_completed(completed.append)
             turn = client.prompt_and_wait("needs bash tool command", timeout=2.0)
             start_names = [
                 event.tool_name
@@ -1702,11 +1701,19 @@ class RpcClientTests(unittest.TestCase):
 
             self.assertEqual(start_names, ["bash"])
             self.assertEqual(
-                [event.tool_name for event in update_events], ["echo_host"]
+                [event.tool_name for event in update_events], ["bash"]
             )
-            self.assertEqual([event.tool_name for event in end_events], ["echo_host"])
+            self.assertEqual([event.tool_name for event in end_events], ["bash"])
             self.assertEqual(end_events[0].tool_call_id, "toolu_bash_1")
             self.assertEqual(end_events[0].result["content"][0]["text"], "host:hello")
+            self.assertEqual(
+                completed,
+                [
+                    HostToolCompletedEvent(
+                        tool_name="echo_host", tool_call_id="toolu_bash_1:cmd:0"
+                    )
+                ],
+            )
 
     def _echo_host_tool(self, execute) -> HostTool:
         return host_tool(

@@ -1796,6 +1796,11 @@ class NegotiateProtocolResult:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class AbortAndDeliverQueueResult:
+    aborted: bool
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class TopicsListResult:
     topics: tuple[TopicSummary, ...]
     suggestions: tuple[TopicSuggestion, ...]
@@ -1822,11 +1827,6 @@ class TopicsDismissSuggestionResult:
 class TopicsOrganiseResult:
     queued: bool
     """The Inbox was busy; the turn runs after the current one."""
-
-
-@dataclass(slots=True, frozen=True, kw_only=True)
-class AbortAndDeliverQueueResult:
-    aborted: bool
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -3432,6 +3432,13 @@ def parse_negotiate_protocol_result(value: object, path: str = "NegotiateProtoco
     )
 
 
+def parse_abort_and_deliver_queue_result(value: object, path: str = "AbortAndDeliverQueueResult") -> AbortAndDeliverQueueResult:
+    payload = expect_object(value, path)
+    return AbortAndDeliverQueueResult(
+        aborted=required(payload, "aborted", decode_bool, path),
+    )
+
+
 def parse_topics_list_result(value: object, path: str = "TopicsListResult") -> TopicsListResult:
     payload = expect_object(value, path)
     return TopicsListResult(
@@ -3467,13 +3474,6 @@ def parse_topics_organise_result(value: object, path: str = "TopicsOrganiseResul
     payload = expect_object(value, path)
     return TopicsOrganiseResult(
         queued=required(payload, "queued", decode_bool, path),
-    )
-
-
-def parse_abort_and_deliver_queue_result(value: object, path: str = "AbortAndDeliverQueueResult") -> AbortAndDeliverQueueResult:
-    payload = expect_object(value, path)
-    return AbortAndDeliverQueueResult(
-        aborted=required(payload, "aborted", decode_bool, path),
     )
 
 

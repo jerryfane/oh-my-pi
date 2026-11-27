@@ -1111,6 +1111,16 @@ describe("wait", () => {
 				}),
 			);
 			expect(report(await elapse(interactiveHour, 1_800_000))).toContain("No job finished within 30m");
+
+			// An entry touched 2 minutes earlier has 8m retention left, so top window is 7m (8m - 1m margin), not 9m.
+			const touchedTwoMinutesAgo = Date.now() - 120_000;
+			const agedTenMinutes = new WaitTool(
+				session(manager, "Main", false, {
+					tuiTranscript: true,
+					getPromptCacheEntry: () => ({ touchedAt: touchedTwoMinutesAgo, tier: "long", ttlMs: 600_000 }),
+				}),
+			);
+			expect(report(await elapse(agedTenMinutes, 420_000))).toContain("No job finished within 7m");
 			build.resolve("done");
 		});
 

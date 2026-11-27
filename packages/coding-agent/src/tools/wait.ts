@@ -60,14 +60,16 @@ const RECENTLY_EVICTED_MS = 10 * 60_000;
 const RECENTLY_EVICTED_SHOWN = 3;
 
 /**
- * Top window of a blocking wait: the cache lifetime of the caller's latest
- * request less a margin, between the default 4m top window and
- * {@link WAIT_TOP_MAX_MS}; the default 4m top window without a known entry.
+ * Top window of a blocking wait: the remaining cache retention of the caller's
+ * latest request (`touchedAt + ttlMs - now`) less a margin, clamped between the
+ * default 4m top window and {@link WAIT_TOP_MAX_MS}; the default 4m top window
+ * without a known entry.
  */
-function waitTopMs(entry: PromptCacheEntry | undefined): number {
+function waitTopMs(entry: PromptCacheEntry | undefined, now = Date.now()): number {
 	const floor = WAIT_LADDER_MS[WAIT_TOP_RUNG];
 	if (!entry) return floor;
-	return Math.min(Math.max(entry.ttlMs - WAIT_CACHE_MARGIN_MS, floor), WAIT_TOP_MAX_MS);
+	const remainingMs = entry.touchedAt + entry.ttlMs - now;
+	return Math.min(Math.max(remainingMs - WAIT_CACHE_MARGIN_MS, floor), WAIT_TOP_MAX_MS);
 }
 
 /** Back-to-back waits that each elapsed with nothing new. */
