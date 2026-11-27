@@ -1,7 +1,7 @@
 import { logger, toError } from "@oh-my-pi/pi-utils";
 import { Settings } from "../config/settings";
-import { type OutputArtifactError, OutputSink } from "@oh-my-pi/pi-tui/tools/streaming-output";
-import { statusEventKey } from "@oh-my-pi/pi-tui/tools/eval";
+import { type ArtifactAllocator, type OutputArtifactError, OutputSink } from "../tools/streaming-output";
+import { statusEventKey } from "../tools/details/eval";
 import type { ToolSession } from "../tools";
 import { ToolAbortError } from "../tools/tool-errors";
 import {
@@ -83,9 +83,9 @@ export interface KernelExecutorBaseOptions {
 	/** Shows the user `out://` replies of the cell's bridged tool calls; absent, those calls are refused. */
 	onReply?: (text: string) => void;
 	toolSession?: ToolSession;
+	parentToolCallId?: string;
 	bridgeSessionId?: string;
-	artifactId?: string;
-	artifactPath?: string;
+	allocateArtifact?: ArtifactAllocator;
 	/** Set by the kernel session registry; true when this cell is the first on a replacement for a dead kernel. */
 	claimKernelRestartNotice?: () => boolean;
 }
@@ -108,9 +108,9 @@ export interface KernelExecutionResult {
 	stdinRequested: boolean;
 }
 
-/** Mirrors the `eval-state-context` reminder wording so agents recognise it. */
+/** Opens the first cell run on a replacement runtime: what earlier cells defined is gone. */
 export function formatKernelRestartNotice(runtimeLabel: string): string {
-	return `Kernel restarted: the previous ${runtimeLabel} is dead; state is unavailable. Re-run needed setup: variables, imports and definitions from earlier cells are gone.`;
+	return `[${runtimeLabel} restarted; earlier state gone]`;
 }
 
 /** Minimal kernel surface the base executor drives, satisfied by every backend kernel. */
@@ -488,8 +488,7 @@ export async function executeWithKernelBase<
 	const settings = await Settings.init();
 	const sink = new OutputSink({
 		onChunk: options?.onChunk,
-		artifactPath: options?.artifactPath,
-		artifactId: options?.artifactId,
+		allocateArtifact: options?.allocateArtifact,
 		headBytes: resolveOutputSinkHeadBytes(settings),
 		artifactMaxBytes: resolveOutputSinkArtifactMaxBytes(settings),
 		maxColumns: resolveOutputMaxColumns(settings),
@@ -542,6 +541,7 @@ export async function executeWithKernelBase<
 		options?.toolSession && options?.bridgeSessionId
 			? registerPyToolBridge(options.bridgeSessionId, runId, {
 					toolSession: options.toolSession,
+					parentToolCallId: options.parentToolCallId,
 					signal: options.signal,
 					cellTimeoutMs: executionTimeoutMs ?? options.idleTimeoutMs ?? 0,
 					shieldedSignal: abortShield.signal,
@@ -578,7 +578,7 @@ export async function executeWithKernelBase<
 			const annotation = timedOut
 				? formatKernelTimeoutAnnotation(executionTimeoutMs ?? options?.idleTimeoutMs, result.kernelKilled ?? false)
 				: result.kernelKilled && !abortShield.abortRequested
-					? "Kernel died during execution; completion is uncertain. The cell was not replayed; check for partial side effects before retrying."
+					? "kernel died mid-cell; completion uncertain, not replayed"
 					: undefined;
 			const dumped = await sink.dump(annotation);
 			return {
@@ -599,7 +599,7 @@ export async function executeWithKernelBase<
 		}
 
 		if (result.stdinRequested) {
-			const dumped = await sink.dump("Kernel requested stdin; interactive input is not supported.");
+			const dumped = await sink.dump("stdin unsupported");
 			return {
 				exitCode: 1,
 				cancelled: false,

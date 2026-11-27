@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import binascii
 import json
+import math
 import os
 import queue
 import signal
@@ -350,10 +351,11 @@ class HostToolCompletedEvent:
     """A registered host tool's `execute()` returned without raising.
 
     Emitted by `RpcClient.on_host_tool_completed` for every dispatch path —
-    top-level call, `xd://` device write, or the eval bridge — unlike
-    `tool_execution_end`, which only names the transport tool the agent
-    invoked. `tool_call_id` is the id omp dispatched with; for eval-bridged
-    calls it is synthetic and matches no `tool_execution_*` event.
+    top-level call, a tool command run inside a `bash` call, or the eval
+    bridge — unlike `tool_execution_end`, which only names the transport tool
+    the agent invoked. `tool_call_id` is the id omp dispatched with; for
+    bash tool-command (`<bash_call_id>:cmd:<n>`) and eval-bridged calls it is
+    a child/synthetic id and matches no `tool_execution_*` event.
     """
 
     tool_name: str
@@ -530,7 +532,6 @@ class RpcClient(WireClient):
         self._event_condition = threading.Condition()
         self._pending: dict[str, _PendingRequest] = {}
         self._pending_host_tool_calls: dict[str, _PendingHostToolCall] = {}
-        self._host_tool_dispatch_names: dict[str, str] = {}
         self._pending_host_uri_requests: dict[str, _PendingHostUriRequest] = {}
         self._request_id = 0
         self._events = _BoundedHistory[JsonObject](self._max_event_history)
@@ -754,7 +755,6 @@ class RpcClient(WireClient):
             # reader's exception path) returns early.
             self._mark_closed(RpcProcessExitError("RPC process stopped"))
             self._pending_host_tool_calls.clear()
-            self._host_tool_dispatch_names.clear()
             self._pending_host_uri_requests.clear()
             self._process = None
             self._pgid = None
@@ -915,7 +915,7 @@ class RpcClient(WireClient):
                 else:
                     self.cancel_ui_request(request.id)
                 return
-            if request.method == "ask":
+            if request.method in ("ask", "form"):
                 self.cancel_ui_request(request.id)
 
         return self.on_ui_request(handle)
@@ -951,6 +951,36 @@ class RpcClient(WireClient):
             wire_answers.append(entry)
         self._send_notification(
             {"type": "extension_ui_response", "id": request_id, "answers": wire_answers}
+        )
+
+    def send_ui_data(self, request_id: str, data: Mapping[str, str | int | float | Sequence[str]]) -> None:
+        """Answer a `form` request with the submitted values by control `name`.
+
+        Raises `TypeError` for a `bool` (forms submit option values, never booleans),
+        a value that is neither a string, a number nor a sequence of strings (`None`,
+        a mapping, a set), or a list member that is not a string, and `ValueError` for
+        a non-finite float, which JSON cannot carry.
+        """
+        wire_data: JsonObject = {}
+        for name, value in data.items():
+            if isinstance(value, bool):
+                raise TypeError(f"form field {name!r} must be a string, a number or a list of strings, not a bool")
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(f"form field {name!r} must be a finite number, not {value!r}")
+            if isinstance(value, (str, int, float)):
+                wire_data[name] = value
+                continue
+            if not isinstance(value, Sequence):
+                raise TypeError(
+                    f"form field {name!r} must be a string, a number or a list of strings, not {type(value).__name__}"
+                )
+            # Members are checked too: a NaN inside a list would write invalid JSON the server cannot parse.
+            members = list(value)
+            if not all(isinstance(member, str) for member in members):
+                raise TypeError(f"form field {name!r} must be a list of strings, not {members!r}")
+            wire_data[name] = members
+        self._send_notification(
+            {"type": "extension_ui_response", "id": request_id, "data": wire_data}
         )
 
     def cancel_ui_request(self, request_id: str, *, timed_out: bool = False) -> None:
@@ -1502,30 +1532,6 @@ class RpcClient(WireClient):
             return cast(JsonObject, dict(result))
         raise RpcError("Host tool handlers must return a string or a result mapping")
 
-    def _normalize_host_tool_event(self, payload: JsonObject) -> None:
-        """Rename transport tool events for in-flight host-tool dispatches.
-
-        With `tools.xdev` enabled, omp mounts custom tools as `xd://` devices
-        and the agent invokes them through the `write` tool, so
-        `tool_execution_update`/`tool_execution_end` events report the
-        transport tool (`write`) rather than the host tool that actually ran.
-        The `host_tool_call` frame carries the outer call's `toolCallId` (the
-        device dispatch forwards it verbatim), which lets events for that call
-        be renamed to the executed host tool — consumers observe the same tool
-        names regardless of transport. A top-level call (xdev off) maps the
-        name onto itself. `tool_execution_start` precedes the `host_tool_call`
-        frame on the wire, so start events keep the transport name.
-        """
-        tool_call_id = payload.get("toolCallId")
-        if not isinstance(tool_call_id, str):
-            return
-        if payload.get("type") == "tool_execution_end":
-            tool_name = self._host_tool_dispatch_names.pop(tool_call_id, None)
-        else:
-            tool_name = self._host_tool_dispatch_names.get(tool_call_id)
-        if tool_name is not None:
-            payload["toolName"] = tool_name
-
     def _handle_host_tool_call(self, payload: JsonObject) -> None:
         request_id = payload.get("id")
         tool_name = payload.get("toolName")
@@ -1537,10 +1543,6 @@ class RpcClient(WireClient):
             or not isinstance(tool_call_id, str)
         ):
             return
-        # Remember the dispatch so tool_execution_* events for this call id can
-        # be renamed from the transport tool to the host tool that ran; see
-        # _normalize_host_tool_event.
-        self._host_tool_dispatch_names[tool_call_id] = tool_name
         if not isinstance(raw_arguments, Mapping):
             self._send_notification(
                 {
@@ -1948,8 +1950,6 @@ class RpcClient(WireClient):
                     continue
 
                 payload_type = payload.get("type")
-                if payload_type in ("tool_execution_update", "tool_execution_end"):
-                    self._normalize_host_tool_event(payload)
                 try:
                     notification = parse_notification(payload)
                 except (TypeError, ValueError) as exc:

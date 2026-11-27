@@ -35,7 +35,11 @@ use omp_xfs::{
 };
 use crate::bre;
 use crate::host::{AsyncUtility, Host, StdoutFile};
+use crate::root_guard;
 use crate::stdio;
+
+/// `grep`'s spelling of the [`root_guard`] escape hatch; it has no depth cap.
+const ROOT_FLAGS: root_guard::Flags = root_guard::Flags { allow: "--allow-root", depth: None };
 
 /// Exit status of a `grep` or `rg` run: 0 when a line was selected, 1 when
 /// none was, 2 on any error, except that under `-q` a match outranks errors.
@@ -349,6 +353,10 @@ struct GrepArgs {
 	/// Recursively search and follow every symbolic link.
 	#[arg(short = 'R', long = "dereference-recursive")]
 	dereference_recursive: bool,
+
+	/// Permit a recursive search of a filesystem root such as /.
+	#[arg(long = "allow-root")]
+	allow_root: bool,
 
 	/// Follow symbolic links named as command-line operands.
 	#[arg(short = 'O')]
@@ -812,22 +820,10 @@ fn build_matcher(
 		return build_default_matcher(&builder, &translated, patterns).map(Engine::Rust);
 	}
 
-	// A `{` that opens no interval is a literal to GNU and BSD grep, but the
-	// `regex` crate refuses the whole pattern, so `grep -E '{a}'` failed on
-	// patterns real grep matches. An attempted-but-unterminated interval
-	// stays an error in both.
-	let patterns: Vec<std::borrow::Cow<'_, str>> =
-		patterns.iter().map(|p| bre::ere_literalize_braces(p)).collect();
-
-	// `regex` accepts `^+` and compiles it as `(?:^)+`, which matches at every
-	// line start. GNU and BSD grep both reject the pattern, so returning every
-	// line with exit 0 would be a wrong answer reported as success.
-	if let Some(bad) = patterns
+	let patterns = patterns
 		.iter()
-		.find(|pattern| bre::ere_repetition_operand_missing(pattern))
-	{
-		return Err(format!("repetition-operator operand invalid: {bad}"));
-	}
+		.map(|pattern| bre::ere_to_rust(pattern, true).map_err(|err| format!("{}: {pattern}", err.message())))
+		.collect::<Result<Vec<_>, _>>()?;
 
 	builder
 		.build_many(&patterns)
@@ -1870,6 +1866,13 @@ impl AsyncUtility for Grep {
 			"-"
 		}));
 	}
+	if directory_action == DirectoryAction::Recurse
+		&& !cli.allow_root
+		&& let Err(refusal) = root_guard::check(files.iter().map(|file| host.resolve(file)), None, ROOT_FLAGS)
+	{
+		let _ = writeln!(host.stderr, "grep: {refusal}");
+		return 2;
+	}
 
 	let max_count = match resolve_max_count(&cli) {
 		Ok(max_count) => max_count,
@@ -2065,6 +2068,16 @@ mod tests {
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Grep>(args, stdin, "/").await;
 		(code, capture.out(), capture.err())
+	}
+
+	/// Failure mode: `grep -r x /` walked the whole disk for hours.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn recursive_search_refuses_the_filesystem_root() {
+		// `-q` stops a regression at the first match instead of reading the disk.
+		let (code, out, err) = run(&["-rq", "e", "/"], "").await;
+		assert_eq!((code, out.as_str()), (2, ""));
+		assert!(err.starts_with("grep: refusing") && err.contains("--allow-root"), "stderr: {err}");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2588,8 +2601,8 @@ mod tests {
 
 	#[tokio::test(flavor = "multi_thread")]
 	async fn gnu_basic_alternation_and_color_aliases_are_supported() {
-		let input = "\"tools.xdev\": {}\n\"tools.toolbox\": {}\n\"tools.other\": {}\n";
-		let (code, out, err) = run(&["-c", r"tools.xdev\|tools.toolbox"], input).await;
+		let input = "\"tools.commands\": {}\n\"tools.toolbox\": {}\n\"tools.other\": {}\n";
+		let (code, out, err) = run(&["-c", r"tools.commands\|tools.toolbox"], input).await;
 		assert_eq!(code, 0, "{err}");
 		assert_eq!(out, "2\n");
 		for color in ["--color=auto", "--color=always", "--color=never", "--color"] {
@@ -2729,6 +2742,17 @@ mod tests {
 		// A `$` that ends neither is still a literal dollar sign.
 		let (_, out, err) = run(&["-c", "a$b"], "a$b\nab\n").await;
 		assert_eq!(out, "1\n", "{err}");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn posix_brackets_match_literal_square_brackets() {
+		for (mode, pattern, stdin, expected) in [
+			("-oE", r"[][\.^$*+?(){}|\\]", "a.b[c]\n", ".\n[\n]\n"),
+			("-o", "[.[]", "a[b\n", "[\n"),
+		] {
+			let (code, out, err) = run(&[mode, pattern], stdin).await;
+			assert_eq!((code, out.as_str(), err.as_str()), (0, expected, ""), "{mode} {pattern}");
+		}
 	}
 
 	#[tokio::test(flavor = "multi_thread")]

@@ -94,7 +94,7 @@ it.skipIf(process.platform === "win32")(
 it.skipIf(process.platform === "win32")("keeps state and options after a call that exits non-zero", async () => {
 	const tool = bashTool();
 	await run(tool, "set -uo pipefail; PI_STATE_VAR=kept");
-	expect((await run(tool, "false")).text).toContain("Command exited with code 1");
+	expect((await run(tool, "false")).text).toContain("[exit code 1]");
 	expect((await run(tool, 'printf "%s %s" "$PI_STATE_VAR" "$-"')).text).toMatch(/^kept \S*u\S*$/);
 });
 
@@ -129,7 +129,7 @@ it.skipIf(process.platform === "win32")(
 		expect((await run(tool, "sleep 2")).async?.state).toBe("running");
 
 		const overlapping = await run(tool, "/bin/sleep 30 & printf %s $!");
-		expect(overlapping.text).toContain("Background jobs started here run in a copy of the busy session shell");
+		expect(overlapping.text).toContain("[jobs invisible to later calls]");
 		const pid = Number.parseInt(overlapping.text, 10);
 		try {
 			Bun.gc(true);
@@ -147,21 +147,12 @@ it.skipIf(process.platform === "win32")(
 	async () => {
 		const [first, second] = [`${cwd}:first`, `${cwd}:second`];
 		let sessionId = first;
-		const heldAllocation = Promise.withResolvers<{ id?: string; path?: string }>();
-		let allocations = 0;
-		const tool = bashTool(
-			{ "bash.autoBackground.thresholdMs": 100 },
-			{
-				getSessionId: () => sessionId,
-				// Holds the first call before its shell starts, so the session changes underneath it.
-				allocateOutputArtifact: async () => (allocations++ === 0 ? heldAllocation.promise : {}),
-			},
-		);
+		const tool = bashTool({}, { getSessionId: () => sessionId });
 		try {
-			expect((await run(tool, "PI_STATE_VAR=from-first")).async?.state).toBe("running");
+			const pending = run(tool, "PI_STATE_VAR=from-first");
+			// The session changes after the call started but before its shell runs.
 			sessionId = second;
-			heldAllocation.resolve({});
-			await manager.waitForAll();
+			await pending;
 
 			expect((await run(tool, 'printf "[%s]" "$PI_STATE_VAR"')).text).toBe("[]");
 			// The left session's shell was dropped when that call finished.

@@ -14,7 +14,7 @@
  * `thinking` overrides (same vocabulary as the cascade, validated against the
  * row's API); catalog axes are rejected because they stay rule-owned.
  */
-import { API_COMPAT_RECORDS } from "../../src/compat/axes";
+import { API_COMPAT_RECORDS, type RuleAxes } from "../../src/compat/axes";
 import type {
 	CompiledProvider,
 	CompiledProviderDiscovery,
@@ -31,7 +31,7 @@ import {
 	runnerApiKind,
 	type TokenCost,
 } from "../../src/types";
-import { axisFor, collectAxis, type RuleAxes } from "./compile-axes";
+import { axisFor, collectAxis } from "./compile-axes";
 import {
 	CompatCompileError,
 	type KdlNodeView,
@@ -54,8 +54,8 @@ const KNOWN_APIS = [
 	"anthropic-messages",
 	"bedrock-converse-stream",
 	"google-generative-ai",
-	"google-gemini-cli",
 	"google-vertex",
+	"google-interactions",
 	"kiro-api",
 	"ollama-chat",
 	"cursor-agent",

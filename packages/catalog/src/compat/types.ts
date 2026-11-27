@@ -452,6 +452,10 @@ export interface CompiledCredentialMap {
 	projectId?: CompiledCredentialField;
 	apiEndpoint?: CompiledCredentialField;
 	enterpriseUrl?: CompiledCredentialField;
+	/** Dot path to the refresh token's remaining lifetime in seconds (`OAuthCredentials.refreshExpires`). */
+	refreshExpiresIn?: string;
+	/** Granted scopes (`OAuthCredentials.scope`), usually the response's `scope`. */
+	scope?: CompiledCredentialField;
 }
 
 /** Bearer GET that enriches credentials with identity fields. */
@@ -462,16 +466,17 @@ export interface CompiledUserinfo {
 }
 
 /**
- * One token-endpoint style request. `params` values may use `{placeholders}`
- * (`code`, `state`, `redirect_uri`, `code_verifier`, `client_id`,
- * `client_secret`, `refresh_token`, `device_code`, `scope`, `base`).
+ * One token-endpoint style request. String `params` values may use
+ * `{placeholders}` (`code`, `state`, `redirect_uri`, `code_verifier`,
+ * `client_id`, `client_secret`, `refresh_token`, `device_code`, `scope`,
+ * `base`); numeric values go out as JSON numbers.
  */
 export interface CompiledOAuthRequest {
 	url: CompiledAuthValue;
 	body: "form" | "json";
 	/** Include the grant's standard parameter set before `params`. */
 	standard: boolean;
-	params: Record<string, string>;
+	params: Record<string, string | number>;
 	headers: Record<string, string>;
 	timeoutMs?: number;
 }
@@ -555,15 +560,36 @@ export type CompiledLogin =
 	| CompiledDeviceCodeLogin
 	| CompiledCustomLogin;
 
+/**
+ * Token-endpoint refusals that prove a refresh grant dead: a 400/401 whose
+ * RFC 6749 `error` code is in `codes`, unless its `error_description` equals
+ * `exceptDescription`.
+ */
+export interface CompiledDeadGrant {
+	codes: string[];
+	exceptDescription?: string;
+}
+
 /** Refresh-token grant declared for a provider. */
 export type CompiledRefresh =
 	| { kind: "none" }
-	| { kind: "hook"; hook: string }
+	| {
+			kind: "hook";
+			hook: string;
+			/** Refresh once the access token is this close to expiry; the engine default otherwise. */
+			windowMs?: number;
+	  }
 	| {
 			kind: "request";
 			token: CompiledOAuthRequest;
 			/** Stored credential fields that must be present before refreshing. */
 			require: string[];
+			/** Sent space-joined as `scope`; a 400 `invalid_scope` retries once without it. */
+			scopes?: string[];
+			/** Refresh once the access token is this close to expiry; the engine default otherwise. */
+			windowMs?: number;
+			/** When set, only these refusals disable the login; every other refresh failure keeps it. */
+			deadGrant?: CompiledDeadGrant;
 			credential: CompiledCredentialMap;
 			userinfo?: CompiledUserinfo;
 			afterRefresh?: string;
@@ -590,9 +616,30 @@ export interface CompiledAuthProvider {
 	disabled?: string;
 	/** Account risk a user must accept (by typing "yes") before a new login starts. */
 	loginWarning?: string;
+	/**
+	 * What every surface calls the provider once an account is linked (such as
+	 * "Acme Pro plan"); `name` stays the pre-sign-in `/login` label.
+	 */
+	connectedName?: string;
+	/**
+	 * One transcript line shown when a session starts using one of the provider's
+	 * models (such as "Using your Acme Pro plan").
+	 */
+	activeNotice?: string;
 	storeAs?: string;
 	callbackPort?: number;
 	pasteCode?: boolean;
+	/**
+	 * Logins are bound to a key only this machine holds (such as a proof-of-possession key in
+	 * the OS vault), so they stay in the local `agent.db`: the auth broker
+	 * neither stores nor refreshes them.
+	 */
+	deviceBound?: boolean;
+	/**
+	 * Runs when a login is removed: `hook` forgets the account's secrets kept
+	 * outside the credential store and revokes the grant at the provider.
+	 */
+	signOut?: { hook: string };
 	apiKeyFormat: "bearer" | "structured";
 	expiry?: "jwt-or-never";
 	/** `api-key`: an OAuth login persists only `credentials.access` as a plain API key. */

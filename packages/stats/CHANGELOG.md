@@ -2,6 +2,30 @@
 
 ## [Unreleased]
 
+### Added
+
+- Added queryable tracking of tool approval requests and outcomes across sessions in the stats database.
+
+### Fixed
+
+- Fixed live updates and synchronization in the `omp stats` dashboard when session directories are inaccessible or agents are continuously writing.
+
+## [19.1.1] - 2026-11-23
+
+### Added
+
+- Added `readDailyActivity()` for reading stored daily activity without being blocked by another process writing to the stats database; it returns `null` when no stats database exists.
+
+### Fixed
+
+- Fixed Spotlight baseline and adjusted-net calculations to use consistent result sets, improving headline and step-row accuracy.
+
+## [19.0.1] - 2026-11-19
+
+### Added
+
+- Added 2d and 3d range presets with hourly buckets to the stats dashboard time selector ([#19766](https://github.com/can1357/oh-my-pi/issues/19766), [#19774](https://github.com/can1357/oh-my-pi/pull/19774) by [@thekitaev](https://github.com/thekitaev)).
+
 ## [19.0.0] - 2026-11-18
 
 ### Breaking Changes

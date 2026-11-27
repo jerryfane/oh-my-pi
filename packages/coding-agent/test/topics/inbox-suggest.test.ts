@@ -39,7 +39,7 @@ import { TopicSuggestTool } from "@oh-my-pi/pi-coding-agent/topics/suggest-tool"
 import { TOPIC_ORGANISE_TYPE, TOPIC_SUGGESTION_TYPE, TopicsError } from "@oh-my-pi/pi-coding-agent/topics/suggestions";
 import { resetTopicsRegistryForTests } from "@oh-my-pi/pi-coding-agent/topics/workers";
 import { TempDir } from "@oh-my-pi/pi-utils";
-import type { IrcMessage } from "@oh-my-pi/pi-tui/tools/irc";
+import type { IrcMessage } from "@oh-my-pi/pi-coding-agent/irc/irc-types";
 import { createAssistantMessage, createInMemoryAuthStorage } from "../helpers/agent-session-setup";
 
 const OWNER = "Main";

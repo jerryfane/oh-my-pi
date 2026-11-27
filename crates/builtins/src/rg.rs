@@ -41,6 +41,7 @@ use crate::grep::{
 	describe_search_error, exit_status, for_each_nonempty_match,
 };
 use crate::host::{AsyncUtility, Host, StdoutFile, StreamWriter, forward_slash_display};
+use crate::root_guard;
 use crate::stdio;
 
 use ignore::{
@@ -55,6 +56,9 @@ use omp_xfs::{
 	ignore::{Match as RuleMatch, Rules},
 	walk,
 };
+
+/// `rg`'s spelling of the [`root_guard`] escape hatches.
+const ROOT_FLAGS: root_guard::Flags = root_guard::Flags { allow: "--allow-root", depth: Some("--max-depth") };
 
 #[derive(Parser, Debug)]
 #[command(
@@ -284,6 +288,10 @@ pub(crate) struct Rg {
 	/// Limit directory traversal depth.
 	#[arg(short = 'd', long = "max-depth", alias = "maxdepth", value_name = "NUM")]
 	max_depth: Option<usize>,
+
+	/// Permit searching a filesystem root such as / deeper than --max-depth 2.
+	#[arg(long = "allow-root")]
+	allow_root: bool,
 
 	/// Ignore files larger than this size.
 	#[arg(long = "max-filesize", value_name = "NUM")]
@@ -1283,16 +1291,13 @@ async fn collect_files(
 	}
 }
 
-/// Display spelling of a walked `path` under the `operand` it was found from
-/// (resolved to `root`), with `/` separators on Windows like the shell's other
-/// path-printing utilities.
+/// Display spelling of a walked `path` under the operand spelled `operand`
+/// (resolved to `root`; see [`Operands::spelling`]), with `/` separators on
+/// Windows like the shell's other path-printing utilities.
 fn display_path(operand: &OsStr, root: &Path, path: &Path) -> PathBuf {
 	let rel = path.strip_prefix(root).unwrap_or(path);
-	if rel.is_empty() {
-		return PathBuf::from(operand);
-	}
-	let display = if operand == OsStr::new(".") {
-		rel.to_path_buf()
+	let display = if rel.is_empty() {
+		PathBuf::from(operand)
 	} else {
 		Path::new(operand).join(rel)
 	};
@@ -1912,7 +1917,7 @@ async fn path_is_stdout(stdout: Option<&StdoutFile>, fs: &omp_vfs::Fs, path: &Pa
 async fn list_files<W: Write>(
 	host: &mut Host,
 	cli: &Rg,
-	paths: &[OsString],
+	operands: &Operands,
 	record: &RecordFormat,
 	out: &mut W,
 ) -> SearchOutcome {
@@ -1923,7 +1928,7 @@ async fn list_files<W: Write>(
 	let mut any = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
-	for operand in paths {
+	for operand in &operands.paths {
 		if processed_operand && host.is_cancelled() {
 			had_error = true;
 			break;
@@ -1952,7 +1957,7 @@ async fn list_files<W: Write>(
 					if path_is_stdout(stdout.as_ref(), &fs, path).await {
 						continue;
 					}
-					let display = display_path(operand.as_os_str(), &resolved, path);
+					let display = display_path(operands.spelling(operand), &resolved, path);
 					let _ = record.write_path_record(out, Some(display.as_os_str().as_encoded_bytes()));
 					any = true;
 				}
@@ -1977,14 +1982,30 @@ async fn list_files<W: Write>(
 	SearchOutcome { any_match: any, had_error }
 }
 
-fn default_paths(paths: &mut Vec<OsString>, use_implicit_stdin: bool) {
-	if !paths.is_empty() {
-		return;
+/// What `rg` searches: the operands as given, or when none were, standard
+/// input if it is the search input, else the working directory.
+struct Operands {
+	paths:    Vec<OsString>,
+	/// `paths` is the default rather than given, so walked paths print
+	/// without the `./` an explicit `.` keeps.
+	implicit: bool,
+}
+
+impl Operands {
+	fn new(mut paths: Vec<OsString>, implicit_stdin: bool) -> Self {
+		let implicit = paths.is_empty();
+		if implicit {
+			paths.push(OsString::from(if implicit_stdin { "-" } else { "." }));
+		}
+		Self { paths, implicit }
 	}
-	if use_implicit_stdin {
-		paths.push(OsString::from("-"));
-	} else {
-		paths.push(OsString::from("."));
+
+	/// How `operand` spells its walked paths, matching ripgrep: as given
+	/// (`rg x .` prints `./a`, which a later `rg x "$f"` cannot mistake for a
+	/// flag when `a` starts with `-`), or empty for the implicit `.`
+	/// (`rg x` prints `a`).
+	fn spelling<'a>(&self, operand: &'a OsStr) -> &'a OsStr {
+		if self.implicit { OsStr::new("") } else { operand }
 	}
 }
 
@@ -2029,7 +2050,7 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 	host: &mut Host,
 	cli: &Rg,
 	matcher: &M,
-	paths: &[OsString],
+	operands: &Operands,
 	opts: &SearchOptions,
 	out: &mut W,
 ) -> i32 {
@@ -2049,7 +2070,7 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 	};
 	let fs = host.vfs();
 	let mut recursive = false;
-	for path in paths {
+	for path in &operands.paths {
 		if path.as_os_str() != OsStr::new("-")
 			&& fs.metadata(&host.resolve(path)).await.is_ok_and(|meta| meta.is_dir())
 		{
@@ -2057,13 +2078,13 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 			break;
 		}
 	}
-	let show_names = show_names_for(paths, recursive, cli, opts);
+	let show_names = show_names_for(&operands.paths, recursive, cli, opts);
 	let mut filters = None;
 	let mut stats = Stats::new();
 	let mut any_match = false;
 	let mut had_error = false;
 	let mut processed_operand = false;
-	for operand in paths {
+	for operand in &operands.paths {
 		if opts.quiet && any_match {
 			break;
 		}
@@ -2113,7 +2134,7 @@ async fn execute_search<M: Matcher<Captures: Send> + Clone + Send + Sync + 'stat
 							filters,
 							matcher,
 							&auto_searcher,
-							operand.as_os_str(),
+							operands.spelling(operand),
 							&resolved,
 							show_names,
 							opts,
@@ -2256,7 +2277,7 @@ impl AsyncUtility for Rg {
 	} else {
 		host.stdout_writer()
 	};
-	let (patterns, mut paths) = match resolve_patterns(host, &cli).await {
+	let (patterns, paths) = match resolve_patterns(host, &cli).await {
 		Ok(resolved) => resolved,
 		Err(error) => {
 			let _ = writeln!(host.stderr, "{error}");
@@ -2273,13 +2294,20 @@ impl AsyncUtility for Rg {
 		};
 	}
 	let pattern_stdin_consumed = cli.pattern_files.iter().any(|file| file == OsStr::new("-"));
-	default_paths(
-		&mut paths,
+	let operands = Operands::new(
+		paths,
 		!cli.files && !pattern_stdin_consumed && host.stdin_is_search_input(),
 	);
+	if !cli.allow_root
+		&& let Err(refusal) =
+			root_guard::check(operands.paths.iter().map(|path| host.resolve(path)), cli.max_depth, ROOT_FLAGS)
+	{
+		let _ = writeln!(host.stderr, "rg: {refusal}");
+		return 2;
+	}
 	opts.line_number = effective_line_number(&cli);
 	if cli.files {
-		let outcome = list_files(host, &cli, &paths, &opts.record, &mut out).await;
+		let outcome = list_files(host, &cli, &operands, &opts.record, &mut out).await;
 		let _ = out.flush();
 		return exit_status(false, outcome.any_match, outcome.had_error);
 	}
@@ -2294,8 +2322,8 @@ impl AsyncUtility for Rg {
 		},
 	};
 	match &matcher {
-		Engine::Rust(matcher) => execute_search(host, &cli, matcher, &paths, &opts, &mut out).await,
-		Engine::Pcre(matcher) => execute_search(host, &cli, matcher, &paths, &opts, &mut out).await,
+		Engine::Rust(matcher) => execute_search(host, &cli, matcher, &operands, &opts, &mut out).await,
+		Engine::Pcre(matcher) => execute_search(host, &cli, matcher, &operands, &opts, &mut out).await,
 	}
 }
 }
@@ -2310,6 +2338,15 @@ mod tests {
 	async fn run(args: &[&str], stdin: &str) -> (i32, String, String) {
 		let (code, capture) = run_async_util::<Rg>(args, stdin, "/").await;
 		(code, capture.out(), capture.err())
+	}
+
+	/// Failure mode: `rg x /` walked the whole disk for hours.
+	#[cfg(unix)]
+	#[tokio::test(flavor = "multi_thread")]
+	async fn refuses_to_search_the_filesystem_root() {
+		let (code, out, err) = run(&["--max-depth", "3", "needle", "/"], "").await;
+		assert_eq!((code, out.as_str()), (2, ""));
+		assert!(err.starts_with("rg: refusing") && err.contains("--allow-root"), "stderr: {err}");
 	}
 
 	fn anchored_glob_tree() -> tempfile::TempDir {
@@ -2435,7 +2472,7 @@ mod tests {
 			std::fs::create_dir_all(path.parent().unwrap()).unwrap();
 			std::fs::write(path, "hit\n").unwrap();
 		}
-		let sorted = "a/0.txt\na/b/3.txt\na/c/2.txt\nb/1.txt\nm.txt\nz.txt\n";
+		let sorted = "./a/0.txt\n./a/b/3.txt\n./a/c/2.txt\n./b/1.txt\n./m.txt\n./z.txt\n";
 		let (code, capture) = run_async_util::<Rg>(&["-l", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), sorted);
@@ -2453,6 +2490,26 @@ mod tests {
 		let (code, capture) = run_async_util::<Rg>(&["--files", "sub"], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
 		assert_eq!(capture.out(), "sub/file.txt\n");
+	}
+
+	#[tokio::test(flavor = "multi_thread")]
+	async fn explicit_dot_operand_keeps_its_prefix() {
+		// Defends: `rg -l x . | while read f; do rg y "$f"; done` must not
+		// hand the second rg `--dir/file` (an unrecognized flag); like real rg,
+		// an explicit `.` prints `./--dir/file` and only the implicit one strips it.
+		let tree = tempfile::tempdir().unwrap();
+		std::fs::create_dir(tree.path().join("--dir")).unwrap();
+		std::fs::write(tree.path().join("--dir/file.txt"), "hit\n").unwrap();
+		for (args, out) in [
+			(&["-l", "hit", "."][..], "./--dir/file.txt\n"),
+			(&["-l", "hit"][..], "--dir/file.txt\n"),
+			(&["--files", "."][..], "./--dir/file.txt\n"),
+			(&["--files"][..], "--dir/file.txt\n"),
+		] {
+			let (code, capture) = run_async_util::<Rg>(args, "", tree.path()).await;
+			assert_eq!(code, 0, "{args:?}: {}", capture.err());
+			assert_eq!(capture.out(), out, "{args:?}");
+		}
 	}
 
 
@@ -2491,7 +2548,7 @@ mod tests {
 			run_async_util::<Rg>(&["-n", "needle", "--glob", "!docs/evidence/**", "."], "", tree.path())
 				.await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "docs/c.txt:1:needle\nsrc/b.txt:1:needle\n");
+		assert_eq!(capture.out(), "./docs/c.txt:1:needle\n./src/b.txt:1:needle\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2500,7 +2557,7 @@ mod tests {
 		let (code, capture) =
 			run_async_util::<Rg>(&["-n", "needle", "-g", "src/*.txt", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "src/b.txt:1:needle\n");
+		assert_eq!(capture.out(), "./src/b.txt:1:needle\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2534,7 +2591,7 @@ mod tests {
 		let (code, capture) =
 			run_async_util::<Rg>(&["-n", "needle", "--iglob", "SRC/*.TXT", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "src/b.txt:1:needle\n");
+		assert_eq!(capture.out(), "./src/b.txt:1:needle\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2560,13 +2617,13 @@ mod tests {
 		std::fs::write(tree.path().join("a.txt"), "miss\nhit\n").unwrap();
 		let (code, capture) = run_async_util::<Rg>(&["hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt:hit\n");
+		assert_eq!(capture.out(), "./a.txt:hit\n");
 		let (code, capture) = run_async_util::<Rg>(&["-n", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt:2:hit\n");
+		assert_eq!(capture.out(), "./a.txt:2:hit\n");
 		let (code, capture) = run_async_util::<Rg>(&["-n", "-N", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt:hit\n");
+		assert_eq!(capture.out(), "./a.txt:hit\n");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2576,20 +2633,20 @@ mod tests {
 		std::fs::write(tree.path().join("a.txt"), "hit\n").unwrap();
 		let (code, capture) = run_async_util::<Rg>(&["-l0", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt\0");
+		assert_eq!(capture.out(), "./a.txt\0");
 		// Match lines: `path\0text` with no `:` after the NUL; with -n the
 		// line number follows the NUL (`path\0N:text`).
 		let (code, capture) = run_async_util::<Rg>(&["-0", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt\0hit\n");
+		assert_eq!(capture.out(), "./a.txt\0hit\n");
 		let (code, capture) = run_async_util::<Rg>(&["-n0", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "a.txt\01:hit\n");
+		assert_eq!(capture.out(), "./a.txt\01:hit\n");
 		// --files-without-match also emits bare `path\0`. (Exit code for this
 		// mode is a pre-existing divergence outside this test's contract.)
 		let (_code, capture) =
 			run_async_util::<Rg>(&["--files-without-match", "-0", "nope", "."], "", tree.path()).await;
-		assert_eq!(capture.out(), "a.txt\0");
+		assert_eq!(capture.out(), "./a.txt\0");
 	}
 
 	#[tokio::test(flavor = "multi_thread")]
@@ -2630,7 +2687,7 @@ mod tests {
 		let (code, capture) =
 			run_async_util::<Rg>(&["--path-separator", "|", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 0, "{}", capture.err());
-		assert_eq!(capture.out(), "sub|a.txt:hit\n");
+		assert_eq!(capture.out(), ".|sub|a.txt:hit\n");
 		let (code, capture) =
 			run_async_util::<Rg>(&["--path-separator", "::", "hit", "."], "", tree.path()).await;
 		assert_eq!(code, 2);

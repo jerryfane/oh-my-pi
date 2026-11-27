@@ -2,6 +2,16 @@
 
 ## [Unreleased]
 
+### Removed
+
+- Removed unused public configuration exports from @oh-my-pi/pi-mnemopi/config.
+
+## [19.1.0] - 2026-11-21
+
+### Fixed
+
+- Improved diagnostics when a configured embedding provider fails, making provider errors visible in logs while preserving the existing fallback behavior.
+
 ## [18.22.1] - 2026-11-17
 
 ### Fixed

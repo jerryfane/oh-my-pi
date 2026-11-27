@@ -3,8 +3,8 @@
  * workers (Vibe by default; owner-facing topics with `topics/workers`), and
  * the views of workers it gives other modules.
  */
-import type { SingleResult } from "@oh-my-pi/pi-tui/tools/task";
-import type { VibeSessionState } from "@oh-my-pi/pi-tui/tools/vibe";
+import type { SingleResult } from "../task/task-details";
+import type { VibeSessionState } from "../tools/details/vibe";
 import type { WorkerScopeTag } from "./lifecycle";
 
 /**

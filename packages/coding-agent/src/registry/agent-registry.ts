@@ -12,10 +12,9 @@
 import { logger } from "@oh-my-pi/pi-utils";
 import type { AgentSessionHandle } from "../session/agent-session-handle";
 import { AgentAwaits, type AgentAwaitsApi } from "./agent-awaits";
-import { oneLineLabel } from "@oh-my-pi/pi-tui/tools/task";
-
-import { MAIN_AGENT_ID, type AgentStatus, type AgentMetricsSummary } from "@oh-my-pi/pi-tui/overlays/agent-hub-types";
-import { noteAgentArrival } from "@oh-my-pi/pi-tui/overlays/agent-identity";
+import { oneLineLabel } from "../task/task-details";
+import { type AgentMetricsSummary, type AgentStatus, MAIN_AGENT_ID } from "./agent-hub-types";
+import { noteAgentArrival } from "../ui/tools/agent-identity";
 export { MAIN_AGENT_ID };
 export type { AgentStatus, AgentMetricsSummary };
 
@@ -71,6 +70,8 @@ export interface AgentRef {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	/** Identity of the live spawner, independent of its registry name. */
+	parentSessionKey?: string;
 	status: AgentStatus;
 	/** Null exactly when parked/aborted. */
 	session: AgentSessionHandle | null;
@@ -118,6 +119,8 @@ export interface RegisterInput {
 	displayName: string;
 	kind: AgentKind;
 	parentId?: string;
+	/** Live identity of the session that spawned this agent. */
+	parentSessionKey?: string;
 	session: AgentSessionHandle | null;
 	sessionFile?: string | null;
 	status?: AgentStatus;
@@ -151,8 +154,8 @@ export interface AgentRegistryApi {
 	markResultAccepted(id: string, expected?: AgentRefExpectation, responseAt?: number): boolean;
 	/** Accepted-but-running refs whose run already finished. */
 	staleAcceptedRuns(): AgentRef[];
-	/** Record a short activity gist for the work-aware roster. */
-	setActivity(id: string, activity: string): void;
+	/** Record a roster heartbeat for `id` when it still matches `expected`. */
+	setActivity(id: string, activity: string, expected?: AgentRefExpectation): void;
 	/** Attach a live session to `id` when it still matches `expected`. */
 	attachSession(
 		id: string,
@@ -223,6 +226,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			displayName: input.displayName,
 			kind: input.kind,
 			parentId: input.parentId,
+			parentSessionKey: input.parentSessionKey,
 			status: input.status ?? "running",
 			session: input.session,
 			sessionFile: input.sessionFile ?? null,
@@ -267,6 +271,7 @@ export class AgentRegistry implements AgentRegistryApi {
 			displayName: current.displayName,
 			kind: current.kind,
 			parentId: current.parentId,
+			parentSessionKey: current.parentSessionKey,
 			session: null,
 			sessionFile: current.sessionFile,
 			status: "parked",
@@ -394,10 +399,9 @@ export class AgentRegistry implements AgentRegistryApi {
 	 * intent text can neither break the roster nor smuggle terminal escapes —
 	 * every caller is safe without sanitizing at its own call site.
 	 */
-	setActivity(id: string, activity: string): void {
+	setActivity(id: string, activity: string, expected?: AgentRefExpectation): void {
 		const ref = this.#refs.get(id);
-		if (!ref) return;
-		if (ref.status !== "running") return;
+		if (!ref || ref.status !== "running" || !this.#matchesExpected(ref, expected)) return;
 		const gist = oneLineLabel(activity);
 		ref.lastActivity = Date.now();
 		if (ref.activity === gist) return;

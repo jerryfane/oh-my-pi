@@ -192,10 +192,10 @@ describe.skipIf(!CHROMIUM_AVAILABLE)("browser fill aborts", () => {
 describe.skipIf(!CHROMIUM_AVAILABLE)("browser input cut off mid-gesture", () => {
 	// `blockNow(ms)` blocks the page's main thread in its own script right after the current call answers; with
 	// `blockMs` set, the next mousedown or keydown handler blocks instead. Either way omp's input waits on the page
-	// for BLOCK_MS, past the 2 s per-op ceiling of a BLOCKED_CELL_S cell (`resolveOpTimeouts`: the budget less 1 s),
+	// for BLOCK_MS, past the 1 s per-op ceiling of a BLOCKED_CELL_S cell (`resolveOpTimeouts`: the budget less 1 s),
 	// and the cell's cleanup returns once the page answers, inside that budget.
-	const BLOCKED_CELL_S = 3;
-	const BLOCK_MS = 2_500;
+	const BLOCKED_CELL_S = 2;
+	const BLOCK_MS = 1_500;
 	const gestureHtml = `<!doctype html>
 <button id="target" style="position:absolute;left:20px;top:20px;width:120px;height:40px">Target</button>
 <div id="from" style="position:absolute;left:20px;top:100px;width:60px;height:60px"></div>
@@ -1020,6 +1020,71 @@ return { value: await tab.value("#msg"), sent: await tab.evaluate(() => window.s
 				context,
 			);
 			expect(valueFrom<unknown>(result)).toEqual({ value: "a\nb", sent: [] });
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 40_000);
+
+	test("fill ends with key events on the field for pages that search on them, typing nothing twice", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const tabName = `fill-keyup-${crypto.randomUUID()}`;
+		// `#q` searches only on `keyup`, as CyberChef's operation search does, and its input spends the page's user
+		// activation on a popup; input in `#opens` and a keydown in `#hops` move focus to a button; a keydown in `#flip`
+		// makes it a checkbox; `#box` is a MathML element named like a text field.
+		const html = `<!doctype html><input id="q" value="old"><p id="results"></p><input id="opens"><input id="hops">
+<input id="flip"><button id="ok">OK</button><math><textarea id="box" tabindex="0"></textarea></math>
+<script>
+window.events = [];
+for (const type of ["keydown", "keypress", "beforeinput", "input", "keyup", "click"]) {
+  addEventListener(type, event => events.push([type, event.target.id, event.key ?? "", event.target.value].join(":")), true);
+}
+q.addEventListener("input", () => window.open()?.close());
+q.addEventListener("keyup", () => { results.textContent = q.value + " active:" + navigator.userActivation.isActive; });
+opens.addEventListener("input", () => ok.focus());
+hops.addEventListener("keydown", () => ok.focus());
+flip.addEventListener("keydown", () => { flip.type = "checkbox"; });
+</script>`;
+		const context = { session, toolCallId: "browser-fill-keyup" };
+		await prelude.invoke(
+			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent(html)}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `await tab.fill("#box", "x");
+const boxKeys = await tab.evaluate(() => window.events.splice(0).filter(event => event.startsWith("key")));
+await tab.fill("#q", "to base64");
+const results = await tab.text("#results");
+await tab.fill("#opens", " ");
+await tab.fill("#hops", "x");
+await tab.fill("#flip", "x");
+return { boxKeys, results, events: await tab.evaluate(() => window.events) };`,
+					timeout: 25,
+				},
+				context,
+			);
+			expect(valueFrom<unknown>(result)).toEqual({
+				results: "to base64 active:false",
+				events: [
+					"beforeinput:q::",
+					"input:q::to base64",
+					"keydown:q:4:to base64",
+					"keyup:q:4:to base64",
+					"beforeinput:opens::",
+					"input:opens:: ",
+					"beforeinput:hops::",
+					"input:hops::x",
+					"keydown:hops:x:x",
+					"beforeinput:flip::",
+					"input:flip::x",
+					"keydown:flip:x:x",
+				],
+				boxKeys: [],
+			});
 		} finally {
 			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
 		}
@@ -2093,6 +2158,46 @@ document.getElementById("rerender").addEventListener("pointerdown", () => {
 		}
 	}, 30_000);
 
+	test("keeps a click on an inert target undelivered while the relay's overlay host comes, changes and goes", async () => {
+		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
+		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
+		const page = await browserHandle.browser.newPage();
+		// On the press, the overlay host mounted before the click is replaced by a new one, which is then restyled;
+		// `pageToo` also changes the page itself, which still confirms the click.
+		const outcome = async (pageToo: boolean): Promise<string> => {
+			await page.setContent(`<div inert><button id="inert">Inert</button></div><p id="clock">0</p>
+<omp-overlay></omp-overlay>
+<script>
+addEventListener("pointerdown", () => {
+	document.querySelector("omp-overlay").remove();
+	const host = document.createElement("OMP-OVERLAY");
+	document.body.append(host);
+	host.attachShadow({ mode: "closed" }).innerHTML = "<div>pointer</div>";
+	host.setAttribute("data-state", "pressed");
+	host.style.opacity = "0";
+	${pageToo ? 'document.getElementById("clock").textContent = "1";' : ""}
+}, true);
+</script>`);
+			const handle = await page.$("#inert");
+			if (!handle) throw new Error("Expected #inert");
+			const result = await clickElement(handle, "click #inert").then(
+				() => "clicked",
+				error => (String(error).includes("could not confirm the click reached") ? "refused" : String(error)),
+			);
+			await handle.dispose();
+			// The host changed while the click was watched.
+			expect(await page.evaluate(`document.querySelector("omp-overlay").dataset.state`)).toBe("pressed");
+			return result;
+		};
+		try {
+			expect(await outcome(false)).toBe("refused");
+			expect(await outcome(true)).toBe("clicked");
+		} finally {
+			await page.close().catch(() => undefined);
+			if (browserHandle.browser.connected) await releaseBrowser(browserHandle, { kill: true });
+		}
+	}, 30_000);
+
 	test("fails a click whose frame the page removes while the first press is down, and keeps one it removes on a click", async () => {
 		const browserHandle = await acquireBrowser({ kind: "headless", headless: true }, { cwd: process.cwd() });
 		if (!("browser" in browserHandle)) throw new Error("Expected a Puppeteer browser");
@@ -2496,7 +2601,7 @@ return { clicks: await tab.evaluate(clicks), frameClicks: await inner.evaluate(c
 					name: tabName,
 					code: `await tab.evaluate(() => window.render(true));
 try { await tab.click("#vol"); return "clicked"; } catch (caught) { return String(caught?.message ?? caught); }`,
-					timeout: 4,
+					timeout: 2,
 				},
 				context,
 			);
@@ -2504,6 +2609,34 @@ try { await tab.click("#vol"); return "clicked"; } catch (caught) { return Strin
 			expect(error).toContain("timed out");
 			expect(error).toContain("selector currently matches no elements");
 			expect(error).not.toContain("detached");
+		} finally {
+			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
+		}
+	}, 30_000);
+
+	test("an action on a selector the page cannot parse fails at once, naming a prefix inside a CSS list", async () => {
+		const session = makeSession();
+		const prelude = createBrowserPrelude(session);
+		const context = { session, toolCallId: "browser-invalid-selector" };
+		const tabName = `invalid-selector-${crypto.randomUUID()}`;
+		await prelude.invoke(
+			{ action: "open", name: tabName, url: `data:text/html,${encodeURIComponent("<input name=projectName>")}` },
+			context,
+		);
+		try {
+			const result = await prelude.invoke(
+				{
+					action: "run",
+					name: tabName,
+					code: `try { await tab.fill('input[name="projectName"], label/Project name', "omp"); return "filled"; } catch (caught) { return String(caught?.message ?? caught); }`,
+					timeout: 20,
+				},
+				context,
+			);
+			const error = valueFrom<string>(result);
+			expect(error).toContain("is not a valid selector");
+			expect(error).toContain("a label/ prefix applies to the whole selector and cannot join a CSS list");
+			expect(error).not.toContain("timed out");
 		} finally {
 			await prelude.invoke({ action: "close", name: tabName, kill: true }, context).catch(() => undefined);
 		}

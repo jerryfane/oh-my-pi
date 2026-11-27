@@ -18,12 +18,7 @@ import { skillCapability } from "../capability/skill";
 import type { EffectiveExtensionRoots, SourceMeta } from "../capability/types";
 import type { Settings } from "../config/settings";
 import { cfgDisabledExtensions, cfgSkills, type SkillsSettings } from "./settings";
-import {
-	type Skill as CapabilitySkill,
-	isUserSourceEnabled,
-	loadCapability,
-	type SkillFrontmatter,
-} from "../discovery";
+import { type Skill as CapabilitySkill, loadCapability, type SkillFrontmatter } from "../discovery";
 import {
 	clearPluginRootsAndCaches,
 	compareSkillOrder,
@@ -31,10 +26,11 @@ import {
 	registeredPluginRootOf,
 	scanSkillsFromDir,
 } from "../discovery/helpers";
-import { allowsSkillTokens, SKILL_TOKEN_RE } from "@oh-my-pi/pi-tui/prompt/skill-tokens";
+import { allowsSkillTokens, SKILL_TOKEN_RE } from "./skill-tokens";
 import autoloadTemplate from "../prompts/skills/autoload.md" with { type: "text" };
 import userInvocationTemplate from "../prompts/skills/user-invocation.md" with { type: "text" };
 import { SKILLSHARE_PROVIDER_ID } from "../discovery/skillshare";
+import { substitutePluginRoot } from "../discovery/substitute-plugin-root";
 import type { SkillPromptDetails } from "../session/messages";
 import { expandTilde } from "../tools/path-utils";
 
@@ -60,6 +56,12 @@ export interface Skill {
 	 * every `skill://` resource access must realpath-resolve within it.
 	 */
 	containRoot?: string;
+	/**
+	 * Plugin install path supplying this skill (Claude marketplace plugins).
+	 * `${CLAUDE_PLUGIN_ROOT}` / `${OMP_PLUGIN_ROOT}` in the skill's Markdown
+	 * body are substituted with it when the body is read (#20165).
+	 */
+	pluginRoot?: string;
 	/** Source metadata for display */
 	_source?: SourceMeta;
 }
@@ -84,7 +86,7 @@ export interface LoadSkillsResult {
  * Otherwise derived from the path so every other provider gets one without
  * plumbing: the directory owning `skills/` (a plugin or package root), else
  * the directory holding the skill (a custom skills root), else the provider.
- * Dotted homes (`~/.claude/skills`) are not meaningful names.
+ * Dotted homes (`.claude/skills`, `~/.agents/skills`) are not meaningful names.
  */
 function skillNamespace(skill: Pick<CapabilitySkill, "path" | "_source">): string {
 	let root = skill._source.pluginName;
@@ -277,6 +279,7 @@ export async function loadSkillsFromDir(options: LoadSkillsFromDirOptions): Prom
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: options.source,
 			...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
+			...(capSkill._source?.pluginRoot !== undefined && { pluginRoot: capSkill._source.pluginRoot }),
 			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
 			_source: capSkill._source,
 		})),
@@ -305,8 +308,6 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 	const {
 		cwd = getProjectDir(),
 		enabled = true,
-		enableCodexUser = false,
-		enableClaudeUser = false,
 		enableClaudeProject = true,
 		enablePiUser = true,
 		enablePiProject = true,
@@ -330,21 +331,11 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 		// — third-party CLI toggles must never silently hide them (cf. #2401). The
 		// master `enabled` flag above still gates them.
 		if (provider === MANAGED_SKILLS_PROVIDER_ID) return true;
-		if (provider === "codex" && level === "user") return enableCodexUser || isUserSourceEnabled("codex");
-		if (provider === "claude" && level === "user") return enableClaudeUser || isUserSourceEnabled("claude");
 		if (provider === "claude" && level === "project") return enableClaudeProject;
 		if (provider === "native" && level === "user") return enablePiUser;
 		if (provider === "native" && level === "project") return enablePiProject;
 		if (provider === "agents" && level === "user") return enableAgentsUser;
 		if (provider === "agents" && level === "project") return enableAgentsProject;
-		// User-scope claude-plugins skills carry the root's origin (#10743). omp's
-		// own installs (`omp` registry, `--plugin-dir`) are not the foreign
-		// ~/.claude/plugins tree, so the foreign opt-in gate applies only to
-		// claude-origin roots — parity with allowedRoots() in
-		// discovery/claude-plugins.ts. Without this, #10666's root-level fix is
-		// re-dropped here for every user-level claude-plugins skill.
-		if (provider === "claude-plugins" && source.origin !== undefined && source.origin !== "claude") return true;
-		if (level === "user") return isUserSourceEnabled(provider);
 		return true;
 	}
 
@@ -476,6 +467,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: `${capSkill._source.provider}:${capSkill.level}`,
 			...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
+			...(capSkill._source?.pluginRoot !== undefined && { pluginRoot: capSkill._source.pluginRoot }),
 			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
 			_source: capSkill._source,
 		};
@@ -519,6 +511,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 					baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 					source: "custom:user",
 					...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
+					...(capSkill._source?.pluginRoot !== undefined && { pluginRoot: capSkill._source.pluginRoot }),
 					hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
 					_source: { ...capSkill._source, providerName: "Custom" },
 				},
@@ -602,6 +595,7 @@ export async function loadSkills(options: LoadSkillsOptions = {}): Promise<LoadS
 			baseDir: capSkill.path.replace(/[\\/]SKILL\.md$/, ""),
 			source: `${capSkill._source.provider}:${capSkill.level}`,
 			...(capSkill.containRoot !== undefined && { containRoot: capSkill.containRoot }),
+			...(capSkill._source?.pluginRoot !== undefined && { pluginRoot: capSkill._source.pluginRoot }),
 			hide: capSkill.frontmatter?.hide === true || capSkill.frontmatter?.disableModelInvocation === true,
 			_source: capSkill._source,
 		});
@@ -854,11 +848,15 @@ export type SkillInvocationKind = "user" | "autoload";
 export type SkillPromptInput = Pick<ParsedSkillInvocation, "args"> & Partial<Pick<ParsedSkillInvocation, "prompt">>;
 
 /** Read a skill's instruction body before rendering user-provided arguments. */
-export async function loadSkillPromptBody(skill: Pick<Skill, "filePath">): Promise<string> {
+export async function loadSkillPromptBody(skill: Pick<Skill, "filePath" | "pluginRoot">): Promise<string> {
 	const content = await Bun.file(skill.filePath).text();
 	// Only the body is used: keep HTML comments (`repair: false`) and leave YAML
 	// diagnostics to the loader, which already parsed this frontmatter.
-	return parseFrontmatter(content, { source: skill.filePath, repair: false, level: "off" }).body.trim();
+	let body = parseFrontmatter(content, { source: skill.filePath, repair: false, level: "off" }).body.trim();
+	// Claude Code parity (#20165): plugin skills resolve ${CLAUDE_PLUGIN_ROOT} /
+	// ${OMP_PLUGIN_ROOT} in the Markdown body when the content is loaded.
+	if (skill.pluginRoot !== undefined) body = substitutePluginRoot(body, skill.pluginRoot);
+	return body;
 }
 
 /** A skill's instruction body and the skill it was read from. */

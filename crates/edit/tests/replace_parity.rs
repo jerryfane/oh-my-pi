@@ -4,7 +4,7 @@ use std::collections::HashMap;
 
 use common::run_fixture;
 use omp_edit::{
-	EditMode, EditStore, PathPolicy,
+	EditMode, Location, PathPolicy,
 	fuzzy::{FindMatchOptions, find_match},
 	path_policy::canonical_key,
 	text::adjust_indentation,
@@ -90,8 +90,8 @@ fn resolves_parent_targets_outside_cwd() {
 		policy
 			.resolve("../outside.txt", &HashMap::new())
 			.unwrap()
-			.absolute,
-		root.path().join("outside.txt")
+			.location,
+		Location::Disk(root.path().join("outside.txt"))
 	);
 }
 
@@ -108,8 +108,8 @@ fn preserves_absolute_targets_outside_cwd() {
 		policy
 			.resolve(absolute.to_str().unwrap(), &HashMap::new())
 			.unwrap()
-			.absolute,
-		absolute
+			.location,
+		Location::Disk(absolute)
 	);
 }
 
@@ -126,21 +126,29 @@ fn expands_home_targets_outside_cwd() {
 		policy
 			.resolve("~/.claude/settings.json", &HashMap::new())
 			.unwrap()
-			.absolute,
-		home.join(".claude/settings.json")
+			.location,
+		Location::Disk(home.join(".claude/settings.json"))
 	);
 }
 
 #[test]
-fn canonical_snapshot_key_returns_input_when_no_ancestor_exists() {
+fn canonical_snapshot_key_resolves_missing_tail_against_existing_ancestor() {
 	let root = tempfile::tempdir().expect("tempdir");
 	let missing = root.path().join("missing-parent/child/file.txt");
-	assert_eq!(canonical_key(&missing), missing);
+	// For a path that does not exist, `canonical_key` must canonicalize the
+	// deepest existing ancestor and re-append the missing tail, so the key
+	// matches before and after the write (even under a symlinked ancestor).
+	assert_eq!(
+		canonical_key(&missing),
+		canonical_key(root.path()).join("missing-parent/child/file.txt")
+	);
 }
 
 #[cfg(unix)]
 #[test]
 fn canonical_snapshot_keys_fuse_symlink_equivalent_paths() {
+	use omp_edit::EditStore;
+
 	let root = tempfile::tempdir().expect("tempdir");
 	let real = root.path().join("real");
 	let alias = root.path().join("alias");
@@ -155,6 +163,13 @@ fn canonical_snapshot_keys_fuse_symlink_equivalent_paths() {
 	assert_eq!(alias_key, real_key);
 
 	let store = EditStore::new();
-	let hash = store.record(&real_key, "x\n", None);
-	assert_eq!(store.by_hash(&alias_key, &hash).unwrap().text.as_ref(), "x\n");
+	let hash = store.record(&Location::Disk(real_key), "x\n", None);
+	assert_eq!(
+		store
+			.by_hash(&Location::Disk(alias_key), &hash)
+			.unwrap()
+			.text
+			.as_ref(),
+		"x\n"
+	);
 }

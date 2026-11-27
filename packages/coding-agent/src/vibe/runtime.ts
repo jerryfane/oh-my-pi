@@ -5,7 +5,7 @@ import {
 	type VibeSendOutcome,
 	type VibeKillOutcome,
 	type VibeWaitOutcome,
-} from "@oh-my-pi/pi-tui/tools/vibe";
+} from "../tools/details/vibe";
 /**
  * Vibe mode worker-session runtime.
  *
@@ -40,13 +40,13 @@ import { type ExecutorOptions, normalizeModelPatterns, runSubagentFollowUpTurn, 
 import { generateTaskName, sanitizeAgentId } from "../task/name-generator";
 import { AgentOutputManager } from "../task/output-manager";
 import { type AgentDefinition, spawnDepthOf } from "../task/types";
-import { type AgentProgress, oneLineLabel, type SingleResult } from "@oh-my-pi/pi-tui/tools/task";
+import { type AgentProgress, oneLineLabel, type SingleResult } from "../task/task-details";
 import type { ToolSession } from "../tools";
 import { type FirstTurnOutcome, type TranscriptPreamble, throwIfStale } from "../session/inbox-epoch";
 import { resolveSubagentStartModel } from "../task/subagent-start-model";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { formatDuration } from "@oh-my-pi/pi-tui/render/render-utils";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { formatDuration } from "@oh-my-pi/pi-utils";
+import { ToolError } from "../tools/tool-errors";
 import { calculateTokensPerSecond } from "../utils/token-rate";
 
 import {
@@ -58,7 +58,7 @@ import {
 	type VibeSpawnLifecycleEvent,
 	type VibeTombstoneReason,
 } from "./lifecycle";
-import { type VibeCli } from "@oh-my-pi/pi-tui/tools/vibe";
+import { type VibeCli } from "../tools/details/vibe";
 import type {
 	QueuedMessage,
 	WorkerChange,

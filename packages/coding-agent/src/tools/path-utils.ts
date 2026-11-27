@@ -1,8 +1,13 @@
 import type { ToolTier } from "@oh-my-pi/pi-agent-core";
 import { extractUriScheme } from "../internal-urls/parse";
-import { type LineRange } from "@oh-my-pi/pi-tui/tools/line-ranges";
-import { splitPathAndSel, isReadableUrlPath } from "@oh-my-pi/pi-tui/tools/read";
-import { toPathList } from "@oh-my-pi/pi-tui/render/render-utils";
+import { type LineRange } from "./line-ranges";
+import { splitPathAndSel, isReadableUrlPath } from "./details/read";
+import {
+	type DelimitedPathSplitMode,
+	isDelimitedPathSeparator,
+	splitTopLevelDelimitedPath,
+	toPathList,
+} from "../utils/render-utils";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import * as url from "node:url";
@@ -14,13 +19,15 @@ import {
 	isEnotdir,
 	isRecord,
 	isWsl,
+	prompt,
 	stripWindowsExtendedLengthPathPrefix,
 	windowsPathToWslMount,
 } from "@oh-my-pi/pi-utils";
 import { InternalUrlRouter } from "../internal-urls";
+import rootSearchRefusedTemplate from "../prompts/tools/root-search-refused.md" with { type: "text" };
 import { type InternalUrlFilesystem, joinUrlPath, UrlFsError } from "../internal-urls/url-filesystem";
 import { ToolAbortError } from "./tool-errors";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolError } from "./tool-errors";
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
 
@@ -541,6 +548,26 @@ export function stripOuterDoubleQuotes(input: string): string {
 	return input.startsWith('"') && input.endsWith('"') && input.length > 1 ? input.slice(1, -1) : input;
 }
 
+/**
+ * Refuses search roots that name a filesystem root (`/.`, `/usr/..`, a `../..` climbing to `/`, `C:\`):
+ * a whole-disk walk visits every file on the machine and runs for hours. Called by `grep`, `ast_grep`,
+ * `ast_edit` (via {@link resolveToolSearchScope}) and `glob`; the shell builtins' `root_guard` applies
+ * the same rule. A bare `/` never reaches here, since {@link resolveToCwd} aliases it to the workspace.
+ * Internal URLs are never whole disks.
+ *
+ * @throws {ToolError} naming the root and what to search instead.
+ */
+export function assertNotFilesystemRoot(searchPaths: Iterable<string>): void {
+	const router = InternalUrlRouter.instance();
+	for (const searchPath of searchPaths) {
+		if (router.canHandle(searchPath)) continue;
+		const resolved = path.resolve(searchPath);
+		if (path.dirname(resolved) === resolved) {
+			throw new ToolError(prompt.render(rootSearchRefusedTemplate, { root: resolved }));
+		}
+	}
+}
+
 /** Search root for a parsed base path: a registered internal URL as spelled (single-slash alias normalized), else {@link resolveToCwd}. */
 export function resolveSearchBase(basePath: string, cwd: string): string {
 	const router = InternalUrlRouter.instance();
@@ -559,6 +586,18 @@ export function resolveSearchResultPath(base: string, rel: string): string {
 	const router = InternalUrlRouter.instance();
 	if (router.canHandle(rel) || path.isAbsolute(rel)) return rel;
 	return router.canHandle(base) ? joinUrlPath(base, rel) : path.resolve(base, rel);
+}
+
+/**
+ * Absolute path of a native result for one resolved search target.
+ * Directory results are walk-relative and join onto `basePath`. A file
+ * target's display path is only its name, so the file is `basePath` itself.
+ */
+export function resolveTargetResultPath(
+	target: { basePath: string; isDirectory: boolean },
+	displayPath: string,
+): string {
+	return target.isDirectory ? resolveSearchResultPath(target.basePath, displayPath) : target.basePath;
 }
 
 /** `target` relative to the host directory `base` with `/` separators; `target` itself when either is an internal URL. */
@@ -585,17 +624,6 @@ export function hasGlobPathChars(filePath: string): boolean {
 
 type PathEntrySplitter = (item: string) => { basePath: string };
 
-const TOP_LEVEL_WHITESPACE_RE = /\s/;
-
-type DelimitedPathSplitMode = "comma" | "semicolon" | "whitespace" | "mixed";
-
-function isDelimitedPathSeparator(ch: string, mode: DelimitedPathSplitMode): boolean {
-	if (mode === "comma") return ch === ",";
-	if (mode === "semicolon") return ch === ";";
-	if (mode === "whitespace") return TOP_LEVEL_WHITESPACE_RE.test(ch);
-	return ch === "," || ch === ";" || TOP_LEVEL_WHITESPACE_RE.test(ch);
-}
-
 function hasTopLevelPathDelimiter(entry: string): boolean {
 	let braceDepth = 0;
 	for (let i = 0; i < entry.length; i++) {
@@ -612,37 +640,11 @@ function hasTopLevelPathDelimiter(entry: string): boolean {
 			if (braceDepth > 0) braceDepth--;
 			continue;
 		}
-		if (braceDepth === 0 && (ch === "," || ch === ";" || TOP_LEVEL_WHITESPACE_RE.test(ch))) {
+		if (braceDepth === 0 && isDelimitedPathSeparator(ch, "mixed")) {
 			return true;
 		}
 	}
 	return false;
-}
-
-function splitTopLevelDelimitedPath(entry: string, mode: DelimitedPathSplitMode): string[] {
-	const parts: string[] = [];
-	let braceDepth = 0;
-	let start = 0;
-	for (let i = 0; i < entry.length; i++) {
-		const ch = entry[i];
-		if (ch === "\\" && i + 1 < entry.length) {
-			i++;
-			continue;
-		}
-		if (ch === "{") {
-			braceDepth++;
-			continue;
-		}
-		if (ch === "}") {
-			if (braceDepth > 0) braceDepth--;
-			continue;
-		}
-		if (braceDepth !== 0 || !isDelimitedPathSeparator(ch, mode)) continue;
-		parts.push(entry.slice(start, i));
-		start = i + 1;
-	}
-	parts.push(entry.slice(start));
-	return parts;
 }
 
 async function delimitedPathPartResolves(entry: string, cwd: string, splitter: PathEntrySplitter): Promise<boolean> {
@@ -893,6 +895,8 @@ export interface ResolvedSearchTarget {
 	basePath: string;
 	glob?: string;
 	bareGlob?: boolean;
+	/** `basePath` is a directory. A file target's native display path is only its name. */
+	isDirectory: boolean;
 }
 
 export interface ResolvedMultiSearchPath {
@@ -1185,6 +1189,7 @@ async function resolveSearchPathItems(
 					basePath: item.absoluteBasePath,
 					glob: item.parsedPath.glob ? combineSearchGlobs(item.parsedPath.glob, suffixGlob) : suffixGlob,
 					bareGlob: isBareSearchGlob(item.raw, item.parsedPath),
+					isDirectory: item.type === "directory",
 				}))
 			: undefined;
 
@@ -1626,6 +1631,9 @@ export async function resolveToolSearchScope(opts: ToolScopeOptions): Promise<To
 		}
 		scopePath = multiSearchPath.scopePath;
 	}
+	// Fanned-out targets are the walk roots; otherwise the single base is (for a
+	// multi-path union it is itself one of the requested scopes).
+	assertNotFilesystemRoot(multiTargets ? multiTargets.map(target => target.basePath) : [searchPath]);
 
 	let isDirectory: boolean;
 	try {

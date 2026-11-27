@@ -22,24 +22,22 @@ import type { AgentRegistryApi } from "../registry/agent-registry";
 import type { LocalProtocolOptions } from "./local-protocol";
 import type { SessionEntry } from "../session/session-entries";
 import type { ToolSession } from "../tools";
-import type { CoordinationDetails } from "@oh-my-pi/pi-tui/tools/wait";
-import type { ProcReadDetails, ProcWriteDetails } from "@oh-my-pi/pi-tui/tools/proc-render";
-import type { CfgReadDetails, CfgWriteDetails } from "@oh-my-pi/pi-tui/tools/cfg-render";
-import type { XdevRenderDispatch } from "@oh-my-pi/pi-tui/tools/xdev";
-import type { SchemeWriteScope } from "@oh-my-pi/pi-tui/tools/url-scheme-host";
+import type { CoordinationDetails } from "../tools/details/wait";
+import type { ProcReadDetails, ProcWriteDetails } from "../tools/details/proc-render";
+import type { CfgReadDetails, CfgWriteDetails } from "../tools/details/cfg-render";
+import type { SchemeWriteScope } from "./url-scheme";
 
 /** Render state and prewalk facts a handler write attaches to the `write` tool result. */
 export interface InternalWriteDetails {
 	message?: CoordinationDetails;
 	proc?: ProcWriteDetails;
 	cfg?: CfgWriteDetails;
-	xdev?: XdevRenderDispatch;
 	/** Absolute file the write landed in, for the transcript card's file link (conflict://). */
 	resolvedPath?: string;
 	/**
 	 * The write changed no files (process stdin, service mode), so the prewalk gate must not read
-	 * it as implementation work. Unlike {@link SchemeWritePolicy.cancels}, the plan-mode and
-	 * device-only gates still apply.
+	 * it as implementation work. Unlike {@link SchemeWritePolicy.cancels}, the plan-mode
+	 * gate still applies.
 	 */
 	touchesNoFiles?: true;
 }
@@ -61,7 +59,7 @@ export interface InternalWriteResult {
  *   returns; `read` routes located URLs through its filesystem pipeline (paging, images, sqlite, archives).
  * - `virtual`: content is rendered by the handler (it may still `locate` a backing file for search/bash).
  * - `remote`: content lives on another host or service; never locatable.
- * - `device`: session-bound control surface (processes, tool devices).
+ * - `device`: session-bound control surface (processes, replies to the user).
  */
 export type SchemeBacking = "file" | "virtual" | "remote" | "device";
 
@@ -80,7 +78,7 @@ export interface SchemeWritePolicy {
 	 * - `file`: tools (`write`, `edit`, `ast_edit`) write the file {@link ProtocolHandler.locate}
 	 *   returns with `{ create: true }`; the handler has no `write` hook.
 	 * - `handler`: {@link ProtocolHandler.write} performs it (messages, stdin, settings, remote
-	 *   hosts, devices) for `write` and for bash redirects, which deliver a handle's bytes as one
+	 *   hosts) for `write` and for bash redirects, which deliver a handle's bytes as one
 	 *   write on close; file-editing tools refuse the URL even when it locates a backing file.
 	 */
 	via: "file" | "handler";
@@ -97,8 +95,15 @@ export interface SchemeWritePolicy {
 	/** Largest payload in UTF-8 bytes the scheme accepts; the shell refuses writes past it (EFBIG). Default: unbounded. */
 	maxBytes?: number;
 	/**
+	 * File-editing tools may patch this remote text through a local mirror, updating
+	 * existing files in place only: `edit` refuses creating, deleting, or moving such a
+	 * URL before its preview. Requires `via: "handler"`, `payload: "text"`, `backing:
+	 * "remote"`, and the handler's {@link ProtocolHandler.edit} hooks.
+	 */
+	edits?: "update";
+	/**
 	 * True when this URL's write only cancels background work (`proc://<id>/kill`), so it
-	 * passes the plan-mode and device-only gates like a `coordination`-scoped write. Approval
+	 * passes the plan-mode gate like a `coordination`-scoped write. Approval
 	 * still follows {@link SchemeWritePolicy.tier}.
 	 */
 	cancels?(url: InternalUrl): boolean;
@@ -128,7 +133,7 @@ export interface SchemeSpec {
 	unbounded?: boolean;
 	/** Renderers may call `locate` to hyperlink these URLs: locate is local, cheap, never spawns or fetches. */
 	linkable?: boolean;
-	/** Transcript read cards collapse like plain files instead of expanding (xd://). */
+	/** Transcript read cards collapse like plain files instead of expanding (help://). */
 	compactTranscript?: boolean;
 	/** `read` peels a trailing `?q=<question>` as an image question (local://, attachment://); other schemes own their query. */
 	imageQuestion?: true;
@@ -342,7 +347,7 @@ export interface ResolveContext {
 	 */
 	rules?: readonly Rule[];
 	/**
-	 * Calling tool session. Session-bound schemes (`proc://`, `xd://`) require it
+	 * Calling tool session. Session-bound schemes (`proc://`) require it
 	 * and throw when it is absent.
 	 */
 	session?: ToolSession;
@@ -368,10 +373,10 @@ export interface WriteContext {
 	localProtocolOptions?: LocalProtocolOptions;
 	/**
 	 * Calling tool session. Session-bound writes (`agent://` messages,
-	 * `proc://` stdin/stop/mode, `xd://` devices) require it and throw when it is absent.
+	 * `proc://` stdin/stop/mode) require it and throw when it is absent.
 	 */
 	session?: ToolSession;
-	/** The tool call dispatching this write (`write`, or a bash command redirecting into the URL); device dispatch (`xd://`) forwards it to the wrapped tool. */
+	/** The tool call dispatching this write (`write`, or a bash command redirecting into the URL). */
 	toolCall?: {
 		id: string;
 		onUpdate?: AgentToolUpdateCallback;
@@ -380,7 +385,61 @@ export interface WriteContext {
 }
 
 /**
- * Handler for a specific internal URL scheme (e.g., agent://, memory://, skill://, xd://).
+ * Where a remote file an edit targets lives: the destination its URL resolved
+ * to and the absolute path there (together the mirror's key), plus the canonical
+ * URL `read` shows in its tag and `edit` writes back through.
+ */
+export interface RemoteEditLocation {
+	/** `scheme://authority/<absolute path>`, the authority as written. */
+	url: string;
+	/**
+	 * Identity of the resolved destination (host, account, port, key), so one
+	 * URL that resolves to different hosts (per-project aliases) never shares a mirror,
+	 * and spellings that resolve to one destination (`Prod`, `prod`) always do.
+	 */
+	target: string;
+	/** Absolute path of the file on {@link target}. */
+	path: string;
+}
+
+/** Remote text fetched for an edit. */
+export interface RemoteEditSource extends RemoteEditLocation {
+	content: string;
+	/** Checksum of exactly the fetched bytes; {@link RemoteEditHooks.update} writes only while the file still matches it. */
+	checksum: string;
+}
+
+/**
+ * Hooks for remote text that `edit` patches through a local mirror
+ * (`spec.write.edits`). The mirror is keyed by the {@link RemoteEditLocation},
+ * so every spelling of one remote file shares its mirror and snapshot tag.
+ */
+export interface RemoteEditHooks {
+	/**
+	 * The file's {@link RemoteEditLocation}. With `localOnly`, never touches the
+	 * remote host and returns `undefined` when the answer would need it (a
+	 * home-relative path whose HOME is not cached yet).
+	 */
+	locate(
+		url: InternalUrl,
+		context?: ResolveContext,
+		options?: { localOnly?: boolean },
+	): Promise<RemoteEditLocation | undefined>;
+	/**
+	 * Fetch an existing regular file's text for an edit. Refuses a symbolic link
+	 * (naming it), a directory, a special file, binary content, and a missing
+	 * path (`RemoteEditMissingError`).
+	 */
+	fetch(url: InternalUrl, context?: ResolveContext): Promise<RemoteEditSource>;
+	/**
+	 * Replace the file's text in one remote operation, only while its bytes still
+	 * match `checksum` (`RemoteEditConflictError` otherwise; nothing is written).
+	 */
+	update(url: InternalUrl, content: string, checksum: string, context?: WriteContext): Promise<void>;
+}
+
+/**
+ * Handler for a specific internal URL scheme (e.g., agent://, memory://, skill://).
  */
 export interface ProtocolHandler {
 	/** The scheme this handler processes (without trailing ://) */
@@ -408,6 +467,8 @@ export interface ProtocolHandler {
 	 * N bytes" result and may carry transcript-only display details.
 	 */
 	write?(url: InternalUrl, content: string, context?: WriteContext): Promise<InternalWriteResult | void>;
+	/** Mirror-edit hooks: present exactly when `spec.write.edits` is set (the router enforces this at registration). */
+	readonly edit?: RemoteEditHooks;
 	/**
 	 * Optional autocomplete hook. Returns candidate completions for the
 	 * host/path portion of a `scheme://` URL while the user composes a prompt.
@@ -459,7 +520,7 @@ export interface ProtocolHandler {
 	/**
 	 * Sub-path, query and limit grammar the {@link promptDoc} line leaves out
 	 * (rendered from `prompts/internal-urls/<scheme>-reference.md`), served on demand
-	 * at `xd://read/urls`. Reads cheap process facts only; `undefined` omits the scheme.
+	 * at `help://read/urls`. Reads cheap process facts only; `undefined` omits the scheme.
 	 */
 	promptReference?(): string | undefined;
 }

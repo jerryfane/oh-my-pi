@@ -8,6 +8,6 @@ Nothing you started running and no answer owed? Returns at once; so does a wait 
 {{#if endTurn}}
 - Nothing left but waiting on your own jobs/services or an owed reply? End your turn instead: each of their results and messages starts your next turn.
 {{else}}
-- A wait returned with nothing new and nothing else is left? Call `wait` right away with no other tool call: it then blocks up to {{longest}}, longer for a reply.
+- A wait returned with nothing new and nothing else is left? Call `wait` right away with no other tool call: it then blocks up to the current prompt-cache window (at least {{longest}}).
 {{/if}}
 Results and messages auto-deliver. NEVER poll while work remains.

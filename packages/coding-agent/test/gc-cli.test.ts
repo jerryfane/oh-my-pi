@@ -768,9 +768,9 @@ describe("runGcCommand history checkpoint", () => {
 			reader.query("SELECT * FROM history").all();
 			writer.run("INSERT INTO history (prompt) VALUES ('after-reader')");
 
-			await expect(runGcCommand({ flags: { agentDir: root, wal: true, apply: true } })).rejects.toThrow(
-				`WAL checkpoint failed for ${dbPath}: busy=1`,
-			);
+			await expect(
+				runGcCommand({ flags: { agentDir: root, wal: true, apply: true }, walBusyTimeoutMs: 50 }),
+			).rejects.toThrow(`WAL checkpoint failed for ${dbPath}: busy=1`);
 
 			expect(await Bun.file(path.join(root, "gc.lock")).exists()).toBe(false);
 		} finally {
@@ -780,7 +780,7 @@ describe("runGcCommand history checkpoint", () => {
 			reader.close();
 			writer.close();
 		}
-	}, 10_000);
+	});
 });
 
 describe("runGcCommand session staging sweep", () => {
@@ -2013,6 +2013,117 @@ describe("runGcCommand cold-session archive", () => {
 		expect(result.archive?.errors).toEqual([]);
 		expect(toolCalls).toEqual([{ session_file: childPath, entry_id: assistant.id, tool_call_id: "" }]);
 		expect(offsets).toEqual([{ session_file: childPath, offset: childStat.size, last_modified: childStat.mtimeMs }]);
+	});
+
+	test("prunes unbranched tool_approvals rows and transfers retained fork approvals on archive", async () => {
+		const projectDir = path.join(getSessionsDir(root), "project");
+		const unbranched = path.join(projectDir, "unbranched.jsonl");
+		const parent = path.join(projectDir, "parent.jsonl");
+		const child = path.join(projectDir, "child.jsonl");
+		const oldTimestamp = new Date(Date.now() - 40 * 86_400_000).toISOString();
+		const recentTimestamp = new Date().toISOString();
+
+		const userMsg = (id: string, ts: string) =>
+			JSON.stringify({
+				type: "message",
+				id,
+				parentId: null,
+				timestamp: ts,
+				message: { role: "assistant", content: [] },
+			});
+		await Bun.write(
+			unbranched,
+			`${[
+				JSON.stringify({ type: "session", version: 3, id: "unbranched", timestamp: oldTimestamp, cwd: "/tmp" }),
+				userMsg("um1", oldTimestamp),
+				JSON.stringify({
+					type: "custom",
+					id: "u1",
+					timestamp: oldTimestamp,
+					customType: "tool_approval_requested",
+					data: { toolCallId: "call_unbranched", toolName: "bash", approvalMode: "write" },
+				}),
+			].join("\n")}\n`,
+		);
+		await agePath(unbranched, 40);
+
+		const sharedApproval = {
+			type: "custom",
+			id: "p1",
+			timestamp: oldTimestamp,
+			customType: "tool_approval_requested",
+			data: { toolCallId: "call_shared", toolName: "bash", approvalMode: "write" },
+		};
+		await Bun.write(
+			parent,
+			`${[
+				JSON.stringify({ type: "session", version: 3, id: "parent", timestamp: oldTimestamp, cwd: "/tmp" }),
+				userMsg("pm1", oldTimestamp),
+				JSON.stringify(sharedApproval),
+				JSON.stringify({
+					type: "custom",
+					id: "p2",
+					timestamp: oldTimestamp,
+					customType: "tool_approval_requested",
+					data: { toolCallId: "call_parent_only", toolName: "bash", approvalMode: "write" },
+				}),
+			].join("\n")}\n`,
+		);
+		await agePath(parent, 40);
+
+		await Bun.write(
+			child,
+			`${[
+				JSON.stringify({
+					type: "session",
+					version: 3,
+					id: "child",
+					timestamp: recentTimestamp,
+					cwd: "/tmp",
+					parentSession: parent,
+				}),
+				userMsg("cm1", recentTimestamp),
+				JSON.stringify(sharedApproval),
+			].join("\n")}\n`,
+		);
+		const childStat = await fs.stat(child);
+
+		const statsDbPath = path.join(root, "stats.db");
+		const db = new Database(statsDbPath);
+		db.run(
+			"CREATE TABLE tool_approvals (session_file TEXT NOT NULL, tool_call_id TEXT NOT NULL, PRIMARY KEY (session_file, tool_call_id)) WITHOUT ROWID",
+		);
+		db.run(
+			"CREATE TABLE file_offsets (session_file TEXT PRIMARY KEY, offset INTEGER NOT NULL, last_modified INTEGER NOT NULL)",
+		);
+		const insertApproval = db.query("INSERT INTO tool_approvals (session_file, tool_call_id) VALUES (?, ?)");
+		insertApproval.run(unbranched, "call_unbranched");
+		insertApproval.run(parent, "call_shared");
+		insertApproval.run(parent, "call_parent_only");
+		const insertOffset = db.query("INSERT INTO file_offsets (session_file, offset, last_modified) VALUES (?, ?, ?)");
+		insertOffset.run(unbranched, 1, 1);
+		insertOffset.run(parent, 1, 1);
+		insertOffset.run(child, childStat.size, childStat.mtimeMs);
+		db.close();
+
+		const result = await runGcCommand({
+			flags: {
+				agentDir: root,
+				archive: true,
+				coldArchiveAfterDays: 30,
+				retainNewestGlobal: 0,
+				retainNewestPerCwd: 0,
+				apply: true,
+			},
+		});
+
+		const check = new Database(statsDbPath);
+		const approvals = check.query("SELECT session_file, tool_call_id FROM tool_approvals").all();
+		check.close();
+
+		expect(result.archive?.errors).toEqual([]);
+		expect(result.archive?.archived).toBe(2);
+		expect(approvals).toEqual([{ session_file: child, tool_call_id: "call_shared" }]);
 	});
 
 	test("skips decompressible historical archives without a valid session header", async () => {
@@ -3277,6 +3388,46 @@ describe("runGcCommand replay data stripping", () => {
 
 		const rerun = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
 		expect(rerun.strip).toMatchObject({ wouldStrip: 0, stripped: 0 });
+	});
+
+	test("reduces a reasoning_details envelope to its reasoning field marker", async () => {
+		const id = Bun.randomUUIDv7();
+		const file = path.join(getSessionsDir(root), "project", `${id}.jsonl`);
+		const completions = { api: "openai-completions", provider: "openrouter", model: "google/gemini-3-pro-preview" };
+		const envelope = (field?: string) =>
+			JSON.stringify({
+				reasoningDetails: [
+					{ type: "reasoning.text", text: "plan", signature: "text-signature", index: 0 },
+					{ type: "reasoning.encrypted", data: "encrypted-blob", id: "call_1", index: 1 },
+				],
+				...(field ? { field } : {}),
+			});
+		const lines = [
+			header(id),
+			assistant(
+				[
+					{ type: "thinking", thinking: "plan", thinkingSignature: envelope("reasoning") },
+					{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" }, thoughtSignature: "c2ln" },
+				],
+				{ ...completions, stopReason: "toolUse" },
+			),
+			toolResult("call_1"),
+			assistant([{ type: "thinking", thinking: "noted", thinkingSignature: envelope() }], completions),
+			prompt("keep going"),
+			assistant([{ type: "text", text: "done" }], completions),
+		];
+		await writeTranscript(file, lines, 40);
+
+		const result = await runGcCommand({ flags: { agentDir: root, strip: true, apply: true } });
+
+		expect(result.strip).toMatchObject({ wouldStrip: 1, stripped: 1, records: 2, errors: [] });
+		const after = (await Bun.file(file).text()).split("\n").slice(0, -1);
+		expect(JSON.parse(after[1]).message.content).toEqual([
+			{ type: "thinking", thinking: "plan", thinkingSignature: "reasoning" },
+			{ type: "toolCall", id: "call_1", name: "read", arguments: { path: "a" } },
+		]);
+		expect(JSON.parse(after[3]).message.content).toEqual([{ type: "thinking", thinking: "noted" }]);
+		expect(after[5]).toBe(lines[5]);
 	});
 
 	test("a dry run rewrites nothing, and recent or leased sessions are never stripped", async () => {

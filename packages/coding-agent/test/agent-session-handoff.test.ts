@@ -1480,6 +1480,66 @@ describe("AgentSession handoff", () => {
 		expect(compaction.summary).toContain(handoffText);
 	});
 
+	it("falls through to soft after an oversized cross-provider handoff without sending it", async () => {
+		let sideStreamCalls = 0;
+		const sideStreamFn: StreamFn = () => {
+			sideStreamCalls++;
+			throw new Error("sideStreamFn should not be called for oversized handoff");
+		};
+		await session.dispose();
+		const sessionFile = sessionManager.getSessionFile();
+		if (!sessionFile) throw new Error("Expected a persisted session file");
+		sessionManager = await SessionManager.open(sessionFile, tempDir.path());
+		session = new AgentSession({
+			agent: new Agent({
+				initialState: {
+					// Room for the base request, not for the oversized history below.
+					model: { ...model, contextWindow: 16_384, maxTokens: 128 },
+					systemPrompt: ["Test"],
+					tools: [],
+					messages: [],
+				},
+				convertToLlm: compactionModule.defaultConvertToLlm,
+			}),
+			sessionManager,
+			settings: session.settings,
+			modelRegistry,
+			obfuscator,
+			sideStreamFn,
+		});
+		events = [];
+		session.subscribe(event => {
+			events.push(event);
+		});
+
+		cfgCompactionMethodOrder.set(session.settings, ["handoff", "soft"]);
+		cfgContextPromotionEnabled.set(session.settings, false);
+		sessionManager.appendMessage({
+			role: "user",
+			content: "unreadable native history ".repeat(6000),
+			timestamp: Date.now(),
+		});
+		session.agent.replaceMessages(session.buildDisplaySessionContext().messages);
+		const compactSpy = vi.spyOn(compactionModule, "compact").mockImplementation(async preparation => ({
+			summary: "## Goal\nContinue with the original request",
+			shortSummary: undefined,
+			firstKeptEntryId: preparation.firstKeptEntryId,
+			tokensBefore: preparation.tokensBefore,
+			details: {},
+		}));
+
+		await session.runIdleCompaction();
+
+		expect(sideStreamCalls).toBe(0);
+		expect(compactSpy).toHaveBeenCalled();
+		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "idle", action: "handoff" });
+		expect(events).toContainEqual({ type: "auto_compaction_start", reason: "idle", action: "context-full" });
+		expect(sessionManager.getBranch().findLast(entry => entry.type === "compaction")).toMatchObject({
+			type: "compaction",
+			method: "soft",
+		});
+	});
+
 	it("falls back from malformed auto-handoff to soft compaction", async () => {
 		cfgCompactionMethodOrder.set(session.settings, ["handoff", "soft"]);
 		cfgCompactionHandoffSaveToDisk.set(session.settings, true);
@@ -1513,5 +1573,117 @@ describe("AgentSession handoff", () => {
 		if (compaction?.type !== "compaction") throw new Error("Expected soft compaction");
 		expect(compaction.summary).toContain("Follow the original read-only request");
 		expect(compaction.summary).not.toContain("Let me find");
+	});
+
+	describe("with a handoff model that never stops streaming", () => {
+		let requestedMaxTokens: (number | undefined)[];
+
+		/** Streams `## Goal` text forever; only an abort of the request signal ends it. */
+		const endlessSideStreamFn: StreamFn = (requestModel, _context, options) => {
+			requestedMaxTokens.push(options?.maxTokens);
+			const stream = new AssistantMessageEventStream();
+			const partial: AssistantMessage = {
+				role: "assistant",
+				content: [{ type: "text", text: "## Goal\nKeep going" }],
+				api: requestModel.api,
+				provider: requestModel.provider,
+				model: requestModel.id,
+				stopReason: "stop",
+				usage: {
+					input: 1,
+					output: 1,
+					cacheRead: 0,
+					cacheWrite: 0,
+					totalTokens: 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+				},
+				timestamp: Date.now(),
+			};
+			queueMicrotask(() => stream.push({ type: "text_delta", contentIndex: 0, delta: " and going", partial }));
+			options?.signal?.addEventListener(
+				"abort",
+				() => stream.push({ type: "error", reason: "aborted", error: { ...partial, stopReason: "aborted" } }),
+				{ once: true },
+			);
+			return stream;
+		};
+
+		beforeEach(async () => {
+			requestedMaxTokens = [];
+			await session.dispose();
+			const sessionFile = sessionManager.getSessionFile();
+			if (!sessionFile) throw new Error("Expected a persisted session file");
+			sessionManager = await SessionManager.open(sessionFile, tempDir.path());
+			session = new AgentSession({
+				agent: new Agent({
+					initialState: { model, systemPrompt: ["Test"], tools: [], messages: [] },
+					convertToLlm: compactionModule.defaultConvertToLlm,
+				}),
+				sessionManager,
+				settings: Settings.isolated({
+					"compaction.enabled": true,
+					"compaction.autoContinue": false,
+					"compaction.asyncEnabled": false,
+					"compaction.keepRecentTokens": 1,
+					"compaction.methodOrder": ["handoff", "soft"],
+					// A real 50ms deadline: the timer under test is the platform's
+					// `AbortSignal.timeout`, which fake timers do not drive.
+					"compaction.handoffTimeoutSeconds": 0.05,
+				}),
+				modelRegistry,
+				obfuscator,
+				sideStreamFn: endlessSideStreamFn,
+			});
+			events = [];
+			session.subscribe(event => {
+				events.push(event);
+			});
+		});
+
+		it("fails the auto-handoff at the deadline and falls through to the next method", async () => {
+			const lastEntryId = sessionManager.getBranch().at(-1)?.id;
+			if (!lastEntryId) throw new Error("Expected seeded history");
+			vi.spyOn(compactionModule, "prepareCompaction").mockReturnValue({
+				firstKeptEntryId: lastEntryId,
+				messagesToSummarize: [{ role: "user", content: "original goal", timestamp: 1 }],
+				turnPrefixMessages: [],
+				recentMessages: [],
+				isSplitTurn: false,
+				tokensBefore: 100,
+				fileOps: { read: new Set(), written: new Set(), edited: new Set() },
+				settings: compactionModule.DEFAULT_COMPACTION_SETTINGS,
+			});
+			vi.spyOn(compactionModule, "compact").mockResolvedValue({
+				summary: "## Goal\nSoft summary after the handoff timed out",
+				shortSummary: undefined,
+				firstKeptEntryId: lastEntryId,
+				tokensBefore: 100,
+				details: {},
+			});
+
+			await session.runIdleCompaction();
+
+			expect(requestedMaxTokens).toEqual([compactionModule.MAX_SUMMARY_TOKENS]);
+			expect(events).toContainEqual(
+				expect.objectContaining({
+					type: "auto_compaction_end",
+					action: "handoff",
+					aborted: false,
+					errorMessage: expect.stringContaining("Handoff timed out after 0.05s"),
+				}),
+			);
+			const compaction = sessionManager.getBranch().findLast(entry => entry.type === "compaction");
+			expect(compaction).toMatchObject({ type: "compaction", method: "soft" });
+			if (compaction?.type !== "compaction") throw new Error("Expected soft compaction");
+			expect(compaction.summary).not.toContain("Keep going");
+		});
+
+		it("reports a manual handoff timeout as a failure, not a cancel", async () => {
+			await expect(session.compact(undefined, { mode: "handoff" })).rejects.toThrow(
+				"Handoff timed out after 0.05s (compaction.handoffTimeoutSeconds)",
+			);
+			expect(sessionManager.getBranch().some(entry => entry.type === "compaction")).toBe(false);
+			expect(session.isBackgroundCompacting).toBe(false);
+		});
 	});
 });

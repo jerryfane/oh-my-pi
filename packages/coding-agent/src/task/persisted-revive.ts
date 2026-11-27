@@ -4,7 +4,7 @@ import { logger } from "@oh-my-pi/pi-utils";
 import { MAIN_AGENT_RULE_NAME, SUB_AGENT_RULE_NAME } from "../capability/rule";
 import { validateAgentAccountPools } from "../config/account-pools";
 import type { Model } from "@oh-my-pi/pi-ai";
-import { assertModelSupportsEffortCeiling } from "@oh-my-pi/pi-tui/thinking";
+import { assertModelSupportsEffortCeiling } from "../thinking/levels";
 import type { ModelRegistry } from "../config/model-registry";
 import {
 	formatModelStringWithRouting,
@@ -445,7 +445,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 			// A spawn depth reset at launch is persisted; otherwise it equals the derived task depth.
 			spawnDepth: init.spawnDepth ?? taskDepth,
 			toolNames: revivedToolNames,
-			// `revivedToolNames` is the enabled set, devices included: keep those devices,
+			// The persisted enabled set includes tool commands: keep them as commands,
 			// or they come back as top-level tools and change the replayed tool list.
 			mountedToolNames: init.mountedTools,
 			outputSchema: init.outputSchema,
@@ -501,7 +501,7 @@ export async function revivePersistedSubagent(spec: PersistedReviveSpec, expecte
 	// Clamp the active set to the persisted list: createAgentSession's
 	// `alwaysInclude` can re-add non-defaultInactive extension/custom tools
 	// the original run didn't carry. Unknown/missing names are ignored.
-	await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedXdevToolNames()]);
+	await session.setActiveToolsByName([...revivedToolNames, ...session.getMountedToolCommandNames()]);
 	// The yield tool's schema carries the last batch's items; the replayed prefix must match it.
 	if (init.workPoolYieldItems) await session.setWorkPoolYieldItems(init.workPoolYieldItems);
 	// Wire the extension runtime exactly as the live executor does. Without

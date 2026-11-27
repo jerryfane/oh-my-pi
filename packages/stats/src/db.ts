@@ -10,7 +10,7 @@ import {
 	hasRecurringTariff,
 } from "@oh-my-pi/pi-catalog/models";
 import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
-import { getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
+import { $envpos, getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
 import { ChunkedInsert } from "./chunked-insert";
 import { classifyAgentType, type ParseSessionResult, type SessionParserState } from "./parser";
 import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
@@ -30,6 +30,7 @@ import type {
 	MessageStats,
 	MessageStatsInput,
 	SnapcompactCompactionStats,
+	ToolApprovalStats,
 	ToolCallStats,
 	ToolResultLink,
 	UserMessageLink,
@@ -165,9 +166,27 @@ const SNAPCOMPACT_COMPACTIONS_SINCE_MS = Date.parse("2026-08-20T00:00:00Z");
 // since this date, so older cursors stay put.
 const MODEL_USAGE_PURPOSE_BACKFILL_KEY = "model_usage_purpose_v1";
 const MODEL_USAGE_SINCE_MS = Date.parse("2026-08-31T00:00:00Z");
+// Tool approval prompts are filled by the parser from `tool_approval_requested`
+// and `tool_approval_resolved` custom entries; transcripts modified since
+// approval recording shipped are re-parsed once so older cursors stay put.
+const TOOL_APPROVALS_BACKFILL_KEY = "tool_approvals_v1";
+const TOOL_APPROVALS_SINCE_MS = Date.parse("2026-11-01T00:00:00Z");
 function shouldResetBackfill(value: string | undefined): boolean {
 	return value !== BACKFILL_COMPLETE && value !== BACKFILL_PENDING;
 }
+/** How long a stats DB statement waits on another connection's lock before failing with "database is locked". */
+const BUSY_TIMEOUT_MS = 5000;
+/**
+ * Env var overriding {@link BUSY_TIMEOUT_MS} (positive milliseconds) for the
+ * connections this module opens; for tests that hold the write lock. Read at
+ * open time, so worker threads inherit it from the spawning process.
+ */
+export const STATS_BUSY_TIMEOUT_MS_ENV = "OMP_STATS_BUSY_TIMEOUT_MS";
+
+function busyTimeoutPragma(): string {
+	return `PRAGMA busy_timeout = ${$envpos(STATS_BUSY_TIMEOUT_MS_ENV, BUSY_TIMEOUT_MS)}`;
+}
+
 /**
  * Initialize the database and create tables.
  */
@@ -180,7 +199,7 @@ export async function initDb(): Promise<Database> {
 	db = new Database(getStatsDbPath());
 	// Install the busy handler BEFORE any lock-taking statement. See
 	// https://github.com/can1357/oh-my-pi/issues/2421.
-	db.run("PRAGMA busy_timeout = 5000");
+	db.run(busyTimeoutPragma());
 	db.run("PRAGMA journal_mode = WAL");
 	// The database is a derived cache of the transcripts, so WAL's NORMAL sync
 	// (fsync only at checkpoints) is safe: a crash can drop the newest batches,
@@ -416,6 +435,25 @@ export async function initDb(): Promise<Database> {
 			PRIMARY KEY (session_file, entry_id)
 		) WITHOUT ROWID;
 		CREATE INDEX IF NOT EXISTS idx_snapcompact_compactions_entry ON snapcompact_compactions(entry_id, timestamp);
+
+		-- Tool approval prompts and their resolutions, keyed by (session_file, tool_call_id).
+		CREATE TABLE IF NOT EXISTS tool_approvals (
+			session_file TEXT NOT NULL,
+			tool_call_id TEXT NOT NULL,
+			parent_tool_call_id TEXT,
+			folder TEXT NOT NULL,
+			tool_name TEXT NOT NULL,
+			approval_mode TEXT,
+			requested_at INTEGER,
+			request_reason TEXT,
+			approved INTEGER,
+			resolved_at INTEGER,
+			resolve_reason TEXT,
+			PRIMARY KEY (session_file, tool_call_id)
+		) WITHOUT ROWID;
+		CREATE INDEX IF NOT EXISTS idx_tool_approvals_tool_requested ON tool_approvals(tool_name, requested_at);
+		CREATE INDEX IF NOT EXISTS idx_tool_approvals_call ON tool_approvals(tool_call_id);
+		CREATE INDEX IF NOT EXISTS idx_tool_approvals_requested ON tool_approvals(requested_at);
 	`);
 
 	const offsetColumns = db.query("PRAGMA table_info(file_offsets)").all() as { name: string }[];
@@ -497,10 +535,13 @@ export async function initDb(): Promise<Database> {
 	// sentinel write (process killed in between) still reclassifies on the next
 	// init instead of silently leaving every row as the 'main' default. A
 	// brand-new empty table has nothing to reclassify, so it settles COMPLETE.
-	db.query("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)").run(
-		AGENT_TYPE_BACKFILL_KEY,
-		messagesTableExisted ? BACKFILL_PENDING : BACKFILL_COMPLETE,
-	);
+	// Checked before writing: an open of a settled database takes no write lock.
+	if (!db.query("SELECT 1 FROM meta WHERE key = ?").get(AGENT_TYPE_BACKFILL_KEY)) {
+		db.query("INSERT OR IGNORE INTO meta (key, value) VALUES (?, ?)").run(
+			AGENT_TYPE_BACKFILL_KEY,
+			messagesTableExisted ? BACKFILL_PENDING : BACKFILL_COMPLETE,
+		);
+	}
 	db.run("CREATE INDEX IF NOT EXISTS idx_messages_timestamp_agent_type ON messages(timestamp, agent_type)");
 	// Each behavior-metric bump invalidates previously-ingested rows. We detect
 	// the stale schema by column name and drop the table; `IF NOT EXISTS` above
@@ -582,6 +623,7 @@ export async function initDb(): Promise<Database> {
 	reparseModifiedSince(db, SPOTLIGHT_TOGGLE_BACKFILL_KEY, SPOTLIGHT_SINCE_MS);
 	reparseModifiedSince(db, SNAPCOMPACT_COMPACTIONS_BACKFILL_KEY, SNAPCOMPACT_COMPACTIONS_SINCE_MS);
 	reparseModifiedSince(db, MODEL_USAGE_PURPOSE_BACKFILL_KEY, MODEL_USAGE_SINCE_MS);
+	reparseModifiedSince(db, TOOL_APPROVALS_BACKFILL_KEY, TOOL_APPROVALS_SINCE_MS);
 	ensureRollupSchema(db);
 	return db;
 }
@@ -1100,6 +1142,20 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 					for (const table of SPOTLIGHT_TABLES) {
 						changes += database.query(`DELETE FROM ${table} WHERE session_file = ?`).run(sessionFile).changes;
 					}
+					const parsedApprovalIds = new Set(result.toolApprovals.map(row => row.toolCallId));
+					const storedApprovals = database
+						.query<{ tool_call_id: string }, [string]>(
+							"SELECT tool_call_id FROM tool_approvals WHERE session_file = ?",
+						)
+						.all(sessionFile);
+					if (storedApprovals.some(row => !parsedApprovalIds.has(row.tool_call_id))) {
+						reconcile = true;
+					}
+					if (storedApprovals.length > 0) {
+						changes += database
+							.query("DELETE FROM tool_approvals WHERE session_file = ?")
+							.run(sessionFile).changes;
+					}
 				}
 				// The parse covers the whole transcript: drop compactions it no longer holds or has
 				// rewritten. A removed one may live on in a fork, which only another replay can credit.
@@ -1146,6 +1202,7 @@ export function applySessionParseResults(sessions: ParsedSession[]): {
 			updateUserMessageLinks(parsedRows(writes, result => result.userLinks)) +
 			insertToolCalls(parsedRows(writes, result => result.toolCalls)) +
 			updateToolResults(parsedRows(writes, result => result.toolResults)) +
+			upsertToolApprovals(parsedRows(writes, result => result.toolApprovals)) +
 			insertSnapcompactCompactions(parsedRows(writes, result => result.snapcompactCompactions)) +
 			insertSpotlightSessions(parsedRows(writes, result => result.spotlight.sessions)) +
 			updateSpotlightTitles(parsedRows(writes, result => result.spotlight.titles)) +
@@ -1389,9 +1446,36 @@ export function getMessageById(id: number): MessageStats | null {
  * raw rows while its rebuild backlog is too large for exact reads.
  */
 export async function getDailyActivity(days = 371): Promise<DailyActivityPoint[]> {
-	const database = await initDb();
+	return dailyActivity(await initDb(), days);
+}
+
+/**
+ * {@link getDailyActivity} from the stored rows through a connection of its
+ * own that never writes: no schema setup or one-time pass runs first, so
+ * another process holding the write lock never delays or fails it (WAL
+ * readers do not wait for writers). Returns null when the stats database
+ * cannot be opened, as before one exists.
+ */
+export function readDailyActivity(days = 371): DailyActivityPoint[] | null {
+	let reader: Database;
+	try {
+		reader = new Database(getStatsDbPath(), { readwrite: true, create: false });
+	} catch {
+		// `create: false` refuses to open a database that does not exist yet.
+		return null;
+	}
+	try {
+		reader.run(busyTimeoutPragma());
+		reader.run("PRAGMA query_only = 1");
+		return dailyActivity(reader, days);
+	} finally {
+		reader.close();
+	}
+}
+
+function dailyActivity(database: Database, days: number): DailyActivityPoint[] {
 	const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-	const rolled = getDailyActivityFromRollup(cutoff);
+	const rolled = getDailyActivityFromRollup(cutoff, database);
 	if (rolled) return rolled;
 	const stmt = database.query(`
 		SELECT
@@ -2020,6 +2104,81 @@ export function insertSnapcompactCompactions(rows: Iterable<SnapcompactCompactio
 				row.sessionFile,
 				[row.entryId, row.timestamp],
 				[row.sessionFile, row.entryId, row.folder, row.timestamp, row.tokensBefore, row.tokensAfter],
+			);
+		}
+		return writer.finish();
+	});
+}
+
+/**
+ * Upsert tool approval prompt records. Request and resolution entries can land
+ * in different incremental sync passes; `COALESCE` merges whichever arrives
+ * later without clobbering fields already persisted. Fork copies sharing the
+ * same `tool_call_id` route to the existing owner's `session_file` so a new
+ * outcome recorded only in a fork still merges into the deduplicated row.
+ */
+export function upsertToolApprovals(rows: Iterable<ToolApprovalStats>): number {
+	if (!db) return 0;
+	const mergeColumns = [
+		"parent_tool_call_id",
+		"approval_mode",
+		"requested_at",
+		"request_reason",
+		"approved",
+		"resolved_at",
+		"resolve_reason",
+	] as const;
+	const coalesce = (column: string) => `${column} = COALESCE(tool_approvals.${column}, excluded.${column})`;
+	const changed = (column: string) =>
+		`COALESCE(tool_approvals.${column}, excluded.${column}) IS NOT tool_approvals.${column}`;
+	const writer = new ChunkedInsert(db, {
+		verb: "INSERT",
+		table: "tool_approvals",
+		columns: [
+			"session_file",
+			"tool_call_id",
+			"parent_tool_call_id",
+			"folder",
+			"tool_name",
+			"approval_mode",
+			"requested_at",
+			"request_reason",
+			"approved",
+			"resolved_at",
+			"resolve_reason",
+		],
+		identity: ["tool_call_id"],
+		upsert: `ON CONFLICT(session_file, tool_call_id) DO UPDATE SET
+			${mergeColumns.map(coalesce).join(",\n")}
+			WHERE ${mergeColumns.map(changed).join("\n\t\t\tOR ")}`,
+	});
+	const findOwner = db.query<{ session_file: string }, [string]>(
+		"SELECT session_file FROM tool_approvals WHERE tool_call_id = ? LIMIT 1",
+	);
+	const ownerByCallId = new Map<string, string>();
+	return atomically(db, () => {
+		for (const row of rows) {
+			let owner = ownerByCallId.get(row.toolCallId);
+			if (owner === undefined) {
+				owner = findOwner.get(row.toolCallId)?.session_file ?? row.sessionFile;
+				ownerByCallId.set(row.toolCallId, owner);
+			}
+			writer.add(
+				owner,
+				[row.toolCallId],
+				[
+					owner,
+					row.toolCallId,
+					row.parentToolCallId ?? null,
+					row.folder,
+					row.toolName,
+					row.approvalMode ?? null,
+					row.requestedAt ?? null,
+					row.requestReason ?? null,
+					row.approved === undefined ? null : row.approved ? 1 : 0,
+					row.resolvedAt ?? null,
+					row.resolveReason ?? null,
+				],
 			);
 		}
 		return writer.finish();

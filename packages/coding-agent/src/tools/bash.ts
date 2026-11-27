@@ -3,8 +3,10 @@ import {
 	formatBackgroundNotice,
 	formatWallTimeNotice,
 	formatExitCodeNotice,
+	formatTimeoutClampNotice,
+	formatTimeoutNotice,
 	WALL_TIME_NOTICE_MIN_MS,
-} from "@oh-my-pi/pi-tui/tools/bash";
+} from "./details/bash";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -15,23 +17,36 @@ import type {
 	AgentToolResult,
 	AgentToolUpdateCallback,
 	ToolApprovalDecision,
+	ToolApprovalQuery,
 	ToolTier,
 } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { PipeStreams, shellBuiltins } from "@oh-my-pi/pi-natives";
+import {
+	analyzeBashApproval,
+	type ApprovalAndClause,
+	type ApprovalSimpleCommand,
+	type BashApprovalAnalysis,
+	PipeStreams,
+	repairHeredocContinuations,
+	type ShellCommands,
+	shellBuiltins,
+} from "@oh-my-pi/pi-natives";
 import { $which, isEnoent, logger, prompt, spillUrl } from "@oh-my-pi/pi-utils";
 import { $env } from "@oh-my-pi/pi-utils/env";
-import { isPosixShell } from "@oh-my-pi/pi-utils/procmgr";
 import {
 	compileNotifyPattern,
+	formatAsyncJobLabel,
 	type NotifyPattern,
 	OutputNotifier,
 	raceJobSettlement,
 	resolveAutoBackgroundWaitMs,
 } from "../async";
+import { shellChangeSnapshots } from "../commit/selective/journal";
 import { type BoardEntry, registerOnBoard } from "../daemon/client";
-import { applyDirenvPreflight, type BashResult, executeBash } from "../exec/bash-executor";
+import { applyDirenvPreflight, type BashResult, executeBash, sessionShellEnv } from "../exec/bash-executor";
+import { BASH_SESSION_ENV } from "../exec/session-processes";
 import { shellMounts, shellProcessCommand } from "../exec/shell-process";
+import { createToolCommandHandler, toolCommandNames } from "../exec/tool-command-host";
 import { InternalUrlRouter } from "../internal-urls";
 import { sessionResolveContext } from "../internal-urls/context";
 import {
@@ -47,39 +62,49 @@ import type {
 	ClientBridgeTerminalHandle,
 	ClientBridgeTerminalOutput,
 } from "../session/client-bridge";
-import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "@oh-my-pi/pi-tui/tools/streaming-output";
+import { DEFAULT_MAX_BYTES, enforceInlineByteCap } from "./streaming-output";
 import { resolveCliEntryCmd } from "../subprocess/worker-client";
 import { TerminalGraphicsDecoder } from "../utils/terminal-graphics";
+import { appendImageLinks } from "../utils/image-temp";
 import type { ToolSession } from ".";
-import { truncateForPrompt } from "./approval";
+import { owningSessionId } from "./session-id";
+import { canToolAllowAvoidPrompt, truncateForPrompt } from "./approval";
 import { type BashInteractiveResult, runInteractiveBashPty } from "./bash-interactive";
 import type { ShellTrace } from "@oh-my-pi/pi-wire";
 import { applyPatchShellInput } from "./bash-apply-patch";
 import { hostCommandUrls, urlBacking } from "./bash-host-urls";
-import { checkBashInterception } from "./bash-interceptor";
+import { bashInterception } from "./bash-interceptor";
 import { rewriteGitWorktreeAdd } from "./bash-worktree-rewrite";
 import { canUseInteractiveBashPty } from "./bash-pty-selection";
 import { resolveEvalBackends } from "./eval-backends";
 import { invalidateGithubCacheForBashCommand, invalidateGithubCacheForBashResult } from "./gh-cache-invalidation";
 import { serviceLogs, startService, type ServiceReady } from "../launch/services";
-import { isFindEnabled } from "./jfind";
-import { formatArtifactErrorNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
-import { formatOutputNotice } from "@oh-my-pi/pi-tui/tools/output-meta";
+import { O2CTL_COMMAND, runO2ctlCommand } from "../launch/o2ctl-command";
+import { findHintVisible } from "./jfind";
+import { formatArtifactErrorNotice } from "./output-meta-format";
+import { formatOutputNotice } from "./output-meta-format";
 import { outputMeta, resolveInlineByteCapBudget } from "./output-meta";
-import { resolveShellDirectory, resolveToCwd } from "./path-utils";
+import { resolveShellDirectory } from "./path-utils";
 import {
-	extractAndChainSegments,
+	bashApprovalDialect,
+	clauseMutatesShellState,
+	extractLiteralAndChainFromAnalysis,
+	hasReinterpretableExecutionArg,
+	isCompoundLiteralClauseEligible,
+	NON_POSIX_CONTROL_RE,
+} from "./bash-approval-policy";
+import {
 	extractLeadingCdTarget,
-	extractLiteralAndChainSegments,
 	isShellEnvironmentAssignment,
-	type LiteralShellCommandSegment,
+	lexShellCommand,
 	tokenizeShellSegments,
 	withoutLeadingEnvironmentAssignments,
 } from "./shell-tokenize";
 import { ToolAbortError } from "./tool-errors";
-import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
+import { ToolError } from "./tool-errors";
 import { toolResult } from "./tool-result";
 import { clampTimeout, TOOL_TIMEOUTS } from "./tool-timeouts";
+import type { ToolCommandDispatch } from "./tool-commands";
 
 import {
 	cfgAstEditEnabled,
@@ -100,8 +125,6 @@ import {
 	cfgBashDirenv,
 	cfgBashDirenvLoadTimeoutMs,
 	cfgBashGitGuard,
-	cfgBashInterceptorEnabled,
-	cfgBashInterceptorPatterns,
 	cfgBashPatterns,
 } from "../exec/settings";
 import { cfgDisplayShellVisualization } from "../modes/settings";
@@ -110,66 +133,7 @@ import { cfgWorktreeClone, ovnfsCommand } from "../task/settings";
 import { sessionShellSpeech } from "../tts/shell-speech";
 import { nativeShapingOff, shapeToolText, shapingExperiment } from "../spotlight";
 import { SPOTLIGHT_FULL_OUTPUT_MAX_BYTES } from "../spotlight/types";
-import type { SpotlightDetails } from "@oh-my-pi/pi-tui/chat/spotlight";
-
-const BASH_APPROVAL_SHELL_CONTROL_CHARS: Record<string, true> = {
-	"\n": true,
-	"\r": true,
-	";": true,
-	"&": true,
-	"|": true,
-	"<": true,
-	">": true,
-	"`": true,
-	$: true,
-	"(": true,
-	")": true,
-};
-const BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE = /(?:^|[ \t])(?:-[^-]*[ce]|--(?:command|eval))(?:[= \t]|$)/u;
-
-function hasBashApprovalShellControl(command: string): boolean {
-	let quote: "'" | '"' | undefined;
-	let hasReinterpretableShellControl = false;
-	for (let i = 0; i < command.length; i++) {
-		const ch = command[i];
-		if (quote === "'") {
-			if (ch === "'") {
-				quote = undefined;
-			} else if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) {
-				hasReinterpretableShellControl = true;
-			}
-			continue;
-		}
-		if (ch === "\\") {
-			const escaped = command[i + 1];
-			if (escaped && Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, escaped)) {
-				hasReinterpretableShellControl = true;
-			}
-			i++;
-			continue;
-		}
-		if (quote === '"') {
-			if (ch === '"') {
-				quote = undefined;
-				continue;
-			}
-			// Expansion is active inside double quotes even in the original line.
-			if (ch === "`" || ch === "$") return true;
-			// Other control characters are literal here but become executable if a
-			// `-c`/`-e` option reinterprets the argument through another shell.
-			if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) hasReinterpretableShellControl = true;
-			continue;
-		}
-		if (ch === "'" || ch === '"') {
-			quote = ch;
-			continue;
-		}
-		if (Object.hasOwn(BASH_APPROVAL_SHELL_CONTROL_CHARS, ch)) return true;
-	}
-	// Options such as `git -c alias.x='!...'` and `sh -c "..."` reinterpret
-	// otherwise literal quoted or escaped arguments as executable code.
-	return hasReinterpretableShellControl && BASH_APPROVAL_REINTERPRETED_ARGUMENT_RE.test(command);
-}
+import type { SpotlightDetails } from "./details/spotlight";
 
 const BASH_PATTERN_APPROVAL_VALUES = new Set(["allow", "deny", "prompt"]);
 
@@ -261,12 +225,29 @@ function normalizeBashApprovalPattern(value: string): string {
 	return value.trim().replace(/\s+/gu, " ");
 }
 
-function bashApprovalPatternToRegExp(pattern: string): RegExp {
-	const escaped = normalizeBashApprovalPattern(pattern)
-		.split("*")
-		.map(part => part.replace(/[\\^$+?.()|[\]{}]/gu, "\\$&"))
-		.join(".*");
-	return new RegExp(`^${escaped}$`, "u");
+/**
+ * Matches `text` against an anchored, case-sensitive `bash.patterns` glob whose only wildcard is `*`
+ * (any run of characters). Linear in `text` per literal: the first and last literals are checked as
+ * prefix and suffix, and each middle literal takes its leftmost occurrence after the previous one,
+ * which is enough to decide a `*`-only glob. A `.*` regex backtracks polynomially on non-matching
+ * input and blocks the event loop for minutes on multi-KB commands (#20591).
+ */
+function bashApprovalPatternMatches(pattern: string, text: string): boolean {
+	const parts = pattern.split("*");
+	const head = parts[0];
+	if (parts.length === 1) return text === head;
+	const tail = parts[parts.length - 1];
+	const end = text.length - tail.length;
+	if (end < head.length || !text.startsWith(head) || !text.endsWith(tail)) return false;
+	let pos = head.length;
+	for (let i = 1; i < parts.length - 1; i++) {
+		const part = parts[i];
+		if (part.length === 0) continue;
+		const index = text.indexOf(part, pos);
+		if (index === -1 || index + part.length > end) return false;
+		pos = index + part.length;
+	}
+	return true;
 }
 
 function normalizeBashPatternApproval(value: unknown): BashPatternApproval | undefined {
@@ -302,7 +283,7 @@ function getBashApprovalPatternRules(value: unknown): BashApprovalPatternRule[] 
 function commandMatchesBashApprovalPattern(command: string, pattern: string): boolean {
 	const normalizedCommand = normalizeBashApprovalPattern(command);
 	if (normalizedCommand.length === 0) return false;
-	return bashApprovalPatternToRegExp(pattern).test(normalizedCommand);
+	return bashApprovalPatternMatches(pattern, normalizedCommand);
 }
 
 // Names match exactly: a wildcard such as `CARGO_*` would also admit
@@ -315,15 +296,13 @@ function stripAllowedLeadingEnvAssignments(command: string, allowedEnvNames: rea
 // `deny`/`prompt` rules are matched per segment so a dangerous command buried in
 // a compound line (`cd x && rm -rf /`, `sleep 1 & rm -rf /`) is still caught,
 // including when prefixed by leading `NAME=value` environment assignments.
-// Reuse the shared shell tokenizer so segmentation stays in one place and honors
-// every command boundary (`;`, `&&`, `||`, `|`, `&`, subshells, newlines).
-function bashCommandSegments(command: string): string[] {
+function fallbackBashRestrictionSegments(command: string): string[] {
 	const candidates: string[] = [];
 	for (const words of tokenizeShellSegments(command)) {
 		if (words.length === 0) continue;
 		candidates.push(words.join(" "));
 		let firstCmdIndex = 0;
-		while (firstCmdIndex < words.length && isShellEnvironmentAssignment(words[firstCmdIndex])) {
+		while (firstCmdIndex < words.length && isShellEnvironmentAssignment(words[firstCmdIndex]!)) {
 			firstCmdIndex++;
 		}
 		if (firstCmdIndex > 0 && firstCmdIndex < words.length) {
@@ -335,38 +314,80 @@ function bashCommandSegments(command: string): string[] {
 
 // `deny`/`prompt` matching: the rule fires when its glob matches the whole
 // command or any single segment of a compound command.
-function commandSegmentMatchesBashApprovalPattern(command: string, pattern: string): boolean {
-	const regex = bashApprovalPatternToRegExp(pattern);
+function commandSegmentMatchesBashApprovalPattern(
+	command: string,
+	pattern: string,
+	restrictionSegments: readonly string[],
+): boolean {
 	const normalizedCommand = normalizeBashApprovalPattern(command);
 	if (normalizedCommand.length === 0) return false;
-	if (regex.test(normalizedCommand)) return true;
-	return bashCommandSegments(command).some(segment => regex.test(segment));
+	if (bashApprovalPatternMatches(pattern, normalizedCommand)) return true;
+	return restrictionSegments.some(segment => bashApprovalPatternMatches(pattern, segment));
+}
+
+function isSimpleAllowEligible(
+	simple: ApprovalSimpleCommand | undefined,
+	hasComment: boolean,
+): simple is ApprovalSimpleCommand {
+	return (
+		!hasComment &&
+		simple !== undefined &&
+		simple.expansionFree &&
+		simple.argv.length > 0 &&
+		!hasReinterpretableExecutionArg(simple.argv, simple.globWordIndices)
+	);
+}
+
+function isNonPosixAllowEligible(command: string): boolean {
+	if (NON_POSIX_CONTROL_RE.test(command)) return false;
+	const words = tokenizeShellSegments(command)[0];
+	return words !== undefined && words.length > 0 && !hasReinterpretableExecutionArg(words);
 }
 
 // A rule "applies" to a command under approval-specific semantics: `allow` must
 // vouch for the ENTIRE command and never rides a compound line (shell control
 // syntax could smuggle an unsafe segment past a narrow allow), while `deny` and
 // `prompt` fire on any matching segment so they mean what they appear to.
-function bashApprovalRuleMatches(
+// Callers must check `isSimpleAllowEligible` / `isNonPosixAllowEligible` first.
+function simpleCommandAllowsRule(
 	command: string,
+	simple: ApprovalSimpleCommand | undefined,
 	rule: BashApprovalPatternRule,
 	allowedEnvVars: readonly string[],
 ): boolean {
-	if (rule.approval === "allow") {
-		if (hasBashApprovalShellControl(command)) return false;
-		if (commandMatchesBashApprovalPattern(command, rule.match)) return true;
+	if (!simple) {
+		const trimmedCommand = command.trimStart();
+		const hasLeadingEnv =
+			withoutLeadingEnvironmentAssignments(trimmedCommand) !== null || isShellEnvironmentAssignment(trimmedCommand);
+		if (
+			(!hasLeadingEnv || isShellEnvironmentAssignment(rule.match)) &&
+			commandMatchesBashApprovalPattern(command, rule.match)
+		) {
+			return true;
+		}
+		if (!hasLeadingEnv) return false;
 		const effectiveEnv = rule.env ? [...rule.env, ...allowedEnvVars] : allowedEnvVars;
-		const stripped = stripAllowedLeadingEnvAssignments(command, effectiveEnv);
+		const stripped = stripAllowedLeadingEnvAssignments(trimmedCommand, effectiveEnv);
 		return stripped !== undefined && commandMatchesBashApprovalPattern(stripped, rule.match);
 	}
-	return commandSegmentMatchesBashApprovalPattern(command, rule.match);
+	const hasLeadingEnv = simple.assignNames.length > 0;
+	if (
+		(!hasLeadingEnv || isShellEnvironmentAssignment(rule.match)) &&
+		commandMatchesBashApprovalPattern(simple.text, rule.match)
+	) {
+		return true;
+	}
+	if (!hasLeadingEnv) return false;
+	const effectiveEnv = rule.env ? [...rule.env, ...allowedEnvVars] : allowedEnvVars;
+	const allAssignsAllowed = simple.assignNames.every(name => effectiveEnv.includes(name));
+	return allAssignsAllowed && commandMatchesBashApprovalPattern(simple.withoutAssignsText, rule.match);
 }
 
 function findNonCompoundBashRestrictionRule(
 	command: string,
 	rules: readonly BashApprovalPatternRule[],
+	segments: readonly string[],
 ): BashApprovalPatternRule | undefined {
-	const segments = bashCommandSegments(command);
 	let promptRule: BashApprovalPatternRule | undefined;
 	for (const rule of rules) {
 		if (
@@ -388,15 +409,61 @@ function findNonCompoundBashRestrictionRule(
 	return promptRule;
 }
 
-function findBashApprovalPatternRule(
+function matchAllowOrRestrictionRule(
 	command: string,
+	simple: ApprovalSimpleCommand | undefined,
+	restrictionSegments: readonly string[],
 	rules: readonly BashApprovalPatternRule[],
 	allowedEnvVars: readonly string[],
 ): BashApprovalPatternRule | undefined {
-	if (hasBashApprovalShellControl(command)) {
-		return findNonCompoundBashRestrictionRule(command, rules);
+	return rules.find(rule =>
+		rule.approval === "allow"
+			? simpleCommandAllowsRule(command, simple, rule, allowedEnvVars)
+			: commandSegmentMatchesBashApprovalPattern(command, rule.match, restrictionSegments),
+	);
+}
+
+function restrictionSegmentsFor(text: string, segments: readonly string[], incomplete: boolean): readonly string[] {
+	return incomplete ? [...segments, ...fallbackBashRestrictionSegments(text)] : segments;
+}
+
+function resolveClauseRule(
+	clause: ApprovalAndClause,
+	literalEligible: boolean,
+	restrictionSegments: readonly string[],
+	policy: BashPatternPolicy,
+): BashApprovalPatternRule | undefined {
+	return literalEligible
+		? matchAllowOrRestrictionRule(
+				clause.text,
+				clause.simple,
+				restrictionSegments,
+				policy.rules,
+				policy.allowedEnvVars,
+			)
+		: findNonCompoundBashRestrictionRule(clause.text, policy.rules, restrictionSegments);
+}
+
+function findBashApprovalPatternRule(
+	command: string,
+	analysis: BashApprovalAnalysis | null,
+	extraRestrictionSegments: readonly string[],
+	rules: readonly BashApprovalPatternRule[],
+	allowedEnvVars: readonly string[],
+): BashApprovalPatternRule | undefined {
+	const baseSegments = analysis?.valid
+		? restrictionSegmentsFor(command, analysis.restrictionSegments, analysis.restrictionIncomplete)
+		: fallbackBashRestrictionSegments(command);
+	const restrictionSegments =
+		extraRestrictionSegments.length > 0 ? [...baseSegments, ...extraRestrictionSegments] : baseSegments;
+	const simple = analysis?.valid ? analysis.single : undefined;
+	const allowEligible =
+		extraRestrictionSegments.length === 0 &&
+		(analysis ? isSimpleAllowEligible(simple, analysis.hasComment) : isNonPosixAllowEligible(command));
+	if (!allowEligible) {
+		return findNonCompoundBashRestrictionRule(command, rules, restrictionSegments);
 	}
-	return rules.find(rule => bashApprovalRuleMatches(command, rule, allowedEnvVars));
+	return matchAllowOrRestrictionRule(command, simple, restrictionSegments, rules, allowedEnvVars);
 }
 
 type BashPatternDecision =
@@ -413,25 +480,35 @@ interface BashPatternPolicy {
 
 function resolveBashPatternDecision(
 	command: string,
-	compoundSegments: readonly LiteralShellCommandSegment[] | null,
+	analysis: BashApprovalAnalysis | null,
+	extraRestrictionSegments: readonly string[],
+	compoundClauses: readonly (ApprovalAndClause & { simple: ApprovalSimpleCommand })[] | null,
 	patternRules: readonly BashApprovalPatternRule[],
 	allowedEnvVars: readonly string[],
 ): BashPatternDecision {
-	if (compoundSegments) {
+	if (compoundClauses) {
 		let promptRule: BashApprovalPatternRule | undefined;
 		for (const rule of patternRules) {
 			if (
 				rule.approval !== "allow" &&
 				commandMatchesBashApprovalPattern(command, rule.match) &&
-				!compoundSegments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+				!compoundClauses.some(clause =>
+					commandSegmentMatchesBashApprovalPattern(clause.text, rule.match, clause.restrictionSegments),
+				)
 			) {
 				if (rule.approval === "deny") return { kind: "deny", rule };
 				promptRule ??= rule;
 			}
 		}
 		let hasUnmatchedSegment = false;
-		for (const segment of compoundSegments) {
-			const segmentRule = findBashApprovalPatternRule(segment.text, patternRules, allowedEnvVars);
+		for (const clause of compoundClauses) {
+			const segmentRule = matchAllowOrRestrictionRule(
+				clause.text,
+				clause.simple,
+				clause.restrictionSegments,
+				patternRules,
+				allowedEnvVars,
+			);
 			if (segmentRule?.approval === "deny") return { kind: "deny", rule: segmentRule };
 			if (segmentRule?.approval === "prompt") promptRule ??= segmentRule;
 			if (!segmentRule) hasUnmatchedSegment = true;
@@ -439,7 +516,13 @@ function resolveBashPatternDecision(
 		if (promptRule) return { kind: "prompt", rule: promptRule };
 		return hasUnmatchedSegment ? { kind: "unmatched" } : { kind: "allow" };
 	}
-	const patternRule = findBashApprovalPatternRule(command, patternRules, allowedEnvVars);
+	const patternRule = findBashApprovalPatternRule(
+		command,
+		analysis,
+		extraRestrictionSegments,
+		patternRules,
+		allowedEnvVars,
+	);
 	if (patternRule?.approval === "deny") return { kind: "deny", rule: patternRule };
 	if (patternRule?.approval === "prompt") return { kind: "prompt", rule: patternRule };
 	if (patternRule?.approval === "allow") return { kind: "allow" };
@@ -474,14 +557,12 @@ const SERVICE_READY = type({
 const bashSchemaBase = type({
 	command: type("string"),
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
-	"cwd?": "string",
 	"pty?": "boolean",
 });
 
 const bashSchemaWithAsync = type({
 	command: "string",
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
-	"cwd?": "string",
 	"pty?": "boolean",
 	"async?": "boolean",
 	"notify?": "string",
@@ -490,7 +571,6 @@ const bashSchemaWithAsync = type({
 const bashSchemaWithService = type({
 	command: "string",
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
-	"cwd?": "string",
 	"pty?": "boolean",
 	"notify?": "string",
 	"name?": SERVICE_NAME,
@@ -500,7 +580,6 @@ const bashSchemaWithService = type({
 const bashSchemaWithAsyncAndService = type({
 	command: "string",
 	"timeout?": type("number").describe(BASH_TIMEOUT_DESCRIPTION),
-	"cwd?": "string",
 	"pty?": "boolean",
 	"async?": "boolean",
 	"notify?": "string",
@@ -524,7 +603,6 @@ type BashToolSchema =
 export interface BashToolInput {
 	command: string;
 	timeout?: number;
-	cwd?: string;
 	name?: string;
 	ready?: ServiceReady;
 	async?: boolean;
@@ -596,6 +674,8 @@ interface ManagedBashJobHandle {
 	background: () => void;
 	/** Text the run wrote to `out://` while the call was in the foreground, oldest first. */
 	replies: readonly string[];
+	/** Tool command dispatches of the run so far, in invocation order. */
+	toolCommands: () => ToolCommandDispatch[];
 }
 
 interface BashProgressDetails extends BashToolDetails {
@@ -611,10 +691,20 @@ const NO_PIDS = (): readonly number[] => [];
  * Shown when a call ran in a fork of the session's busy shell (it overlapped a parallel or backgrounded call)
  * and what it set could not be carried back into the session's shell.
  */
-const FORK_STATE_LOST_NOTICE = "Ran in a copy of the busy session shell; changes here won't persist.";
+const FORK_STATE_LOST_NOTICE = "[shell busy; state not kept]";
 /** Shown when such a call left background jobs running: they stay in the copy. */
-const FORK_JOBS_NOTICE =
-	"Background jobs started here run in a copy of the busy session shell; later calls' jobs, wait and %N won't see them.";
+const FORK_JOBS_NOTICE = "[jobs invisible to later calls]";
+
+/**
+ * Names what a command changed in the session shell that the next call starts without: a `cd`
+ * (calls start in `sessionCwd`) and `set -e`.
+ */
+function formatShellResetNotice(result: BashResult | BashInteractiveResult, sessionCwd: string): string | undefined {
+	const reset: string[] = [];
+	if ("movedCwd" in result && result.movedCwd) reset.push(`cwd → ${sessionCwd}`);
+	if ("errexit" in result && result.errexit) reset.push("set -e off");
+	return reset.length > 0 ? `[next call: ${reset.join(", ")}]` : undefined;
+}
 
 function normalizeResultOutput(result: BashResult | BashInteractiveResult): string {
 	return result.output || "";
@@ -653,34 +743,109 @@ class TerminalSnapshotDecoder {
 	}
 }
 
-function formatTimeoutClampNotice(
-	requestedTimeoutSec: number,
-	effectiveTimeoutSec: number,
-	maxTimeout: number,
-): string | undefined {
-	if (requestedTimeoutSec === effectiveTimeoutSec) return undefined;
-	const cappedByGlobal = maxTimeout > 0 && effectiveTimeoutSec === maxTimeout && maxTimeout < TOOL_TIMEOUTS.bash.max;
-	const limit = cappedByGlobal
-		? `global tools.maxTimeout ceiling ${maxTimeout}s`
-		: `allowed range ${TOOL_TIMEOUTS.bash.min}-${TOOL_TIMEOUTS.bash.max}s`;
-	return `Timeout clamped to ${effectiveTimeoutSec}s (requested ${requestedTimeoutSec}s; ${limit}).`;
-}
-
 /**
- * Records handler answers to a command's URL writes (`> proc://<id>/kill`, `> xd://<tool>`) as
+ * Records handler answers to a command's URL writes (`> proc://<id>/kill`, `> out://`) as
  * result notices: the shell itself shows only an errno for a refused write.
  */
 function noticeUrlWrites(notices: string[]): (report: UrlWriteReport) => void {
 	return ({ url, text, failed }) => {
-		if (failed) notices.push(`Write to ${url} failed: ${text}`);
-		else if (text) notices.push(`${url}: ${text}`);
+		if (failed) notices.push(`[${url} failed: ${text}]`);
+		else if (text) notices.push(`[${url}: ${text}]`);
 	};
 }
 
-/** Explicit tool `cwd` keeps the workspace-root alias; a hoisted shell `cd` does not. */
-function resolveCommandCwd(cwd: string | undefined, sessionCwd: string, hoistedShellCwd: boolean): string {
-	if (!cwd) return sessionCwd;
-	return hoistedShellCwd ? resolveShellDirectory(cwd, sessionCwd) : resolveToCwd(cwd, sessionCwd);
+/** Words that may precede a simple command in a command list without being its name. */
+const SHELL_COMMAND_PREFIX_WORDS: ReadonlySet<string> = new Set([
+	"!",
+	"{",
+	"if",
+	"then",
+	"elif",
+	"else",
+	"do",
+	"while",
+	"until",
+	"time",
+]);
+
+/** Name of a command a simple command starts with, past leading assignments and list keywords. */
+function simpleCommandName(words: readonly string[]): string | undefined {
+	return words.find(word => !isShellEnvironmentAssignment(word) && !SHELL_COMMAND_PREFIX_WORDS.has(word));
+}
+
+/** First session tool command a simple command of `command` starts with. */
+function invokedToolCommand(command: string, names: ReadonlySet<string>): string | undefined {
+	if (names.size === 0) return undefined;
+	for (const words of tokenizeShellSegments(command)) {
+		const name = simpleCommandName(words);
+		if (name !== undefined && names.has(name)) return name;
+	}
+	return undefined;
+}
+
+/** Operators that may join the commands of a line made only of tool commands. */
+const TOOL_COMMAND_LINE_OPERATORS: Record<string, true> = {
+	"": true,
+	";": true,
+	"&&": true,
+	"||": true,
+	"|": true,
+	"|&": true,
+};
+
+/**
+ * Whether every simple command of `command` invokes one of `names`, joined only by `;`, `&&`, `||`,
+ * `|` and newlines, with no redirection, expansion or substitution, grouping, comment, backgrounding
+ * or assignment prefix. Anything this scan cannot vouch for is not such a line.
+ */
+function isToolCommandLine(command: string, names: ReadonlySet<string>): boolean {
+	if (names.size === 0) return false;
+	let commandStart = true;
+	let commands = 0;
+	for (const token of lexShellCommand(command)) {
+		if (token.kind === "separator") {
+			if (!Object.hasOwn(TOOL_COMMAND_LINE_OPERATORS, token.raw.replace(/[ \t\n]/gu, ""))) return false;
+			if (/[\n;&|]/u.test(token.raw)) commandStart = true;
+			continue;
+		}
+		if (/[<>`$\r]/u.test(token.raw) || token.raw.startsWith("#")) return false;
+		if (commandStart) {
+			if (!names.has(token.value)) return false;
+			commands++;
+			commandStart = false;
+		}
+	}
+	return commands > 0;
+}
+
+/** Tool command dispatches of one bash run, in invocation order. */
+class ToolCommandRecorder {
+	#records: Array<ToolCommandDispatch | undefined> = [];
+	#finished = new Set<number>();
+
+	/** Record a finished dispatch. */
+	finish(dispatch: ToolCommandDispatch, index: number): void {
+		this.#records[index] = dispatch;
+		this.#finished.add(index);
+	}
+
+	/** Record the partial details a running dispatch reported. */
+	progress(dispatch: ToolCommandDispatch, index: number): void {
+		if (this.#finished.has(index)) return;
+		const current = this.#records[index];
+		this.#records[index] = current ? { ...current, inner: dispatch.inner } : dispatch;
+	}
+
+	/** Records so far, in invocation order. */
+	list(): ToolCommandDispatch[] {
+		return this.#records.filter((record): record is ToolCommandDispatch => record !== undefined);
+	}
+
+	/** `details.toolCommands` for a frame or result; empty when nothing was dispatched. */
+	details(): { toolCommands?: ToolCommandDispatch[] } {
+		const toolCommands = this.list();
+		return toolCommands.length > 0 ? { toolCommands } : {};
+	}
 }
 
 /**
@@ -693,47 +858,75 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	/** Bash reads `skill://` paths through its shell filesystem, including as a working directory. */
 	readonly readsSkillUris = true;
 	/**
-	 * The interceptor message for a call, checking the raw command and the one after a leading
-	 * `cd … &&` so the wrapper hides neither shell-navigation rules nor the dedicated-tool command.
+	 * Whether this line is pure tool-command traffic: every simple command is a mounted tool
+	 * command (or a special command), joined only by `;`, `&&`, `||`, `|` and newlines, with no
+	 * redirection, expansion, substitution or assignment — see {@link isToolCommandLine}. Such a
+	 * line runs no program: it dispatches the same session tools a top-level call would, which is
+	 * why a same-name extension replacement hands it back to this tool (#18339). Every other line
+	 * stays the override's.
 	 */
-	#interception(
-		rawCommand: string,
-		command: string,
-		name: string | undefined,
-		toolNames: string[],
-	): string | undefined {
-		if (!cfgBashInterceptorEnabled.get(this.session.settings)) return undefined;
-		const rules = cfgBashInterceptorPatterns.get(this.session.settings).filter(rule => !name || rule.tool !== "bash");
-		for (const commandToCheck of rawCommand === command ? [command] : [rawCommand, command]) {
-			const interception = checkBashInterception(commandToCheck, toolNames, rules, rawCommand);
-			if (interception.block) return interception.message ?? "Command blocked";
-		}
-		return undefined;
+	servesToolCommandLine(command: string): boolean {
+		return isToolCommandLine(command, new Set(toolCommandNames(this.session)));
 	}
 
-	readonly approval = (args: unknown, ctx?: AgentToolContext): ToolApprovalDecision => {
+	readonly approval = (args: unknown, ctx?: AgentToolContext, query?: ToolApprovalQuery): ToolApprovalDecision => {
 		const input = (args ?? {}) as Partial<BashToolInput>;
 		const rawCommand = input.command;
 		const command = typeof rawCommand === "string" ? rawCommand : "";
 		// An intercepted call is refused outright; asking first would only approve a doomed call.
-		const cwdCommand = input.cwd ? command : (extractLeadingCdTarget(command)?.rest ?? command);
+		const cwdCommand = extractLeadingCdTarget(command)?.rest ?? command;
 		const name = typeof input.name === "string" ? blankToUndefined(input.name) : undefined;
-		const interception = this.#interception(command, cwdCommand, name, ctx?.toolNames ?? []);
+		const toolCommands = new Set(toolCommandNames(this.session));
+		const interception = bashInterception(
+			this.session.settings,
+			command,
+			cwdCommand,
+			name,
+			ctx?.toolNames ?? [],
+			toolCommands,
+		);
 		if (interception) {
 			return { tier: "exec", override: true, policy: "deny", reason: interception.replace(/^Blocked:\s*/u, "") };
 		}
 		const { session: policy, authority } = this.#patternPolicies();
-		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
-			? this.session.settings.getShellConfig().shell
-			: undefined;
-		const compoundSegments = shell && isPosixShell(shell) ? extractLiteralAndChainSegments(command) : null;
-		const decision = resolveBashPatternDecision(command, compoundSegments, policy.rules, policy.allowedEnvVars);
+		// Without `bash.patterns` rules the native analysis only feeds critical-command prompts,
+		// which a caller that cannot prompt (yolo, tier-only reads) never shows.
+		if (query?.prompts === false && policy.rules.length === 0 && authority.rules.length === 0) {
+			return isToolCommandLine(command, toolCommands) ? "read" : "exec";
+		}
+		const allowCompound = cfgBashAllowCompoundCommands.get(this.session.settings);
+		const shell = this.session.settings.getShellConfig().shell;
+		const dialect = bashApprovalDialect(shell);
+		const analysis = dialect ? analyzeBashApproval(command, dialect) : null;
+		const repaired = dialect ? repairHeredocContinuations(command) : null;
+		const extraRestrictionSegments = repaired ? analyzeBashApproval(repaired, dialect!).restrictionSegments : [];
+		const compoundSegments =
+			extraRestrictionSegments.length === 0 ? extractLiteralAndChainFromAnalysis(analysis, allowCompound) : null;
+		const compoundClauses =
+			compoundSegments && analysis?.andChain
+				? (analysis.andChain as (ApprovalAndClause & { simple: ApprovalSimpleCommand })[])
+				: null;
+		const decision = resolveBashPatternDecision(
+			command,
+			analysis,
+			extraRestrictionSegments,
+			compoundClauses,
+			policy.rules,
+			policy.allowedEnvVars,
+		);
 		// Project layers may tighten the operator's `bash.patterns`, never loosen
 		// them: an operator deny or prompt still applies under a project allow.
 		const authorityDecision =
 			authority === policy
 				? decision
-				: resolveBashPatternDecision(command, compoundSegments, authority.rules, authority.allowedEnvVars);
+				: resolveBashPatternDecision(
+						command,
+						analysis,
+						extraRestrictionSegments,
+						compoundClauses,
+						authority.rules,
+						authority.allowedEnvVars,
+					);
 		const denied =
 			authorityDecision.kind === "deny" ? authorityDecision : decision.kind === "deny" ? decision : undefined;
 		if (denied) {
@@ -754,7 +947,12 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				reason: `Prompt required by bash pattern: ${prompted.rule.match}`,
 			};
 		}
-		const criticalCommand = command !== "" && CRITICAL_BASH_PATTERNS.some(pattern => pattern.test(command));
+		const singleArgvLine = analysis?.valid && analysis.single ? analysis.single.argv.join(" ") : undefined;
+		const criticalCommand =
+			command !== "" &&
+			CRITICAL_BASH_PATTERNS.some(
+				pattern => pattern.test(command) || (singleArgvLine !== undefined && pattern.test(singleArgvLine)),
+			);
 		if (!compoundSegments && criticalCommand) {
 			return { tier: "exec", override: true, reason: "Critical pattern detected" };
 		}
@@ -766,6 +964,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				}
 			}
 		}
+		// Each tool command passes its own approval when it runs; the line itself only reads.
+		if (isToolCommandLine(command, toolCommands)) return "read";
 		if (decision.kind === "allow") return { tier: "write", policy: "allow" };
 		return "exec";
 	};
@@ -799,29 +999,35 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	}
 
 	#formatCompoundApprovalDetails(command: string): string[] | null {
-		const shell = cfgBashAllowCompoundCommands.get(this.session.settings)
-			? this.session.settings.getShellConfig().shell
-			: undefined;
-		if (!shell || !isPosixShell(shell)) return null;
-		const segments = extractAndChainSegments(command);
-		if (!segments) return null;
+		if (!cfgBashAllowCompoundCommands.get(this.session.settings)) return null;
+		const dialect = bashApprovalDialect(this.session.settings.getShellConfig().shell);
+		if (!dialect) return null;
+		const analysis = analyzeBashApproval(command, dialect);
+		if (!analysis.valid || analysis.hasControlChars || analysis.hasComment || !analysis.andChain) return null;
+		const clauses = analysis.andChain;
 		const { session: policy, authority } = this.#patternPolicies();
+		const clauseRestrictions = clauses.map(clause =>
+			restrictionSegmentsFor(clause.text, clause.restrictionSegments, analysis.restrictionIncomplete),
+		);
 		// Whole-chain restrictions apply to the complete chain rather than individual segments.
 		for (const rules of authority === policy ? [policy.rules] : [authority.rules, policy.rules]) {
 			for (const rule of rules) {
 				if (
 					rule.approval !== "allow" &&
 					commandMatchesBashApprovalPattern(command, rule.match) &&
-					!segments.some(segment => commandSegmentMatchesBashApprovalPattern(segment.text, rule.match))
+					!clauses.some((clause, idx) =>
+						commandSegmentMatchesBashApprovalPattern(clause.text, rule.match, clauseRestrictions[idx]!),
+					)
 				) {
 					return null;
 				}
 			}
 		}
-		const segmentCritical = segments.map(segment => {
-			const literalCommand = segment.literal?.argv.join(" ");
+		const clauseEligibility = clauses.map(clause => isCompoundLiteralClauseEligible(clause));
+		const segmentCritical = clauses.map((clause, idx) => {
+			const literalCommand = clauseEligibility[idx] ? clause.simple!.argv.join(" ") : undefined;
 			return CRITICAL_BASH_PATTERNS.some(
-				pattern => pattern.test(segment.text) || (literalCommand !== undefined && pattern.test(literalCommand)),
+				pattern => pattern.test(clause.text) || (literalCommand !== undefined && pattern.test(literalCommand)),
 			);
 		});
 		const wholeChainOnlyCritical =
@@ -832,14 +1038,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		let chainUntainted = true;
 		const rows: string[] = [];
-		for (let i = 0; i < segments.length; i++) {
-			const segment = segments[i]!;
+		for (let i = 0; i < clauses.length; i++) {
+			const clause = clauses[i]!;
 			const isCritical = segmentCritical[i]!;
-			const segmentRule = findBashApprovalPatternRule(segment.text, policy.rules, policy.allowedEnvVars);
+			const literalEligible = clauseEligibility[i]!;
+			const mutatesShellState = clauseMutatesShellState(clause, literalEligible);
+			const segmentRule = resolveClauseRule(clause, literalEligible, clauseRestrictions[i]!, policy);
 			const authorityRule =
 				authority === policy
 					? segmentRule
-					: findBashApprovalPatternRule(segment.text, authority.rules, authority.allowedEnvVars);
+					: resolveClauseRule(clause, literalEligible, clauseRestrictions[i]!, authority);
 			const promptRule =
 				authorityRule?.approval === "prompt"
 					? authorityRule
@@ -848,21 +1056,21 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						: undefined;
 			const covered =
 				chainUntainted &&
-				segment.literal !== null &&
+				literalEligible &&
 				!isCritical &&
 				!promptRule &&
 				authorityRule?.approval !== "deny" &&
 				segmentRule?.approval === "allow";
-			if (segment.mutatesShellState) chainUntainted = false;
+			if (mutatesShellState) chainUntainted = false;
 			if (covered && segmentRule) {
-				rows.push(`  ✓ ${truncateForPrompt(segment.text)} (allowed: ${segmentRule.match})`);
+				rows.push(`  ✓ ${truncateForPrompt(clause.text)} (allowed: ${segmentRule.match})`);
 			} else {
 				const reason = promptRule
 					? `prompt: ${promptRule.match}`
 					: isCritical
 						? "critical pattern"
 						: "requires approval";
-				rows.push(`  ? ${truncateForPrompt(segment.text)} (${reason})`);
+				rows.push(`  ? ${truncateForPrompt(clause.text)} (${reason})`);
 			}
 		}
 		return ["Command:", ...rows];
@@ -882,17 +1090,24 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	get description(): string {
 		const evalBackends = resolveEvalBackends(this.session);
 		const isToolActive = (name: string, fallback: boolean): boolean => this.session.isToolActive?.(name) ?? fallback;
+		const shellConfig = this.session.settings.getShellConfig();
+		const approvalPatternsActive =
+			canToolAllowAvoidPrompt("bash", "exec", { settings: this.session.settings }) &&
+			this.#patternPolicies().session.rules.some(rule => rule.approval === "allow");
 		return prompt.render(bashDescription, {
 			asyncEnabled: cfgAsyncEnabled.get(this.session.settings),
 			// The deadline an omitted `timeout` resolves to, after the `tools.maxTimeout` cap.
 			defaultTimeoutSec: clampTimeout("bash", undefined, cfgToolsMaxTimeout.get(this.session.settings)),
 			autoBackgroundEnabled: cfgBashAutoBackgroundEnabled.get(this.session.settings),
 			autoBackgroundSeconds: cfgBashAutoBackgroundThresholdMs.get(this.session.settings) / 1000,
+			approvalPatternsActive,
+			allowCompoundCommands:
+				cfgBashAllowCompoundCommands.get(this.session.settings) && bashApprovalDialect(shellConfig.shell) !== null,
 			hasAstGrep: isToolActive("ast_grep", cfgAstGrepEnabled.get(this.session.settings)),
 			hasAstEdit: isToolActive("ast_edit", cfgAstEditEnabled.get(this.session.settings)),
 			hasGrep: isToolActive("grep", cfgGrepEnabled.get(this.session.settings)),
 			hasGlob: isToolActive("glob", cfgGlobEnabled.get(this.session.settings)),
-			hasFind: this.session.isToolActive?.("find") ?? isFindEnabled(this.session),
+			hasFind: findHintVisible(this.session),
 			hasRead: isToolActive("read", true),
 			// Frozen at the last prompt rebuild (managed sessions). SDK consumers
 			// building a bare ToolSession lack the rebuild lifecycle, so fall back
@@ -904,7 +1119,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			hasPty: this.#ptyAvailable || this.#launchEnabled,
 			hasEval: isToolActive("eval", evalBackends.python || evalBackends.js),
 			// The embedded shell's session env is the shell config env (see bash-executor).
-			builtins: shellBuiltins(this.session.settings.getShellConfig().env),
+			builtins: shellBuiltins(shellConfig.env),
 			isWindows: process.platform === "win32",
 		});
 	}
@@ -938,22 +1153,73 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		signal: AbortSignal | undefined,
 		options: Omit<InternalUrlFilesystemOptions, "context">,
 	): InternalUrlFilesystem {
-		return new InternalUrlFilesystem({ ...options, context: sessionResolveContext(this.session, { signal }) });
+		return new InternalUrlFilesystem({
+			...options,
+			context: sessionResolveContext(this.session, { signal }),
+			// What the command's builtins and redirections write is journaled like an edit tool's write.
+			onFileChange:
+				this.session.recordFileChange &&
+				(change => this.session.recordFileChange?.({ tool: "bash", ...shellChangeSnapshots(change) })),
+		});
 	}
 
 	/**
-	 * Session identity for a command, read when its tool call starts, so
-	 * `/fork`, `/new`, and `/resume` take effect on the next call while a call
-	 * already under way keeps the session it began in. `PI_TOOL_CALL_ID` is the
-	 * id this call runs under: the agent's call in the transcript, or the eval
-	 * tool bridge's own id for a call made from an eval cell. Always
-	 * set every key: an empty value replaces a stale one inherited from a parent
-	 * omp process, since an env overlay cannot unset.
+	 * Session tool commands for one embedded shell run, plus `o2ctl` while services can launch;
+	 * undefined when there are none. The handler lives as long as the run: `signal` is the run's
+	 * own, and every tool dispatch lands in `recorder`, after which `onChange` re-emits the run's
+	 * frame.
+	 */
+	#shellCommands(
+		names: readonly string[],
+		options: {
+			toolCallId: string;
+			signal: AbortSignal | undefined;
+			context: AgentToolContext | undefined;
+			recorder: ToolCommandRecorder;
+			onChange?: () => void;
+		},
+	): ShellCommands | undefined {
+		// A mounted tool of that name keeps it.
+		const o2ctl = this.#launchEnabled && !names.includes(O2CTL_COMMAND);
+		if (names.length === 0 && !o2ctl) return undefined;
+		const { recorder, onChange } = options;
+		const tools = createToolCommandHandler({
+			session: this.session,
+			toolCallId: options.toolCallId,
+			signal: options.signal,
+			context: options.context,
+			onDispatch: (dispatch, index) => {
+				recorder.finish(dispatch, index);
+				onChange?.();
+			},
+			onProgress: (dispatch, index) => {
+				recorder.progress(dispatch, index);
+				onChange?.();
+			},
+		});
+		return {
+			names: o2ctl ? [...names, O2CTL_COMMAND] : [...names],
+			handler: request =>
+				o2ctl && request.name === O2CTL_COMMAND
+					? runO2ctlCommand(this.session, request, options.signal)
+					: tools(request),
+		};
+	}
+
+	/**
+	 * Session identity for a command ({@link sessionShellEnv}), read when its
+	 * tool call starts, so `/fork`, `/new`, and `/resume` take effect on the next
+	 * call while a call already under way keeps the session it began in.
+	 * `PI_TOOL_CALL_ID` is the id this call runs under: the agent's call in the
+	 * transcript, or the eval tool bridge's own id for a call made from an eval
+	 * cell.
 	 */
 	#sessionEnv(toolCallId: string): Record<string, string> {
+		const sessionId = owningSessionId(this.session) ?? "";
 		return {
-			PI_SESSION_ID: this.session.sessionManager?.getSessionId?.() ?? this.session.getSessionId?.() ?? "",
-			PI_SESSION_FILE: this.session.getSessionFile() ?? "",
+			...sessionShellEnv({ id: sessionId, file: this.session.getSessionFile() }),
+			// Membership tag for processes the call leaves running (session-processes.ts).
+			[BASH_SESSION_ENV]: sessionId,
 			PI_TOOL_CALL_ID: toolCallId,
 		};
 	}
@@ -1027,8 +1293,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			signal: AbortSignal | undefined;
 			/** `urlmap` commands for the session's URL paths ({@link shellMounts}). */
 			mounts: string;
-			artifactPath: string | undefined;
-			artifactId: string | undefined;
 		},
 	): Promise<BashInteractiveResult> {
 		const seed = await this.#sessionSeed(run.sessionId, run.hostCwd, run.signal);
@@ -1045,8 +1309,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				env: { ...seed.env, ...run.sessionEnv },
 				timeoutMs: run.timeoutMs,
 				signal: run.signal,
-				artifactPath: run.artifactPath,
-				artifactId: run.artifactId,
+				allocateArtifact: this.session.allocateOutputArtifact,
 				onStart: pid => {
 					board.entry = registerOnBoard({
 						kind: "external",
@@ -1094,21 +1357,20 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 	): void {
 		const captureNotice = result.artifactError ? `\n\n[${formatArtifactErrorNotice(result.artifactError)}]` : "";
 		if (result.cancelled) {
-			// Local executor output already carries a leading `[Command cancelled]`
+			// Local executor output already carries a leading `[cancelled]`
 			// notice from the sink; PTY/bridge output does not, so annotate only
 			// the latter.
 			const out = normalizeResultOutput(result);
-			const annotated = out.startsWith("[Command cancelled]") ? out : out ? `${out}\n\n[Command aborted]` : out;
-			throw new ToolError(`${annotated || "Command aborted"}${captureNotice}`);
+			const annotated = out.startsWith("[cancelled]") ? out : out ? `${out}\n\n[aborted]` : "[aborted]";
+			throw new ToolError(`${annotated}${captureNotice}`);
 		}
 		if (result.timedOut === true) {
 			const out = normalizeResultOutput(result);
-			const message =
-				timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`;
-			throw new ToolError(`${out ? `${out}\n\n[${message}]` : message}${captureNotice}`);
+			const notice = `[${formatTimeoutNotice(timeoutSec === undefined ? undefined : timeoutSec * 1000)}]`;
+			throw new ToolError(`${out ? `${out}\n\n${notice}` : notice}${captureNotice}`);
 		}
 		if (result.exitCode === undefined) {
-			throw new ToolError(`${outputText}\n\nCommand failed: missing exit status${captureNotice}`);
+			throw new ToolError(`${outputText}\n\n[missing exit status]${captureNotice}`);
 		}
 	}
 
@@ -1125,6 +1387,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			replies?: readonly string[];
 			/** The call the result answers; shapes the output under the session's Spotlight experiment. */
 			toolCallId?: string;
+			/** Tool command dispatches of the run, in invocation order. */
+			toolCommands?: readonly ToolCommandDispatch[];
 		},
 	): Promise<AgentToolResult<BashToolDetails>> {
 		const exitCode = result.exitCode;
@@ -1146,6 +1410,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				if (notice) notices.push(notice);
 			}
 		}
+		const resetNotice = formatShellResetNotice(result, this.session.cwd);
+		if (resetNotice) notices.push(resetNotice);
 		const fork = "fork" in result ? result.fork : undefined;
 		if (fork && !fork.carried) notices.push(FORK_STATE_LOST_NOTICE);
 		if (fork?.jobs) notices.push(FORK_JOBS_NOTICE);
@@ -1177,6 +1443,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			details.exitCode = exitCode;
 		}
 		if (options.replies?.length) details.replies = [...options.replies];
+		if (options.toolCommands?.length) details.toolCommands = [...options.toolCommands];
 		if (shaped?.spotlight) details.spotlight = shaped.spotlight;
 		// Native history is bounded; retain it whole so persisted calls remain replayable.
 		const trace = "trace" in result ? result.trace : undefined;
@@ -1198,8 +1465,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 		if (isTimeout) {
 			details.timedOut = true;
-			const message =
-				timeoutSec === undefined ? "Command timed out" : `Command timed out after ${timeoutSec} seconds`;
+			const message = formatTimeoutNotice(timeoutSec === undefined ? undefined : timeoutSec * 1000);
 			// executeBash has already emitted this leading sink notice. PTY output has not, and output shaped from the
 			// artifact never carries it, so provide the LLM-facing annotation exactly once in the text sent.
 			const lead = outputLines[0];
@@ -1287,8 +1553,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		options: {
 			requestedTimeoutSec?: number;
 			notices?: readonly string[];
+			/** Why the call left the foreground early; see {@link formatBackgroundNotice}. */
+			reason?: string;
 			replies?: readonly string[];
 			trace?: ShellTrace;
+			toolCommands?: readonly ToolCommandDispatch[];
 		} = {},
 	): AgentToolResult<BashToolDetails> {
 		const details: BashToolDetails = {
@@ -1296,6 +1565,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		};
 		if (options.trace) details.trace = options.trace;
 		if (options.replies?.length) details.replies = [...options.replies];
+		if (options.toolCommands?.length) details.toolCommands = [...options.toolCommands];
 		if (timeoutSec === undefined) {
 			details.timeoutDisabled = true;
 		} else {
@@ -1312,7 +1582,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		if (options.notices?.length) {
 			lines.push(...options.notices, "");
 		}
-		lines.push(formatBackgroundNotice(jobId, timeoutSec));
+		lines.push(formatBackgroundNotice(jobId, timeoutSec, options.reason));
 		return {
 			content: [{ type: "text", text: lines.join("\n") }],
 			details,
@@ -1346,13 +1616,19 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		toolCallId: string;
 		/** Output lines to report while the job runs; see {@link BashToolInput.notify}. */
 		notify?: NotifyPattern;
+		/** Session tool command names installed for the run ({@link toolCommandNames}). */
+		toolCommands: readonly string[];
+		/** Tool context the run's tool commands execute under. */
+		context?: AgentToolContext;
+		/** A tool command is about to ask the user for approval while the call still waits on the run. */
+		onApprovalPrompt?: () => void;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
 			throw new ToolError("Background job manager unavailable for this session.");
 		}
 
-		const label = options.command.length > 120 ? `${options.command.slice(0, 117)}...` : options.command;
+		const label = formatAsyncJobLabel(options.command);
 		// Holds the run's Shell only while it runs: a retained reference would
 		// keep a finished `:async:` Shell (and its background children) alive.
 		let pids: () => readonly number[] = NO_PIDS;
@@ -1362,19 +1638,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const outputTap = new TextTap("out", "the command's own stdout+stderr");
 		const pipeSources = new PipeTextSources(streams);
 		let latestText = "";
+		// When the command last wrote its own output: the jobs sheet follows whichever source flows.
+		let outputModified: number | undefined;
 		let latestProgressDetails: BashProgressDetails | undefined;
 		let backgrounded = !options.foreground;
 		const completion = Promise.withResolvers<ManagedBashJobCompletion>();
 		const notices = [...(options.notices ?? [])];
 		const replies: string[] = [];
+		const toolCommandRecorder = new ToolCommandRecorder();
 		// The run's live trace; cleared once the result carries the final bounded snapshot.
 		let liveTrace: ShellTrace | undefined;
 		// While the call waits on the run, every frame of its card carries the replies so far and the
 		// transcript draws the new ones. A backgrounded job's frames carry none: the call's result already did.
-		// Every frame of a live run carries its latest trace.
+		// Every frame of a live run carries its latest trace and its tool command dispatches so far.
 		const withReplies = (details: BashProgressDetails): BashProgressDetails => {
 			const withTrace = liveTrace && details.trace === undefined ? { ...details, trace: liveTrace } : details;
-			return !backgrounded && replies.length > 0 ? { ...withTrace, replies: [...replies] } : withTrace;
+			const withCommands = { ...withTrace, ...toolCommandRecorder.details() };
+			return !backgrounded && replies.length > 0 ? { ...withCommands, replies: [...replies] } : withCommands;
 		};
 		// Replies reach the user only while the call waits on the run: once it returns, nothing draws them.
 		const onReply = (text: string): void => {
@@ -1387,6 +1667,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				details: withReplies(latestProgressDetails ?? {}),
 			});
 		};
+		// A prompt only promotes the run while the call still waits on it; once backgrounded it just waits for the user.
+		const { onApprovalPrompt } = options;
+		const toolContext =
+			options.context && onApprovalPrompt
+				? {
+						...options.context,
+						onApprovalPrompt: () => {
+							if (!backgrounded) onApprovalPrompt();
+						},
+					}
+				: options.context;
 
 		const jobId = manager.register(
 			"bash",
@@ -1423,7 +1714,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						: undefined;
 				// A cancelled job reports nothing more, even while its command is still shutting down.
 				if (notifier) runSignal.addEventListener("abort", () => notifier.stop(), { once: true });
-				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.()) ?? {};
 				const wallTimeStart = performance.now();
 				try {
 					const result = await executeBash(options.command, {
@@ -1451,9 +1741,22 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							toolCallId: options.toolCallId,
 						}).shellFilesystem(),
 						speech: sessionShellSpeech(this.session),
-						artifactPath,
-						artifactId,
+						commands: this.#shellCommands(options.toolCommands, {
+							toolCallId: options.toolCallId,
+							// The job's own signal: the run outlives a call that returned when it was backgrounded.
+							signal: runSignal,
+							context: toolContext,
+							recorder: toolCommandRecorder,
+							onChange: () => {
+								void report(latestText, {
+									output: latestText,
+									async: { state: "running", jobId, type: "bash" },
+								});
+							},
+						}),
+						allocateArtifact: this.session.allocateOutputArtifact,
 						onChunk: chunk => {
+							outputModified = Date.now();
 							outputTap.append(chunk);
 							notifier?.poll();
 						},
@@ -1491,6 +1794,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						wallTimeMs,
 						replies: backgrounded ? undefined : replies,
 						toolCallId: options.toolCallId,
+						toolCommands: toolCommandRecorder.list(),
 					});
 					const finalText = this.#extractTextResult(finalResult);
 					latestText = finalText;
@@ -1528,7 +1832,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			{
 				ownerId: this.session.getAgentId?.() ?? undefined,
 				foreground: options.foreground,
-				process: { command: options.command, cwd: options.commandCwd, pids: () => pids(), streams },
+				process: {
+					command: options.command,
+					cwd: options.commandCwd,
+					pids: () => pids(),
+					streams,
+					outputModified: () => outputModified,
+					trace: () => liveTrace ?? latestProgressDetails?.trace,
+				},
 				intent: options.intent,
 				widgetInputs: {
 					sources: () => [outputTap, ...pipeSources.list()],
@@ -1552,6 +1863,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				backgrounded = true;
 			},
 			replies,
+			toolCommands: () => toolCommandRecorder.list(),
 		};
 	}
 
@@ -1586,7 +1898,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		{
 			command: rawCommand,
 			timeout: rawTimeout,
-			cwd,
 			name: rawName,
 			ready: rawReady,
 			async: rawAsync,
@@ -1605,30 +1916,25 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const sessionId = this.session.getSessionId?.() ?? undefined;
 		const sessionEnv = this.#sessionEnv(toolCallId);
 
-		// Extract a leading `cd <path> && ...` / `cd <path>; ...` into cwd when the
-		// model ignores the cwd parameter. The scanner captures only a single path
-		// token and defers to the shell for anything else (redirects, extra args,
-		// shell expansion), so it never absorbs shell syntax like
-		// `cd /tmp 2>/dev/null && ...` into the structured cwd. `&&` always hoists:
-		// a missing directory fails early, as the shell would short-circuit. `;`
-		// runs the rest even when `cd` fails, so it hoists only onto an existing host
-		// directory; anything else (URL targets included) stays with the shell.
-		// The target is a shell path: `/` is the filesystem root, not the workspace
-		// alias an explicit tool `cwd` keeps.
-		let hoistedShellCwd = false;
-		if (!cwd) {
-			const cd = extractLeadingCdTarget(command);
-			const virtualTarget = cd !== null && InternalUrlRouter.instance().canHandle(cd.path);
-			const semicolonDirectory =
-				cd?.separator === ";" &&
-				!virtualTarget &&
-				(await fs.promises.stat(resolveShellDirectory(cd.path, this.session.cwd)).catch(() => null))?.isDirectory();
-			if (cd && (cd.separator === "&&" || semicolonDirectory === true)) {
-				hoistedShellCwd = !virtualTarget;
-				cwd = cd.path;
-				command = cd.rest;
-				if (cd.separator === ";") ran.cdSeparator = ";";
-			}
+		// Extract a leading `cd <path> && ...` / `cd <path>; ...` into the working
+		// directory. The scanner captures only a single path token and defers to the
+		// shell for anything else (redirects, extra args, shell expansion), so it
+		// never absorbs shell syntax like `cd /tmp 2>/dev/null && ...`. `&&` always
+		// hoists: a missing directory fails early, as the shell would short-circuit.
+		// `;` runs the rest even when `cd` fails, so it hoists only onto an existing
+		// host directory; anything else (URL targets included) stays with the shell.
+		// The target is a shell path: `/` is the filesystem root.
+		let cwd: string | undefined;
+		const cd = extractLeadingCdTarget(command);
+		const virtualTarget = cd !== null && InternalUrlRouter.instance().canHandle(cd.path);
+		const semicolonDirectory =
+			cd?.separator === ";" &&
+			!virtualTarget &&
+			(await fs.promises.stat(resolveShellDirectory(cd.path, this.session.cwd)).catch(() => null))?.isDirectory();
+		if (cd && (cd.separator === "&&" || semicolonDirectory === true)) {
+			cwd = cd.path;
+			command = cd.rest;
+			if (cd.separator === ";") ran.cdSeparator = ";";
 		}
 		// Mode selection runs on normalized fields: a caller that materializes
 		// every optional argument with empty or placeholder values still asked
@@ -1651,18 +1957,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					"`name` starts a long-lived service, which takes no async or timeout. Omit `name` for a finite command (async jobs included), or drop async/timeout to start a service.",
 				);
 			}
-			if (rawTimeout !== undefined)
-				pendingNotices.push("Ignored timeout: service-only; readiness follows ready.timeout.");
-			if (rawAsync === true)
-				pendingNotices.push("Ignored async: service-only; a service start is asynchronous already.");
+			if (rawTimeout !== undefined) pendingNotices.push("[timeout ignored: use ready.timeout]");
+			if (rawAsync === true) pendingNotices.push("[async ignored: services start async]");
 			// Host and timeout configure a readiness condition without naming one.
 			if (
 				ready === undefined &&
 				(blankToUndefined(rawReady?.host) !== undefined || Number.isFinite(rawReady?.timeout))
 			)
-				pendingNotices.push("Ignored ready: it needs log or port; the service started without a readiness wait.");
+				pendingNotices.push("[ready ignored: needs log or port]");
 		} else if (ready !== undefined) {
-			pendingNotices.push("Ignored ready: service-only, and no service name was given.");
+			pendingNotices.push("[ready ignored: needs name]");
 		}
 		if (name === undefined && asyncRequested && !cfgAsyncEnabled.get(this.session.settings)) {
 			throw new ToolError("Async bash execution is disabled. Enable async.enabled to use async mode.");
@@ -1677,13 +1981,26 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// A service's regex is checked by `startService`.
 		const notify = name === undefined && notifySource !== undefined ? compileNotifyPattern(notifySource) : undefined;
 		// Tells the model which output reaches it before the command ends.
-		const notifyNotice =
-			notifySource === undefined
-				? undefined
-				: `Output lines matching /${notifySource}/ arrive as follow-ups while it runs.`;
+		const notifyNotice = notifySource === undefined ? undefined : `[/${notifySource}/ matches arrive as follow-ups]`;
 
-		const interception = this.#interception(rawCommand, command, name, ctx?.toolNames ?? []);
+		const toolCommandNameList = toolCommandNames(this.session);
+		const toolCommands = new Set(toolCommandNameList);
+		const interception = bashInterception(
+			this.session.settings,
+			rawCommand,
+			command,
+			name,
+			ctx?.toolNames ?? [],
+			toolCommands,
+		);
 		if (interception) throw new ToolError(interception);
+		// Tool commands exist only in the embedded shell: a line naming one never leaves it.
+		const invokedCommand = invokedToolCommand(command, toolCommands);
+		if (invokedCommand !== undefined && pty === true) {
+			throw new ToolError(
+				`\`${invokedCommand}\` is a session tool command and cannot run in a PTY; run it without \`pty\`.`,
+			);
+		}
 		// Models trained on Codex call the apply_patch tool as a shell command; omp ships no such
 		// program, so a patch given that way goes to the tool (through its own approval).
 		const shellPatch = applyPatchShellInput(command);
@@ -1698,12 +2015,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 		}
 
+		const repaired = repairHeredocContinuations(command);
+		if (repaired !== null) {
+			pendingNotices.push("[dropped stray `\\` after `<<EOF &&`]");
+			command = repaired;
+		}
+
 		if (cfgWorktreeClone.get(this.session.settings)) {
 			const rewritten = rewriteGitWorktreeAdd(command, resolveCliEntryCmd());
 			if (rewritten !== command) {
-				pendingNotices.push(
-					"Ran `git worktree add` as `omp worktree add`: a copy-on-write clone of the checkout without .git, other worktrees, or untracked .env files. Set worktree.clone=false for plain git.",
-				);
+				pendingNotices.push("[ran as `omp worktree add`: CoW clone without .git or untracked .env]");
 				command = rewritten;
 			}
 		}
@@ -1718,11 +2039,11 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// tier this command was approved at. A URL cwd stays a URL: only that
 		// filesystem can enter it, so a service's or pty command's shell process
 		// starts on the host and enters it, and the client terminal never runs there.
-		const approval = this.approval({ command: rawCommand });
+		const approval = this.approval({ command: rawCommand }, undefined, { prompts: false });
 		const approvalTier = typeof approval === "string" ? approval : approval.tier;
 		const router = InternalUrlRouter.instance();
 		const virtualCwd = cwd && router.canHandle(cwd) ? router.normalize(cwd) : undefined;
-		const commandCwd = virtualCwd ?? resolveCommandCwd(cwd, this.session.cwd, hoistedShellCwd);
+		const commandCwd = virtualCwd ?? (cwd ? resolveShellDirectory(cwd, this.session.cwd) : this.session.cwd);
 		if (cwd) ran.cwd = commandCwd;
 		// Where a process for this command starts: a URL directory has none of its own.
 		const hostCwd = virtualCwd === undefined ? commandCwd : this.session.cwd;
@@ -1786,7 +2107,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					content: [
 						{
 							type: "text",
-							text: `${name}: starting${pid === undefined ? "" : ` pid=${pid}`}\nReadiness wait interrupted early to handle an incoming message; the service is still starting and keeps running. Read proc://${name} for status.${notifyLine ? `\n${notifyLine}` : ""}`,
+							text: `${name}: starting${pid === undefined ? "" : ` pid=${pid}`}\n[readiness wait cut short: incoming message; see proc://${name}]${notifyLine ? `\n${notifyLine}` : ""}`,
 						},
 					],
 					details: { service: { name, state: daemon.state, ready: false, timedOut: false, pid } },
@@ -1795,10 +2116,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const lines = [
 				`${daemon.key}: ${daemon.state}${pid === undefined ? "" : ` pid=${pid}`}${daemon.readyAt === undefined ? "" : " ready"}`,
 			];
-			if (service.readyTimedOut)
-				lines.push(
-					`NOT ready — readiness timed out after ${ready?.timeout ?? 30}s; process state: ${daemon.state}.`,
-				);
+			if (service.readyTimedOut) lines.push(`[not ready: timed out after ${ready?.timeout ?? 30}s]`);
 			if (daemon.exitReason) lines.push(`Reason: ${daemon.exitReason}`);
 			lines.push(...pendingNotices);
 			if (notifyLine) lines.push(notifyLine);
@@ -1825,9 +2143,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const maxTimeout = cfgToolsMaxTimeout.get(this.session.settings);
 		const timeoutSec = timeoutDisabled ? undefined : clampTimeout("bash", requestedTimeoutSec, maxTimeout);
 		const timeoutMs = timeoutSec === undefined ? undefined : timeoutSec * 1000;
-		if (timeoutSec !== undefined) {
-			const timeoutClampNotice = formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec, maxTimeout);
-			if (timeoutClampNotice) pendingNotices.push(timeoutClampNotice);
+		if (timeoutSec !== undefined && timeoutSec !== requestedTimeoutSec) {
+			pendingNotices.push(formatTimeoutClampNotice(requestedTimeoutSec, timeoutSec));
 		}
 
 		if (asyncRequested) {
@@ -1849,6 +2166,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				intent: this.session.getToolCallIntent?.(toolCallId),
 				toolCallId,
 				notify,
+				toolCommands: toolCommandNameList,
+				context: ctx,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1860,9 +2179,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		// The client-bridge terminal provides a live terminal card in the editor;
 		// when available it wins over auto-backgrounding (both are opt-in, and
 		// auto-background would otherwise silently disable the terminal route).
+		// A line naming a tool command stays on the embedded shell, the only one that has them.
 		const clientBridge = this.session.getClientBridge?.();
 		const bridgeTerminalAvailable = Boolean(
-			clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined,
+			clientBridge?.capabilities.terminal &&
+			clientBridge.createTerminal &&
+			!pty &&
+			virtualCwd === undefined &&
+			invokedCommand === undefined,
 		);
 
 		const autoBgManager = this.session.asyncJobManager;
@@ -1880,6 +2204,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				timeoutMs,
 			);
 			const startBackgrounded = autoBackgroundWaitMs === 0;
+			// A tool command about to ask the user promotes the run to the background at once.
+			const approvalPrompt = Promise.withResolvers<{ kind: "approval" }>();
 			const job = this.#startManagedBashJob({
 				command,
 				commandCwd,
@@ -1894,19 +2220,23 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
 				toolCallId,
+				toolCommands: toolCommandNameList,
+				context: ctx,
+				onApprovalPrompt: () => approvalPrompt.resolve({ kind: "approval" }),
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 					requestedTimeoutSec,
 					notices: pendingNotices,
 					trace: job.getLatestTrace(),
+					toolCommands: job.toolCommands(),
 				});
 			}
 			// The job was registered as foreground-backed: hidden from listings and
 			// delivery-suppressed until backgroundJob() promotes it, so a command
 			// finishing within the wait never surfaces as a background job.
 			const waitResult = await raceJobSettlement(
-				job.completion,
+				Promise.race([job.completion, approvalPrompt.promise]),
 				autoBackgroundWaitMs,
 				signal,
 				ctx?.toolCall?.steeringSignal,
@@ -1922,22 +2252,27 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			if (waitResult.kind === "aborted") {
 				autoBgManager.cancel(job.jobId);
 				autoBgManager.releaseForegroundJob(job.jobId);
-				throw new ToolAbortError(job.getLatestText() || "Command aborted");
+				throw new ToolAbortError(job.getLatestText() || "[aborted]");
 			}
 			job.background();
 			autoBgManager.backgroundJob(job.jobId);
 			// "steer": a queued user/peer message arrived mid-wait — background
 			// the command (it keeps running) so the message injects promptly.
-			// `job.notices` also carries the notices the run added so far.
-			const notices =
+			// "approval": a tool command is asking the user; the prompt stays open while the job runs on.
+			const reason =
 				waitResult.kind === "steer"
-					? [...job.notices, "Backgrounded early to handle an incoming message; the command keeps running."]
-					: job.notices;
+					? "incoming message"
+					: waitResult.kind === "approval"
+						? "awaiting approval"
+						: undefined;
 			return this.#buildBackgroundStartResult(job.jobId, job.getLatestText(), timeoutSec, {
 				requestedTimeoutSec,
-				notices,
+				// `job.notices` also carries the notices the run added so far.
+				notices: job.notices,
+				reason,
 				replies: job.replies,
 				trace: job.getLatestTrace(),
+				toolCommands: job.toolCommands(),
 			});
 		}
 
@@ -1971,16 +2306,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			: undefined;
 
 		// Route through the client terminal when the client advertises the terminal capability.
-		// Skip when pty=true (PTY needs the local terminal UI) or the cwd is a URL
-		// (only the embedded shell's filesystem can enter it).
-		if (clientBridge?.capabilities.terminal && clientBridge.createTerminal && !pty && virtualCwd === undefined) {
+		// Skip when pty=true (PTY needs the local terminal UI), the cwd is a URL
+		// (only the embedded shell's filesystem can enter it), or the line names a tool command.
+		if (bridgeTerminalAvailable && clientBridge?.createTerminal) {
 			// Invariant (ACP terminal bridge): createTerminal has no signal in its
 			// contract; allocation cannot be cancelled retroactively. Guard before
 			// allocation. Shared timeout helper / pure AbortSignal fusion rejected:
 			// we need explicit kill-before-read ordering and distinct abort vs
 			// timeout result shapes. Per-route race retained for testability.
 			if (signal?.aborted) {
-				throw new ToolAbortError("Command aborted");
+				throw new ToolAbortError("[aborted]");
 			}
 
 			const bridgeWallTimeStart = performance.now();
@@ -2054,7 +2389,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				]);
 				if (createRaced.kind === "aborted" || signal?.aborted) {
 					cleanupLateCreate(createP);
-					throw new ToolAbortError("Command aborted");
+					throw new ToolAbortError("[aborted]");
 				}
 				if (createRaced.kind === "timeout") {
 					cleanupLateCreate(createP);
@@ -2122,7 +2457,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 
 					if (outcome?.kind === "aborted" || signal?.aborted) {
 						await Promise.race([fireKill(), Bun.sleep(killGraceMs)]);
-						throw new ToolAbortError("Command aborted");
+						throw new ToolAbortError("[aborted]");
 					}
 
 					if (outcome?.kind === "timeout") {
@@ -2144,16 +2479,17 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 							});
 						}
 						const decoded = await bridgeGraphics.finish(current.output);
+						const timedOutText = await appendImageLinks(decoded.text, decoded.images);
 						const timedOutResult: BashInteractiveResult = {
-							output: decoded.text,
+							output: timedOutText,
 							exitCode: undefined,
 							cancelled: false,
 							timedOut: true,
 							truncated: current.truncated,
-							totalLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
-							totalBytes: decoded.text.length,
-							outputLines: decoded.text.length > 0 ? decoded.text.split("\n").length : 0,
-							outputBytes: decoded.text.length,
+							totalLines: timedOutText.length > 0 ? timedOutText.split("\n").length : 0,
+							totalBytes: timedOutText.length,
+							outputLines: timedOutText.length > 0 ? timedOutText.split("\n").length : 0,
+							outputBytes: timedOutText.length,
 							...(decoded.images.length > 0 ? { images: decoded.images } : {}),
 						};
 						return this.#buildCompletedResult(timedOutResult, timeoutSec, {
@@ -2209,7 +2545,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					rawExitCode != null ? rawExitCode : exitStatus.signal ? 137 : undefined;
 
 				const decoded = await bridgeGraphics.finish(finalOutput.output);
-				const outputText = decoded.text;
+				const outputText = await appendImageLinks(decoded.text, decoded.images);
 				const outputByteLen = outputText.length;
 				const outputLineCount = outputText.length > 0 ? outputText.split("\n").length : 0;
 
@@ -2226,7 +2562,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				};
 
 				const bridgeNotices: string[] = [];
-				if (finalOutput.truncated) bridgeNotices.push("(output truncated)");
+				if (finalOutput.truncated) bridgeNotices.push("[output truncated]");
 				for (const notice of pendingNotices) bridgeNotices.push(notice);
 
 				return this.#buildCompletedResult(bridgeResult, timeoutSec, {
@@ -2254,16 +2590,14 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			}
 		}
 
-		// Allocate artifact for truncated output storage
-		const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.()) ?? {};
-
 		const interactiveUi = canUseInteractiveBashPty(pty === true, ctx) ? ctx?.ui : undefined;
 		if (pty && !interactiveUi) {
-			pendingNotices.push("pty requested but unavailable in this environment; ran without a terminal");
+			pendingNotices.push("[pty unavailable; ran without]");
 		}
 		const wallTimeStart = performance.now();
 		// Each frame of the card repeats the latest preview with the replies so far; the transcript draws the new ones.
 		const replies: string[] = [];
+		const toolCommandRecorder = new ToolCommandRecorder();
 		let preview = "";
 		let trace: ShellTrace | undefined;
 		const emitFrame = onUpdate
@@ -2273,6 +2607,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						details: {
 							...(replies.length > 0 ? { replies: [...replies] } : {}),
 							...(trace ? { trace } : {}),
+							...toolCommandRecorder.details(),
 						},
 					})
 			: undefined;
@@ -2286,8 +2621,6 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					timeoutMs,
 					signal,
 					mounts: await shellMounts(sessionResolveContext(this.session, { signal }), approvalTier),
-					artifactPath,
-					artifactId,
 				})
 			: // executeBash runs its OWN direnv preflight internally — pass the RAW
 				// command here so the unset prefix is not applied twice.
@@ -2311,8 +2644,15 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						toolCallId,
 					}).shellFilesystem(),
 					speech: sessionShellSpeech(this.session),
-					artifactPath,
-					artifactId,
+					// The call is the run here: a tool command's approval prompt blocks it until answered.
+					commands: this.#shellCommands(toolCommandNameList, {
+						toolCallId,
+						signal,
+						context: ctx,
+						recorder: toolCommandRecorder,
+						onChange: emitFrame,
+					}),
+					allocateArtifact: this.session.allocateOutputArtifact,
 					// Stream the sink's own inline view rather than re-buffering chunks.
 					onPreview: emitFrame
 						? text => {
@@ -2340,13 +2680,9 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			const isTimeout = result.timedOut === true;
 			if (!isTimeout) {
 				const out = normalizeResultOutput(result);
-				// The local executor already prepends `[Command cancelled]`; PTY
+				// The local executor already prepends `[cancelled]`; PTY
 				// output does not, so preserve one cancellation notice in either case.
-				let message = out.startsWith("[Command cancelled]")
-					? out
-					: out
-						? `${out}\n\n[Command aborted]`
-						: "Command aborted";
+				let message = out.startsWith("[cancelled]") ? out : out ? `${out}\n\n[aborted]` : "[aborted]";
 				if (result.artifactError) message += `\n\n[${formatArtifactErrorNotice(result.artifactError)}]`;
 				if (signal?.aborted) {
 					throw new ToolAbortError(message);
@@ -2361,6 +2697,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 			notices: pendingNotices,
 			wallTimeMs,
 			replies,
+			toolCommands: toolCommandRecorder.list(),
 			toolCallId,
 		});
 	}
