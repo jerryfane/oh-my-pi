@@ -430,4 +430,53 @@ describe("agy transcript ingestion", () => {
 			live.stop();
 		}
 	}, 20_000);
+
+	it("does not leak host ~/.gemini/antigravity-cli transcripts into isolated OMP profiles when agy env overrides are unset", async () => {
+		const prevStatsAgy = process.env[STATS_AGY_DATA_DIR_ENV];
+		const prevAgyApp = process.env.AGY_APP_DATA_DIR;
+		delete process.env[STATS_AGY_DATA_DIR_ENV];
+		delete process.env.AGY_APP_DATA_DIR;
+		try {
+			const { getAgyAppDataDir } = await import("@oh-my-pi/omp-stats/agy-parser");
+			// Isolated test profile (via installStatsTestIsolation) must not auto-discover host ~/.gemini/antigravity-cli.
+			expect(getAgyAppDataDir()).toBeNull();
+
+			// Syncing an isolated profile with one OMP fixture must count only that fixture.
+			const nowIso = new Date().toISOString();
+			const fixturePath = path.join(getSessionsDir(), "--tmp--", "isolated-smoke.jsonl");
+			await fs.mkdir(path.dirname(fixturePath), { recursive: true });
+			await Bun.write(
+				fixturePath,
+				`${JSON.stringify({ type: "session", version: 3, id: "iso-1", timestamp: nowIso, cwd: "/tmp" })}\n${JSON.stringify(
+					{
+						type: "model_usage",
+						id: "iso-m1",
+						parentId: null,
+						timestamp: nowIso,
+						purpose: "title",
+						api: "openai-responses",
+						provider: "openai",
+						model: "gpt-5",
+						stopReason: "stop",
+						usage: {
+							input: 1,
+							output: 1,
+							cacheRead: 0,
+							cacheWrite: 0,
+							totalTokens: 2,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+					},
+				)}\n`,
+			);
+			await syncAllSessions({ workers: 1 });
+			const dash = await getDashboardStats("24h");
+			expect(dash.overall.totalRequests).toBe(1);
+		} finally {
+			if (prevStatsAgy === undefined) delete process.env[STATS_AGY_DATA_DIR_ENV];
+			else process.env[STATS_AGY_DATA_DIR_ENV] = prevStatsAgy;
+			if (prevAgyApp === undefined) delete process.env.AGY_APP_DATA_DIR;
+			else process.env.AGY_APP_DATA_DIR = prevAgyApp;
+		}
+	});
 });

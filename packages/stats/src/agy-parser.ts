@@ -21,7 +21,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { StopReason } from "@oh-my-pi/pi-ai";
-import { isEnoent, readLines } from "@oh-my-pi/pi-utils";
+import { getAgentDir, isEnoent, readLines } from "@oh-my-pi/pi-utils";
 import type { ParseSessionResult, SessionParserState } from "./parser";
 import { emptySpotlightRows } from "./spotlight-ingest";
 import type {
@@ -75,7 +75,9 @@ let summaryCache: SummaryCache | null = null;
 
 /**
  * Resolve the Antigravity CLI app-data directory (`~/.gemini/antigravity-cli`),
- * or `null` when explicitly disabled via `OMP_STATS_AGY_DATA_DIR=""`.
+ * or `null` when explicitly disabled via `OMP_STATS_AGY_DATA_DIR=""` or when
+ * running under an isolated OMP profile (`PI_CONFIG_DIR` / `setAgentDir` outside
+ * `~/.omp/agent`) without an explicit `OMP_STATS_AGY_DATA_DIR` or `AGY_APP_DATA_DIR`.
  */
 export function getAgyAppDataDir(): string | null {
 	const explicit = process.env[STATS_AGY_DATA_DIR_ENV];
@@ -85,6 +87,10 @@ export function getAgyAppDataDir(): string | null {
 	}
 	const agyEnv = process.env.AGY_APP_DATA_DIR?.trim();
 	if (agyEnv) return path.resolve(agyEnv);
+	const defaultAgentDir = path.resolve(os.homedir(), ".omp", "agent");
+	if (path.resolve(getAgentDir()) !== defaultAgentDir) {
+		return null;
+	}
 	return path.join(os.homedir(), ".gemini", "antigravity-cli");
 }
 
