@@ -1091,18 +1091,22 @@ console.log("settled");
 		"kills SIGINT-ignoring descendants in a non-subreaper detached group after the leader exits on SIGINT",
 		async () => {
 			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ptree-sigint-group-"));
+			const helperScript = path.join(dir, "helper.sh");
 			const helperPidFile = path.join(dir, "helper.pid");
 			const leaderSigFile = path.join(dir, "leader.sig");
 			const readyFile = path.join(dir, "ready");
 			try {
-				const cp = spawn(
-					[
-						"/bin/sh",
-						"-c",
-						`trap 'echo SIGINT > ${JSON.stringify(leaderSigFile)}; exit 130' INT; trap 'echo SIGTERM > ${JSON.stringify(leaderSigFile)}; exit 143' TERM; (trap '' INT TERM; echo $$ > ${JSON.stringify(helperPidFile)}; sleep 15) </dev/null >/dev/null 2>&1 & while [ ! -s ${JSON.stringify(helperPidFile)} ]; do sleep 0.01; done; echo ready > ${JSON.stringify(readyFile)}; sleep 15`,
-					],
-					{ detached: true, subreaper: false, descendantDrainMs: 100 },
+				await fs.writeFile(
+					helperScript,
+					`trap '' INT TERM\necho $$ > ${JSON.stringify(helperPidFile)}\nexec sleep 15\n`,
+					"utf8",
 				);
+				const leaderCmd = `trap 'echo SIGINT > ${JSON.stringify(leaderSigFile)}; exit 130' INT; trap 'echo SIGTERM > ${JSON.stringify(leaderSigFile)}; exit 143' TERM; /bin/sh ${JSON.stringify(helperScript)} </dev/null >/dev/null 2>&1 & while [ ! -s ${JSON.stringify(helperPidFile)} ]; do sleep 0.01; done; echo ready > ${JSON.stringify(readyFile)}; sleep 15`;
+				const cp = spawn(["/bin/sh", "-c", leaderCmd], {
+					detached: true,
+					subreaper: false,
+					descendantDrainMs: 100,
+				});
 				const deadline = Date.now() + 3000;
 				while (!(await Bun.file(readyFile).exists()) && Date.now() < deadline) {
 					await Bun.sleep(10);
@@ -1110,6 +1114,7 @@ console.log("settled");
 				expect(await Bun.file(readyFile).exists()).toBe(true);
 				const helperPid = Number.parseInt((await Bun.file(helperPidFile).text()).trim(), 10);
 				expect(helperPid).toBeGreaterThan(1);
+				expect(helperPid).not.toBe(cp.pid);
 				expect(() => process.kill(helperPid, 0)).not.toThrow();
 
 				cp.kill(new AbortError("steer", ""), 120, "SIGINT");

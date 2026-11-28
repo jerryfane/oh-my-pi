@@ -548,6 +548,10 @@ interface StepRunOutcome {
 	interruptedForSteer?: boolean;
 	/** Follow-up prompts accepted for this step whose turn was not confirmed by a `result` frame before exit. */
 	unconfirmedFollowUps?: string[];
+	/** True when the last completed `result` frame was already recorded in the transcript via an intermediate transition. */
+	lastResultAlreadyPublished?: boolean;
+	/** True when `unconfirmedFollowUps[0]` was already recorded as a user prompt via an intermediate transition. */
+	firstUnconfirmedAlreadyPublished?: boolean;
 }
 
 interface ActiveAgyProcessControl {
@@ -771,11 +775,15 @@ async function runSingleAgyStep(params: {
 
 		const decoder = new TextDecoder();
 		let pending = "";
+		let publishedIntermediateTurns = 0;
+		let activeTurnHasResult = false;
 		let pendingIntermediateTransition: { prevResult: AgyStreamResult["result"]; nextPrompt: string } | undefined;
 		const flushPendingIntermediateTransition = () => {
 			if (!pendingIntermediateTransition) return;
 			const transition = pendingIntermediateTransition;
 			pendingIntermediateTransition = undefined;
+			publishedIntermediateTurns += 1;
+			activeTurnHasResult = false;
 			params.onIntermediateTurnComplete?.(transition);
 		};
 		const handleLine = (rawLine: string) => {
@@ -808,6 +816,7 @@ async function runSingleAgyStep(params: {
 				flushPendingIntermediateTransition();
 				resultEvent = parsed.result;
 				resultMalformedReason = parsed.malformedReason;
+				activeTurnHasResult = true;
 				resultsReceived += 1;
 				noteConversationId(parsed.result?.conversation_id);
 				pendingTurns = Math.max(0, pendingTurns - 1);
@@ -918,6 +927,8 @@ async function runSingleAgyStep(params: {
 		}
 
 		const unconfirmedFollowUps = collectUnconfirmedFollowUps();
+		const lastResultAlreadyPublished = publishedIntermediateTurns > 0 && !activeTurnHasResult;
+		const firstUnconfirmedAlreadyPublished = lastResultAlreadyPublished && unconfirmedFollowUps.length > 0;
 		if (steerInterrupted && !aborted && !timedOut) {
 			return {
 				exitCode: 0,
@@ -932,6 +943,8 @@ async function runSingleAgyStep(params: {
 				timedOut: false,
 				interruptedForSteer: true,
 				...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
+				...(lastResultAlreadyPublished ? { lastResultAlreadyPublished: true } : {}),
+				...(firstUnconfirmedAlreadyPublished ? { firstUnconfirmedAlreadyPublished: true } : {}),
 			};
 		}
 
@@ -939,7 +952,7 @@ async function runSingleAgyStep(params: {
 		const hasTerminalSuccess = !hasMalformedResult && resultEvent !== undefined && resultEvent.status === "SUCCESS";
 		const statusIsError = !hasMalformedResult && resultEvent !== undefined && resultEvent.status !== "SUCCESS";
 		const missingResultOnZeroExit = !aborted && !hasMalformedResult && exitCode === 0 && !hasTerminalSuccess;
-		const responseIsAuthoritative = typeof resultEvent?.response === "string";
+		const responseIsAuthoritative = activeTurnHasResult && typeof resultEvent?.response === "string";
 		const finalResponse = responseIsAuthoritative ? (resultEvent?.response as string) : streamedText;
 		const durationMs =
 			resultEvent?.duration_seconds !== undefined
@@ -961,7 +974,7 @@ async function runSingleAgyStep(params: {
 			model,
 			response: finalResponse,
 			responseIsAuthoritative,
-			structuredOutput: resultEvent?.structured_output,
+			structuredOutput: activeTurnHasResult ? resultEvent?.structured_output : undefined,
 			usage: currentUsage(),
 			durationMs,
 			error: errorMessage,
@@ -970,6 +983,8 @@ async function runSingleAgyStep(params: {
 			timedOut,
 			abortReason,
 			...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
+			...(lastResultAlreadyPublished ? { lastResultAlreadyPublished: true } : {}),
+			...(firstUnconfirmedAlreadyPublished ? { firstUnconfirmedAlreadyPublished: true } : {}),
 		};
 	} catch (err) {
 		const message = formatErrorMessage(err);
@@ -1851,6 +1866,7 @@ class AgySessionController {
 	#outputTokens = 0;
 	#cacheReadTokens = 0;
 	#turnStepSeq = 0;
+	#sessionHandle: AgySessionHandle | undefined;
 
 	constructor(cfg: AgyControllerConfig) {
 		this.id = cfg.id;
@@ -1973,31 +1989,55 @@ class AgySessionController {
 		}
 	}
 
-	setRunState(state: "running" | "idle"): void {
-		const nextRunning = state === "running";
-		if (this.#running === nextRunning) return;
-		this.#running = nextRunning;
-		this.#runStartedAt = nextRunning ? Date.now() : undefined;
-		if (!nextRunning) {
-			this.#pendingToolCalls.clear();
-		}
-		for (const listener of this.#runStateListeners) {
-			try {
-				listener(state);
-			} catch (err) {
-				logger.warn("agy run-state listener threw", {
-					id: this.id,
-					state,
-					error: formatErrorMessage(err),
-				});
-			}
-		}
+	bindSessionHandle(handle: AgySessionHandle): void {
+		this.#sessionHandle = handle;
 	}
 
-	/** End in-turn input routing for a retained session so subsequent input routes to wake turns. */
-	endActiveTurn(): void {
+	/**
+	 * Single ownership-checked authority for run-state transitions: updates local state once,
+	 * commits `AgentRegistry.setStatus` once (unless `skipRegistry` is set), and notifies run-state
+	 * listeners once. Returns the registry CAS result (or `true` when skipped).
+	 */
+	commitRunState(
+		state: "running" | "idle",
+		options?: { expected?: AgentRef | AgentSessionHandle; skipRegistry?: boolean },
+	): boolean {
+		const nextRunning = state === "running";
+		const stateChanged = this.#running !== nextRunning;
+		if (stateChanged) {
+			this.#running = nextRunning;
+			this.#runStartedAt = nextRunning ? Date.now() : undefined;
+			if (!nextRunning) {
+				this.#pendingToolCalls.clear();
+			}
+		}
+		let committed = true;
+		if (!options?.skipRegistry) {
+			const expected = options?.expected ?? this.#sessionHandle;
+			if (expected) {
+				committed = AgentRegistry.global().setStatus(this.id, state, expected);
+			}
+		}
+		if (stateChanged) {
+			for (const listener of this.#runStateListeners) {
+				try {
+					listener(state);
+				} catch (err) {
+					logger.warn("agy run-state listener threw", {
+						id: this.id,
+						state,
+						error: formatErrorMessage(err),
+					});
+				}
+			}
+		}
+		return committed;
+	}
+
+	/** End in-turn input routing for a retained session and commit idle once. */
+	endActiveTurn(expected?: AgentRef | AgentSessionHandle): boolean {
 		this.#inActiveTurn = false;
-		this.setRunState("idle");
+		return this.commitRunState("idle", { expected });
 	}
 
 	/** Close input admission permanently (one-shot teardown or abort). */
@@ -2006,7 +2046,7 @@ class AgySessionController {
 		this.#admissionClosed = true;
 		this.#pendingSteers.length = 0;
 		this.#queuedFollowUps.length = 0;
-		this.setRunState("idle");
+		this.commitRunState("idle", { skipRegistry: true });
 	}
 
 	/** Hold wake-queue pumping while final initial-run transcript flush completes. */
@@ -2262,6 +2302,7 @@ class AgySessionController {
 		for (let i = 0; i < input.steps.length; i++) {
 			const step = input.steps[i]!;
 			let currentTranscriptPrompt = step.transcriptPrompt;
+			let recordNextUserPrompt = true;
 			let currentStepPrompt = step.promptText;
 			let steerAttempt = 0;
 			let stepFailed = false;
@@ -2277,8 +2318,10 @@ class AgySessionController {
 					break;
 				}
 
-				input.transcript?.recordUserPrompt(currentTranscriptPrompt);
-				this.recordUserMessage(currentTranscriptPrompt);
+				if (recordNextUserPrompt && currentTranscriptPrompt.length > 0) {
+					input.transcript?.recordUserPrompt(currentTranscriptPrompt);
+					this.recordUserMessage(currentTranscriptPrompt);
+				}
 				let liveStepRequests = 0;
 				let liveStepTokens = 0;
 				let recordedStepInput = 0;
@@ -2337,12 +2380,15 @@ class AgySessionController {
 					onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
 						const prevReply =
 							typeof prevResult?.response === "string" ? prevResult.response : pendingAssistantText;
-						if (prevReply) {
+						const flushed = consumePendingTurnUsage();
+						if (prevReply || flushed.usage) {
 							input.transcript?.recordAssistantTurn({
 								text: prevReply,
 								stopReason: "stop",
+								usage: flushed.usage,
+								durationMs: flushed.durationMs,
 							});
-							this.recordAssistantMessage(prevReply);
+							if (prevReply) this.recordAssistantMessage(prevReply);
 						}
 						pendingAssistantText = "";
 						input.transcript?.recordUserPrompt(nextPrompt);
@@ -2643,7 +2689,7 @@ class AgySessionController {
 						stepFailed = true;
 						break;
 					}
-					if (!lastOutcome.interruptedForSteer) {
+					if (!lastOutcome.interruptedForSteer && !lastOutcome.lastResultAlreadyPublished) {
 						const prevReply = lastOutcome.responseIsAuthoritative ? lastOutcome.response : pendingAssistantText;
 						if (prevReply || stepResidualUsage) {
 							input.transcript?.recordAssistantTurn({
@@ -2656,8 +2702,11 @@ class AgySessionController {
 						}
 					}
 					if (pendingNext.length > 0) {
+						const alreadyPublishedCount = lastOutcome.firstUnconfirmedAlreadyPublished ? 1 : 0;
+						const unrecordedPrompts = pendingNext.slice(alreadyPublishedCount);
 						const combinedPrompt = pendingNext.join("\n\n");
-						currentTranscriptPrompt = combinedPrompt;
+						currentTranscriptPrompt = unrecordedPrompts.join("\n\n");
+						recordNextUserPrompt = unrecordedPrompts.length > 0;
 						currentStepPrompt =
 							step.isFinalStep && step.jsonPromptInstruction
 								? `${combinedPrompt}\n\n${step.jsonPromptInstruction}`
@@ -2836,7 +2885,7 @@ class AgySessionController {
 
 				let transcript: AgyTranscriptWriter | undefined;
 				this.#inActiveTurn = true;
-				this.setRunState("running");
+				this.commitRunState("running");
 				this.emitSessionEvent({ type: "agent_start" });
 				emitSubagentFrameSafely(
 					options.eventBus,
@@ -2908,12 +2957,14 @@ class AgySessionController {
 						summary.lastOutcome.aborted ||
 						Boolean(combinedAbort.signal.aborted) ||
 						refAtCommit?.status === "aborted";
+					const ownsLiveRef = Boolean(refAtCommit && refAtCommit.session === this.#sessionHandle);
 					this.#inActiveTurn = false;
-					this.setRunState("idle");
-					if (!wasAborted && refAtCommit && refAtCommit.session) {
-						if (!registry.setStatus(this.id, "idle", refAtCommit)) {
-							wasAborted = true;
-						}
+					const committedIdle = this.commitRunState("idle", {
+						expected: ownsLiveRef ? refAtCommit : this.#sessionHandle,
+						skipRegistry: wasAborted || !ownsLiveRef,
+					});
+					if (!wasAborted && ownsLiveRef && !committedIdle) {
+						wasAborted = true;
 					}
 					this.promoteLatePendingToWakeTurns();
 
@@ -3071,8 +3122,8 @@ class AgySessionController {
 					await transcript?.close().catch(() => {});
 					if (!postLockEmit) {
 						this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
-						if (this.#wakeQueue.length === 0 || this.#disposed) {
-							this.setRunState("idle");
+						if (this.#running && (this.#wakeQueue.length === 0 || this.#disposed)) {
+							this.commitRunState("idle", { skipRegistry: this.#disposed });
 						}
 						releaseWakeHold();
 					}
@@ -3165,7 +3216,7 @@ class AgySessionController {
 					this.#runAbortController = new AbortController();
 				}
 				this.#inActiveTurn = true;
-				this.setRunState("running");
+				this.commitRunState("running");
 				this.emitSessionEvent({ type: "agent_start" });
 				let wakeTranscript: AgyTranscriptWriter | undefined;
 				let finalReply = "";
@@ -3257,7 +3308,7 @@ class AgySessionController {
 					this.promoteLatePendingToWakeTurns();
 					this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
 					if (this.#wakeQueue.length === 0 || this.#disposed) {
-						this.setRunState("idle");
+						this.commitRunState("idle", { skipRegistry: this.#disposed });
 					}
 				}
 			});
@@ -3278,6 +3329,7 @@ class AgySessionHandle implements AgentSessionHandle {
 
 	constructor(controller: AgySessionController) {
 		this.#controller = controller;
+		controller.bindSessionHandle(this);
 		// Distinct prefix from `${currentThreadId()}:` so `isLocalAgentSession()` never mistakes this
 		// external-CLI handle for a concrete in-process `AgentSession` instance, while registering it
 		// in the local bridged-handle directory so worker threads can still read main's registry refs.
@@ -3472,10 +3524,7 @@ function createAgyReviver(params: {
 			...params,
 			initialRunning: false,
 		});
-		const handle = new AgySessionHandle(controller);
-		const unsubSync = AgentRegistry.global().syncSessionStatus(params.id, handle);
-		controller.addDisposer(unsubSync);
-		return handle;
+		return new AgySessionHandle(controller);
 	};
 }
 
@@ -3556,35 +3605,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	});
 	const sessionHandle = new AgySessionHandle(controller);
 	const registry = AgentRegistry.global();
-	const registeredRef = registry.register({
-		id,
-		displayName: id,
-		kind: "sub",
-		parentId: options.parentAgentId,
-		parentSessionKey: options.parentSessionKey,
-		session: sessionHandle,
-		sessionFile: transcript?.activePath ?? null,
-		status: "running",
-		activity: options.description,
-	});
-	const unsubStatusSync = registry.syncSessionStatus(id, sessionHandle);
-	controller.addDisposer(unsubStatusSync);
-	const unsubRegistryAbort = registry.onChange(event => {
-		if (event.type === "status_changed" && event.ref === registeredRef && event.ref.status === "aborted") {
-			void controller.abort("Cancelled");
-		}
-	});
-	controller.addDisposer(unsubRegistryAbort);
-	if (registeredRef.status === "aborted") {
-		void controller.abort("Cancelled");
-	}
-	// Drain any IRC messages parked before this subagent started running.
-	const existingBus = IrcBus.existing();
-	for (let parked = existingBus?.take(id); parked; parked = existingBus?.take(id)) {
-		await sessionHandle.deliverIrcMessage(parked);
-	}
-
-	const combinedAbort = combineAbortSignals([signal, controller.abortSignal]);
+	let registeredRef!: AgentRef;
 	let onReleaseTransferred = false;
 
 	const progress: AgentProgress = {
@@ -3645,27 +3666,6 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		},
 	});
 
-	// Emit lifecycle start event so OMP's Subagents (Alt+A) HUD registers the worker immediately.
-	const initialSessionFile = transcript?.activePath;
-	emitSubagentFrameSafely(
-		options.eventBus,
-		options.subagentEventBus,
-		TASK_SUBAGENT_LIFECYCLE_CHANNEL,
-		{
-			id,
-			agent: agent.name,
-			parentToolCallId: options.parentToolCallId,
-			detached: options.detached,
-			agentSource: agent.source,
-			description: options.description,
-			...(initialSessionFile ? { sessionFile: initialSessionFile } : {}),
-			status: "started" as const,
-			index,
-		},
-		{ id, status: "started" },
-	);
-	progressReporter.schedule(true);
-
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
 	let summary: TurnSequenceSummary = {
 		lastOutcome: {
@@ -3696,10 +3696,61 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
 	let releaseWakeHold: (() => void) | undefined;
 
-	// Hold the controller's exclusive per-session turn lock across initial execution, atomic
-	// registry commit, artifact persistence, and `transcript.finish()` so a concurrent monitored
-	// follow-up can never race into the still-open `<id>.jsonl` or overwrite the initial artifact.
+	// Reserve the controller's exclusive per-session turn lock BEFORE registering the live
+	// session in AgentRegistry, and hold it across startup parked-IRC drain, initial execution,
+	// atomic registry commit, artifact persistence, and `transcript.finish()` so no monitored
+	// follow-up (even one started synchronously on `registered`) can ever jump ahead of the
+	// initial turn or race into `<id>.jsonl` / `artifactsDir`.
 	await controller.runWithTurnLock(async () => {
+		registeredRef = registry.register({
+			id,
+			displayName: id,
+			kind: "sub",
+			parentId: options.parentAgentId,
+			parentSessionKey: options.parentSessionKey,
+			session: sessionHandle,
+			sessionFile: transcript?.activePath ?? null,
+			status: "running",
+			activity: options.description,
+		});
+		const unsubRegistryAbort = registry.onChange(event => {
+			if (event.type === "status_changed" && event.ref === registeredRef && event.ref.status === "aborted") {
+				void controller.abort("Cancelled");
+			}
+		});
+		controller.addDisposer(unsubRegistryAbort);
+		if (registeredRef.status === "aborted") {
+			void controller.abort("Cancelled");
+		}
+		// Drain any IRC messages parked before this subagent started running.
+		const existingBus = IrcBus.existing();
+		for (let parked = existingBus?.take(id); parked; parked = existingBus?.take(id)) {
+			await sessionHandle.deliverIrcMessage(parked);
+		}
+
+		const combinedAbort = combineAbortSignals([signal, controller.abortSignal]);
+
+		// Emit lifecycle start event so OMP's Subagents (Alt+A) HUD registers the worker immediately.
+		const initialSessionFile = transcript?.activePath;
+		emitSubagentFrameSafely(
+			options.eventBus,
+			options.subagentEventBus,
+			TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+			{
+				id,
+				agent: agent.name,
+				parentToolCallId: options.parentToolCallId,
+				detached: options.detached,
+				agentSource: agent.source,
+				description: options.description,
+				...(initialSessionFile ? { sessionFile: initialSessionFile } : {}),
+				status: "started" as const,
+				index,
+			},
+			{ id, status: "started" },
+		);
+		progressReporter.schedule(true);
+
 		try {
 			const { jsonSchemaStr, jsonPromptInstruction } = prepareOutputSchema(outputSchema);
 			const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
@@ -3768,8 +3819,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 
 		if (adoptConversationId !== undefined) {
 			releaseWakeHold = controller.holdWakes();
-			controller.endActiveTurn();
-			if (registry.setStatus(id, "idle", registeredRef)) {
+			if (controller.endActiveTurn(registeredRef)) {
 				AgentLifecycleManager.global().adopt(
 					id,
 					{

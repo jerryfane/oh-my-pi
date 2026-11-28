@@ -2430,4 +2430,252 @@ if (promptText.includes("PROSE_BAD")) {
 			await worker.terminate("test end");
 		}
 	}, 30_000);
+
+	it("does not duplicate prior answer or follow-up prompt when successor emits ACTIVE then exits 0 without a second result", async () => {
+		const dir = await makeTempDir("omp-agy-successor-exit0-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-s0" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const successorDropBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const cid = conv ?? "conv-successor-drop";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let turn = 0;
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	const msg = JSON.parse(line);
+	const content = msg?.message?.content ?? "";
+	turn += 1;
+	if (!conv && turn === 1) {
+		// Wait briefly so the sibling follow-up arrives on stdin before emitting Turn 1 SUCCESS.
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
+		});
+		await new Promise(r => setTimeout(r, 150));
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+		});
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "UNIQUE_FIRST_ANSWER_841",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 0 },
+			},
+		});
+		continue;
+	}
+	if (!conv && turn === 2) {
+		// Emit one valid successor ACTIVE frame, then exit 0 WITHOUT emitting a second result frame.
+		emit({
+			event: "step_update",
+			step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+		});
+		process.exit(0);
+	}
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "UNIQUE_SECOND_ANSWER_842:" + content.slice(-30),
+			num_turns: 1,
+			usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 0 },
+		},
+	});
+	break;
+}
+`,
+			"fake-agy-successor-drop",
+		);
+
+		let injected = false;
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial work before successor drop",
+			index: 0,
+			id: "SuccessorDropAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(successorDropBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!injected && p.currentTool === "bash") {
+					injected = true;
+					void IrcBus.global().send({
+						from: "PeerWorker",
+						to: "SuccessorDropAgy",
+						body: "UNIQUE_FOLLOWUP_PROMPT_841",
+					});
+				}
+			},
+		});
+
+		expect(res.exitCode).toBe(0);
+		expect(res.output).toContain("UNIQUE_SECOND_ANSWER_842:");
+		expect(res.output).toContain("UNIQUE_FOLLOWUP_PROMPT_841");
+
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "SuccessorDropAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as { type: string; message?: { role?: string; content?: Array<{ text?: string }> } });
+
+		const assistantTexts = transcriptLines
+			.filter(e => e.type === "message" && e.message?.role === "assistant")
+			.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
+		const userTexts = transcriptLines
+			.filter(e => e.type === "message" && e.message?.role === "user")
+			.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
+
+		expect(assistantTexts.filter(t => t.includes("UNIQUE_FIRST_ANSWER_841"))).toHaveLength(1);
+		expect(userTexts.filter(t => t.includes("UNIQUE_FOLLOWUP_PROMPT_841"))).toHaveLength(1);
+		expect(assistantTexts.filter(t => t.includes("UNIQUE_SECOND_ANSWER_842:"))).toHaveLength(1);
+	}, 30_000);
+
+	it("reserves the initial turn lock before exposing the session on registered and commits monitored idle once", async () => {
+		const dir = await makeTempDir("omp-agy-startup-lock-single-idle-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-sl" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const bin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const cid = conv ?? "conv-startup-lock";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let lastContent = "";
+let turns = 0;
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	const msg = JSON.parse(line);
+	lastContent = msg?.message?.content ?? "";
+	turns += 1;
+	await new Promise(r => setTimeout(r, 30));
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "ECHO:" + lastContent.slice(-60),
+			num_turns: turns,
+			usage: { input_tokens: 20, output_tokens: 10, cache_read_tokens: 0 },
+		},
+	});
+}
+`,
+			"fake-agy-startup-lock",
+		);
+
+		// Park an IRC message before the subagent starts so startup hits the async parked-message drain.
+		IrcBus.global().park({
+			from: "PeerStartup",
+			to: "StartupLockWorker",
+			body: "PARKED_BEFORE_START_901",
+		});
+
+		let monitoredFromRegistered: Promise<import("../../src/task/task-details").SingleResult> | undefined;
+		const unsubReg = AgentRegistry.global().onChange(ev => {
+			if (ev.type === "registered" && ev.ref.id === "StartupLockWorker" && !monitoredFromRegistered) {
+				monitoredFromRegistered = runSubagentFollowUpTurn({
+					id: "StartupLockWorker",
+					agent: makeAgent(),
+					message: "MONITORED_FROM_REGISTERED_902",
+					artifactsDir,
+				});
+			}
+		});
+
+		try {
+			const initRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "INITIAL_TASK_900",
+				index: 0,
+				id: "StartupLockWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(bin, { task: "gemini-4-neon-medium" }),
+			});
+
+			expect(monitoredFromRegistered).toBeDefined();
+			const monRes = await monitoredFromRegistered!;
+
+			expect(initRes.exitCode).toBe(0);
+			expect(monRes.exitCode).toBe(0);
+			// Initial turn must consume the parked message; monitored turn must execute second and return its own answer.
+			expect(initRes.output).toContain("PARKED_BEFORE_START_901");
+			expect(monRes.output).toContain("MONITORED_FROM_REGISTERED_902");
+			expect(monRes.output).not.toContain("PARKED_BEFORE_START_901");
+
+			// Final artifact must hold the monitored turn's output (never overwritten by the initial turn).
+			const artifactText = await fs.readFile(path.join(artifactsDir, "StartupLockWorker.md"), "utf8");
+			expect(artifactText).toContain("MONITORED_FROM_REGISTERED_902");
+
+			// Every JSONL line must parse cleanly with unique IDs and intact parentId chain.
+			const rawLines = (await fs.readFile(path.join(artifactsDir, "StartupLockWorker.jsonl"), "utf8"))
+				.trim()
+				.split("\n");
+			const parsed = rawLines.map(l => JSON.parse(l) as Record<string, unknown>);
+			const seenIds = new Set<string>();
+			let prev: string | null = null;
+			for (const entry of parsed.slice(1)) {
+				const eid = entry.id as string;
+				expect(seenIds.has(eid)).toBe(false);
+				seenIds.add(eid);
+				expect(entry.parentId).toBe(prev);
+				prev = eid;
+			}
+		} finally {
+			unsubReg();
+		}
+
+		// Verify monitored settlement calls AgentRegistry.setStatus(id, "idle", ...) exactly once (single writer).
+		const registry = AgentRegistry.global();
+		const origSetStatus = registry.setStatus.bind(registry);
+		let idleStatusWrites = 0;
+		registry.setStatus = ((idArg, statusArg, expectedArg) => {
+			if (idArg === "StartupLockWorker" && statusArg === "idle") {
+				idleStatusWrites += 1;
+			}
+			return origSetStatus(idArg, statusArg, expectedArg);
+		}) as typeof registry.setStatus;
+		try {
+			const secondMon = await runSubagentFollowUpTurn({
+				id: "StartupLockWorker",
+				agent: makeAgent(),
+				message: "SINGLE_IDLE_WRITER_903",
+				artifactsDir,
+			});
+			expect(secondMon.exitCode).toBe(0);
+			expect(idleStatusWrites).toBe(1);
+		} finally {
+			registry.setStatus = origSetStatus;
+		}
+	}, 30_000);
 });
