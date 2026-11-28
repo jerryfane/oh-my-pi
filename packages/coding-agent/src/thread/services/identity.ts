@@ -25,8 +25,10 @@ import { RemoteAgentSession } from "../remote-agent-session";
 import type { RpcCodec } from "../rpc";
 import type { ThreadService } from "../services";
 import {
+	findLocalBridgedHandle,
 	findLocalSession,
 	findRemoteSession,
+	isRegisteredLocalBridgedHandle,
 	isRegisteredLocalSession,
 	rememberRemoteSession,
 	type SessionToken,
@@ -43,7 +45,12 @@ export const AGENT_REF_CODEC = "agent-ref";
 
 /** Whether `value` is a session handle this thread can name by token. */
 function isBridgedSession(value: unknown): value is AgentSessionHandle {
-	return value instanceof RemoteAgentSession || value instanceof PeerAgentSession || isRegisteredLocalSession(value);
+	return (
+		value instanceof RemoteAgentSession ||
+		value instanceof PeerAgentSession ||
+		isRegisteredLocalSession(value) ||
+		isRegisteredLocalBridgedHandle(value)
+	);
 }
 
 function isSessionToken(value: unknown): value is SessionToken {
@@ -66,7 +73,7 @@ export function sessionToken(session: AgentSessionHandle): SessionToken {
 export function resolveSessionToken(token: SessionToken): AgentSessionHandle {
 	const { home, key } = token;
 	if (home === currentThreadId()) {
-		const local = findLocalSession(key);
+		const local = findLocalSession(key) ?? findLocalBridgedHandle(key);
 		if (local) return local;
 	}
 	if (!isMainThread()) return peerAgentSession(key, home);

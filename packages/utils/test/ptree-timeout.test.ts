@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import { Process, ProcessStatus, processInfo } from "@oh-my-pi/pi-natives";
 import {
 	AbortError,
 	ChildProcess,
@@ -1074,6 +1074,63 @@ console.log("settled");
 				expect(setsidStderr).toContain("failed to terminate lingering descendants");
 			} finally {
 				const rawPid = await Bun.file(setsidPidFile)
+					.text()
+					.catch(() => "");
+				const pid = Number.parseInt(rawPid.trim(), 10);
+				if (pid > 1) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
+
+	it.skipIf(process.platform === "win32")(
+		"kills SIGINT-ignoring descendants in a non-subreaper detached group after the leader exits on SIGINT",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ptree-sigint-group-"));
+			const helperScript = path.join(dir, "helper.sh");
+			const helperPidFile = path.join(dir, "helper.pid");
+			const leaderSigFile = path.join(dir, "leader.sig");
+			const readyFile = path.join(dir, "ready");
+			try {
+				await fs.writeFile(
+					helperScript,
+					`trap '' INT TERM\necho $$ > ${JSON.stringify(helperPidFile)}\nexec sleep 15\n`,
+					"utf8",
+				);
+				const leaderCmd = `trap 'echo SIGINT > ${JSON.stringify(leaderSigFile)}; exit 130' INT; trap 'echo SIGTERM > ${JSON.stringify(leaderSigFile)}; exit 143' TERM; /bin/sh ${JSON.stringify(helperScript)} </dev/null >/dev/null 2>&1 & while [ ! -s ${JSON.stringify(helperPidFile)} ]; do sleep 0.01; done; echo ready > ${JSON.stringify(readyFile)}; sleep 15`;
+				const cp = spawn(["/bin/sh", "-c", leaderCmd], {
+					detached: true,
+					subreaper: false,
+					descendantDrainMs: 100,
+				});
+				const deadline = Date.now() + 3000;
+				while (!(await Bun.file(readyFile).exists()) && Date.now() < deadline) {
+					await Bun.sleep(10);
+				}
+				expect(await Bun.file(readyFile).exists()).toBe(true);
+				const helperPid = Number.parseInt((await Bun.file(helperPidFile).text()).trim(), 10);
+				expect(helperPid).toBeGreaterThan(1);
+				expect(helperPid).not.toBe(cp.pid);
+				expect(processInfo([helperPid]).map(p => p.pid)).toEqual([helperPid]);
+
+				cp.kill(new AbortError("steer", ""), 120, "SIGINT");
+				await cp.wait({ allowAbort: true });
+
+				expect((await Bun.file(leaderSigFile).text()).trim()).toBe("SIGINT");
+
+				// The SIGINT/SIGTERM-ignoring descendant must be hard-killed by the group SIGKILL sweep.
+				// Native `processInfo` excludes exited and zombie processes without swallowing probe errors.
+				const stopDeadline = Date.now() + 1000;
+				while (processInfo([helperPid]).length > 0 && Date.now() < stopDeadline) {
+					await Bun.sleep(20);
+				}
+				expect(processInfo([helperPid])).toEqual([]);
+			} finally {
+				const rawPid = await Bun.file(helperPidFile)
 					.text()
 					.catch(() => "");
 				const pid = Number.parseInt(rawPid.trim(), 10);

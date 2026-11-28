@@ -3,16 +3,68 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
+import { IrcBus } from "../../src/irc/bus";
+import { handleRpcCancelSubagent, handleRpcSteerSubagent } from "../../src/modes/rpc/rpc-mode";
+import { RpcSubagentRegistry } from "../../src/modes/rpc/rpc-subagents";
+import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import { isLocalAgentSession } from "../../src/session/agent-session-handle";
 import { CostGate } from "../../src/session/cost-gate";
 import { resolveAgySubagentConfig } from "../../src/task/agy-cli-runner";
-import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "../../src/task/executor";
+import {
+	type ExecutorOptions,
+	runSubagentFollowUpTurn,
+	runSubprocess,
+	type SubagentToolResult,
+} from "../../src/task/executor";
 import { runIsolatedSubprocess } from "../../src/task/isolation-runner";
 import type { AgentProgress } from "../../src/task/task-details";
 import type { AgentDefinition, SubagentLifecyclePayload, SubagentProgressPayload } from "../../src/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../../src/task/types";
+import type { ThreadService } from "../../src/thread/services";
+import { agentsThreadService } from "../../src/thread/services/agents";
+import { identityThreadService } from "../../src/thread/services/identity";
+import { SubagentWorker } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
+import type { AgentsProbe, AgentsProbeGlobals } from "../fixtures/agents-bridge-worker";
 
 const tempDirs: string[] = [];
+
+/** Helper snippet embedded in fake Bun `agy` binaries to read the first NDJSON user prompt from stdin. */
+const READ_FIRST_STDIN_PROMPT_SNIPPET = `
+async function readFirstPrompt() {
+	const reader = Bun.stdin.stream().getReader();
+	const decoder = new TextDecoder();
+	let buf = "";
+	while (true) {
+		const { value, done } = await reader.read();
+		if (value) buf += decoder.decode(value, { stream: true });
+		const nl = buf.indexOf("\\n");
+		if (nl !== -1) {
+			const line = buf.slice(0, nl).trim();
+			reader.releaseLock();
+			if (!line) return "";
+			try {
+				const obj = JSON.parse(line);
+				return typeof obj?.message?.content === "string" ? obj.message.content : "";
+			} catch {
+				return line;
+			}
+		}
+		if (done) {
+			reader.releaseLock();
+			const trimmed = (buf + decoder.decode()).trim();
+			if (!trimmed) return "";
+			try {
+				const obj = JSON.parse(trimmed);
+				return typeof obj?.message?.content === "string" ? obj.message.content : "";
+			} catch {
+				return trimmed;
+			}
+		}
+	}
+}
+`;
 
 async function makeTempDir(prefix: string): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -57,6 +109,10 @@ function makeSettings(
 }
 
 afterEach(async () => {
+	await AgentLifecycleManager.global().dispose();
+	AgentLifecycleManager.resetGlobalForTests();
+	AgentRegistry.resetGlobalForTests();
+	IrcBus.resetGlobalForTests();
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop()!;
 		await fs.rm(dir, { recursive: true, force: true });
@@ -143,8 +199,12 @@ describe("agy CLI subagent runner", () => {
 			model: "gemini-4-neon-low",
 		});
 
-		// Seeded/resumable topic lifecycles and OMP-only contracts stay on native OMP
-		expect(resolveAgySubagentConfig(base({ keepAlive: true }))).toBeUndefined();
+		// keepAlive subagents now route to agy (with live registry + mid-job messaging + revival);
+		// seeded topic lifecycles and OMP-only contracts still stay on native OMP.
+		expect(resolveAgySubagentConfig(base({ keepAlive: true }))).toEqual({
+			binary: bin,
+			model: "gemini-4-neon-medium",
+		});
 		expect(resolveAgySubagentConfig(base({ topicBoard: "board" }))).toBeUndefined();
 		expect(resolveAgySubagentConfig(base({ launchSignal: new AbortController().signal }))).toBeUndefined();
 		expect(
@@ -164,6 +224,7 @@ describe("agy CLI subagent runner", () => {
 		const artifactsDir = path.join(dir, "artifacts");
 		await fs.mkdir(artifactsDir, { recursive: true });
 		const argvDump = path.join(dir, "argv.json");
+		const stdinDump = path.join(dir, "stdin.txt");
 		// Seed a stale JSON sidecar from an earlier run to prove plain replacement clears it
 		const staleSidecar = path.join(artifactsDir, "WorkerDemo.json");
 		await fs.writeFile(staleSidecar, '{"stale":true}\n');
@@ -172,7 +233,10 @@ describe("agy CLI subagent runner", () => {
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 fs.writeFileSync(${JSON.stringify(argvDump)}, JSON.stringify(process.argv.slice(2)));
+const firstPrompt = await readFirstPrompt();
+fs.writeFileSync(${JSON.stringify(stdinDump)}, firstPrompt);
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-123", init: { model: "gemini-4-neon-medium", cwd: process.cwd(), permission_mode: "always-proceed" } });
 emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", parameters: { Path: "/tmp/demo.ts" } } } });
@@ -238,15 +302,16 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 		expect(progressFrames.length).toBeGreaterThanOrEqual(2);
 
 		const argv = JSON.parse(await fs.readFile(argvDump, "utf8")) as string[];
+		expect(argv).toContain("--input-format");
 		expect(argv).toContain("--output-format");
 		expect(argv).toContain("stream-json");
 		expect(argv).toContain("--dangerously-skip-permissions");
 		expect(argv).toContain("--model");
 		expect(argv).toContain("gemini-4-neon-medium");
-		const printArg = argv.find(a => a.startsWith("--print="));
-		expect(printArg).toBeDefined();
-		expect(printArg).toContain("Shared repo context");
-		expect(printArg).toContain("--check-leading-dash find target");
+		expect(argv.some(a => a.startsWith("--print="))).toBe(false);
+		const sentPrompt = await fs.readFile(stdinDump, "utf8");
+		expect(sentPrompt).toContain("Shared repo context");
+		expect(sentPrompt).toContain("--check-leading-dash find target");
 	});
 
 	it("validates constrained, unconstrained (true / {}), non-object, and strict-invalid structured output schemas", async () => {
@@ -261,9 +326,10 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const idx = argv.indexOf("--json-schema");
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
+const promptText = await readFirstPrompt();
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 if (idx >= 0) {
 	const rawSchema = argv[idx + 1] ?? "";
@@ -275,8 +341,8 @@ if (idx >= 0) {
 	fs.writeFileSync(${JSON.stringify(schemaCapture)}, rawSchema);
 	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
 	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: '{"summary":"all good"}', structured_output: { summary: "all good" }, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
-} else if (printArg.includes("<output_format>") && printArg.includes("raw valid JSON")) {
-	const payload = printArg.includes('"type":"array"') ? '["a","b"]' : '{"summary":"all good"}';
+} else if (promptText.includes("<output_format>") && promptText.includes("raw valid JSON")) {
+	const payload = promptText.includes('"type":"array"') ? '["a","b"]' : '{"summary":"all good"}';
 	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
 	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: payload, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
 } else {
@@ -390,7 +456,7 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 		expect(bad.structuredOutput?.status).toBe("invalid");
 	}, 30_000);
 
-	it("accumulates multi-step usage per step, spills oversized prompts, and settles cleanly on spill failure or missing result", async () => {
+	it("accumulates multi-step usage per step, streams huge prompts over stdin without E2BIG, and settles cleanly on missing result", async () => {
 		const dir = await makeTempDir("agy-runner-steps-");
 		const logPath = path.join(dir, "invocations.jsonl");
 
@@ -400,11 +466,12 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const convIdx = argv.indexOf("--conversation");
 const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ conv, printLen: printArg.length, printArg: printArg.slice(0, 140) }) + "\\n");
+const promptText = await readFirstPrompt();
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ conv, argvLen: JSON.stringify(argv).length, promptLen: promptText.length }) + "\\n");
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 const cid = conv ?? "conv-step-1";
 emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
@@ -419,7 +486,7 @@ if (!conv) {
 			"fake-agy-steps",
 		);
 
-		// Portable spill (> 96 KiB direct Unix argv limit) works on all platforms
+		// Huge prompts (> 100 KiB) travel cleanly over NDJSON stdin without touching argv or temp spill files
 		const hugePrompt = "a\n".repeat(55_000);
 		const result = await runSubprocess({
 			cwd: dir,
@@ -442,33 +509,14 @@ if (!conv) {
 		const calls = (await fs.readFile(logPath, "utf8"))
 			.trim()
 			.split("\n")
-			.map(l => JSON.parse(l) as { conv: string | null; printLen: number; printArg: string });
+			.map(l => JSON.parse(l) as { conv: string | null; argvLen: number; promptLen: number });
 		expect(calls.length).toBe(2);
 		expect(calls[0]?.conv).toBeNull();
-		expect(calls[0]?.printLen).toBeLessThan(1024);
+		expect(calls[0]?.argvLen).toBeLessThan(1024);
+		expect(calls[0]?.promptLen).toBeGreaterThan(100_000);
 		expect(calls[1]?.conv).toBe("conv-step-1");
 		const leftovers = (await fs.readdir(dir)).filter(f => f.includes("agy-prompt-"));
 		expect(leftovers).toEqual([]);
-
-		// Linux-only subreaper JSON-env transport: a 90,000-byte multiline prompt (< 96 KiB raw, > 128 KiB JSON-encoded) must spill instead of E2BIG
-		if (process.platform === "linux") {
-			const linuxMultilinePrompt = "a\n".repeat(45_000);
-			const linuxSpillRes = await runSubprocess({
-				cwd: dir,
-				agent: makeAgent(),
-				task: linuxMultilinePrompt,
-				index: 0,
-				id: "LinuxJsonEnvSpill",
-				artifactsDir: dir,
-				settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
-			});
-			expect(linuxSpillRes.exitCode).toBe(0);
-			const allCalls = (await fs.readFile(logPath, "utf8"))
-				.trim()
-				.split("\n")
-				.map(l => JSON.parse(l) as { printLen: number });
-			expect(allCalls.at(-1)?.printLen).toBeLessThan(1024);
-		}
 
 		// Single-step partial step_update usage preserves latest per-request contextTokens separately from aggregate usage
 		const singlePartial = await runSubprocess({
@@ -484,24 +532,6 @@ if (!conv) {
 		expect(singlePartial.tokens).toBe(330);
 		expect(singlePartial.usage?.cacheRead).toBe(90);
 		expect(singlePartial.contextTokens).toBe(140);
-
-		// Spill write failure emits terminal failed lifecycle instead of rejecting unhandled
-		const spillBus = new EventBus();
-		const spillLifecycles: SubagentLifecyclePayload[] = [];
-		spillBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, d => spillLifecycles.push(d as SubagentLifecyclePayload));
-		const spillFail = await runSubprocess({
-			cwd: dir,
-			agent: makeAgent(),
-			task: hugePrompt,
-			index: 0,
-			id: "SpillFail",
-			artifactsDir: path.join(dir, "missing-nonexistent-dir"),
-			eventBus: spillBus,
-			settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
-		});
-		expect(spillFail.exitCode).toBe(1);
-		expect(spillFail.error).toBeDefined();
-		expect(spillLifecycles.map(l => l.status)).toEqual(["started", "failed"]);
 
 		// Zero-exit process without a terminal result frame fails and stops multi-step execution
 		const truncatedBin = await createFakeAgyBinary(
@@ -668,10 +698,11 @@ exit 0
 		const usageEdgeBin = await createFakeAgyBinary(
 			dir,
 			`
-const printArg = process.argv.slice(2).find(a => a.startsWith("--print=")) ?? "";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const promptText = await readFirstPrompt();
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-u", init: { model: "gemini-4-neon-low" } });
-if (printArg.includes("ZERO_CASE")) {
+if (promptText.includes("ZERO_CASE")) {
 	emit({ event: "step_update", step_update: { conversation_id: "conv-u", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "ok", usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 40 } } });
 	emit({ event: "result", result: { conversation_id: "conv-u", status: "SUCCESS", response: "ok", num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 } } });
 } else {
@@ -707,20 +738,18 @@ if (printArg.includes("ZERO_CASE")) {
 		expect(multiTurnRes.usage?.cacheRead).toBe(300);
 		expect(multiTurnRes.contextTokens).toBeUndefined();
 
-		// 4. Short prompt + valid 75 KB root-object JSON schema spills schema into instructions instead of hitting E2BIG
+		// 4. Short prompt + valid 75 KB root-object JSON schema folds schema into stdin prompt instead of hitting E2BIG
 		const spillSchemaBin = await createFakeAgyBinary(
 			dir,
 			`
-import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
-const match = printArg.match(/from (\\S+) and execute/);
-const spillContent = match ? fs.readFileSync(match[1], "utf8") : "";
-const hasSchemaInSpill = spillContent.includes("<output_format>") && spillContent.includes('"summary"');
+const promptText = await readFirstPrompt();
+const hasSchemaInPrompt = promptText.includes("<output_format>") && promptText.includes('"summary"');
 const hasFlag = argv.includes("--json-schema");
 emit({ event: "init", conversation_id: "conv-bigschema", init: { model: "gemini-4-neon-low" } });
-if (!hasFlag && hasSchemaInSpill) {
+if (!hasFlag && hasSchemaInPrompt) {
 	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: '{"summary":"validated"}', num_turns: 1 } });
 } else {
 	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: "plain prose", num_turns: 1 } });
@@ -1135,6 +1164,7 @@ exit 0
 					task: `check ${releaseMode} release hook`,
 					index: 0,
 					id: `ReleaseHook-${releaseMode}`,
+					keepAlive: false,
 					eventBus: releaseBus,
 					onRelease:
 						releaseMode === "sync-throw"
@@ -1479,5 +1509,1531 @@ exit 0
 		const finalAssistant = fbEntries.at(-2)?.message as Record<string, unknown>;
 		expect(JSON.stringify(finalAssistant.content)).toContain("Tail answer only.");
 		expect(JSON.stringify(finalAssistant.content)).not.toContain("I will inspect.");
+	}, 30_000);
+
+	it("delivers mid-job queued follow-ups over live stream-json stdin in the same agy process without interrupting turn 1", async () => {
+		const dir = await makeTempDir("omp-agy-midjob-followup-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-fu" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "turns.jsonl");
+
+		// Stateful stream-json fake agy: reads NDJSON user turns until stdin EOF and runs each in one process.
+		const streamBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+const reader = Bun.stdin.stream().getReader();
+const decoder = new TextDecoder();
+let buf = "";
+let turn = 0;
+const cid = "conv-live-stream";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+async function handleTurn(content) {
+	turn += 1;
+	fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ pid: process.pid, turn, content }) + "\\n");
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: turn, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { parameters: { Path: "turn-" + turn } } } });
+	await Bun.sleep(turn === 1 ? 260 : 80);
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: turn, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { output: "ok-" + turn } } });
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "reply-turn-" + turn + ":" + content.slice(-30),
+			num_turns: turn,
+			usage: { input_tokens: 100 * turn, output_tokens: 20 * turn, cache_read_tokens: 50 * turn },
+		},
+	});
+}
+
+while (true) {
+	const { value, done } = await reader.read();
+	if (value) buf += decoder.decode(value, { stream: true });
+	let nl = buf.indexOf("\\n");
+	while (nl !== -1) {
+		const line = buf.slice(0, nl).trim();
+		buf = buf.slice(nl + 1);
+		if (line) {
+			const parsed = JSON.parse(line);
+			await handleTurn(parsed?.message?.content ?? "");
+		}
+		nl = buf.indexOf("\\n");
+	}
+	if (done) break;
+}
+`,
+			"fake-agy-stream-followup",
+		);
+
+		let sentFollowUp = false;
+		let followUpReceipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const runPromise = runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial assignment",
+			index: 0,
+			id: "StreamFollowUpWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(streamBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentFollowUp && p.currentTool === "read_file") {
+					sentFollowUp = true;
+					// Sibling message (non-parent) queues as a next-turn follow-up on live stdin without killing Turn 1.
+					void IrcBus.global()
+						.send({ from: "SiblingWorker", to: "StreamFollowUpWorker", body: "Also check bar.ts" })
+						.then(r => {
+							followUpReceipt = r;
+						});
+				}
+			},
+		});
+
+		const res = await runPromise;
+		expect(res.exitCode).toBe(0);
+		expect(followUpReceipt?.outcome).toBe("injected");
+		expect(res.output).toContain("reply-turn-2");
+		expect(res.output).toContain("Also check bar.ts");
+		expect(res.requests).toBe(2);
+
+		// Both turns ran inside the exact same live agy process (same PID, no restart).
+		const logged = (await fs.readFile(logFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as { pid: number; turn: number; content: string });
+		expect(logged).toHaveLength(2);
+		expect(logged[0]?.pid).toBe(logged[1]?.pid);
+		expect(logged[0]?.turn).toBe(1);
+		expect(logged[1]?.turn).toBe(2);
+		expect(logged[1]?.content).toContain("SiblingWorker");
+		expect(logged[1]?.content).toContain("Also check bar.ts");
+
+		// Transcript preserves intact parentId chain and records the queued follow-up prompt between turns.
+		const entries = (await fs.readFile(path.join(artifactsDir, "StreamFollowUpWorker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		let prevId: string | null = null;
+		for (const entry of entries.slice(1)) {
+			expect(entry.parentId).toBe(prevId);
+			prevId = entry.id as string;
+		}
+		expect(
+			entries.some(
+				e =>
+					e.type === "message" &&
+					(e.message as Record<string, unknown>).role === "user" &&
+					JSON.stringify(e.message).includes("Also check bar.ts"),
+			),
+		).toBe(true);
+	}, 30_000);
+
+	it("interrupts an active agy turn on mid-job parent IRC steer and RPC steer_subagent, then resumes via --conversation", async () => {
+		const dir = await makeTempDir("omp-agy-midjob-steer-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-st" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "steer-invocations.jsonl");
+
+		// First invocation sleeps for 15s (simulating a long turn) so an immediate steer MUST interrupt it;
+		// resumed invocation (--conversation conv-steer-1) completes immediately with the steered answer.
+		const steerBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ pid: process.pid, conv, promptText }) + "\\n");
+const cid = conv ?? "conv-steer-1";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+if (!conv) {
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "run_command", tool_info: { parameters: { CommandLine: "sleep 15" } } } });
+	await Bun.sleep(15_000);
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "unsteered-slow-finish", num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "STEERED_OK:" + promptText, num_turns: 2, usage: { input_tokens: 150, output_tokens: 40, cache_read_tokens: 80 } } });
+}
+`,
+			"fake-agy-steer",
+		);
+
+		// 1. Direct parent IRC steer interrupts long turn immediately and resumes via --conversation.
+		let sentParentSteer = false;
+		const t0 = Date.now();
+		const parentSteerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Long initial task",
+			index: 0,
+			id: "ParentSteerWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(steerBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentParentSteer && p.currentTool === "run_command") {
+					sentParentSteer = true;
+					void IrcBus.global().send({
+						from: MAIN_AGENT_ID,
+						to: "ParentSteerWorker",
+						body: "Stop and switch to fix-B instead",
+					});
+				}
+			},
+		});
+		const elapsedParentSteer = Date.now() - t0;
+		expect(parentSteerRes.exitCode).toBe(0);
+		expect(parentSteerRes.aborted).toBeUndefined();
+		expect(parentSteerRes.output).toContain("STEERED_OK:");
+		expect(parentSteerRes.output).toContain("Stop and switch to fix-B instead");
+		// Interrupted long 15s turn promptly rather than waiting for Turn 1 to finish.
+		expect(elapsedParentSteer).toBeLessThan(5_000);
+
+		const parentCalls = (await fs.readFile(logFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as { pid: number; conv: string | null; promptText: string });
+		expect(parentCalls).toHaveLength(2);
+		expect(parentCalls[0]?.conv).toBeNull();
+		expect(parentCalls[1]?.conv).toBe("conv-steer-1");
+		expect(parentCalls[1]?.promptText).toContain("Stop and switch to fix-B instead");
+
+		// 2. Herdrup/RPC handleRpcSteerSubagent resolves live agy subagent and steers it mid-turn.
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let rpcSteerErr: string | undefined = "not-called";
+		let rpcSteerSent = false;
+		const rpcSteerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Long RPC task",
+			index: 0,
+			id: "RpcSteerWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: false,
+			settings: makeSettings(steerBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!rpcSteerSent && p.currentTool === "run_command") {
+					rpcSteerSent = true;
+					void handleRpcSteerSubagent(rpcSubagents, "RpcSteerWorker", "Pivot from Herdrup UI").then(err => {
+						rpcSteerErr = err;
+					});
+				}
+			},
+		});
+		rpcSubagents.dispose();
+		expect(rpcSteerErr).toBeUndefined();
+		expect(rpcSteerRes.exitCode).toBe(0);
+		expect(rpcSteerRes.output).toContain("STEERED_OK:Pivot from Herdrup UI");
+	}, 30_000);
+
+	it("cancels a running agy subagent cleanly via RPC cancel_subagent and preserves its aborted tombstone", async () => {
+		const dir = await makeTempDir("omp-agy-rpc-cancel-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-cancel" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const slowBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: "conv-cancel-1", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-cancel-1", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "bash", tool_info: { parameters: { command: "sleep 30" } } } });
+await Bun.sleep(30_000);
+`,
+			"fake-agy-slow-cancel",
+		);
+
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let cancelTriggered = false;
+		let cancelResult = false;
+		const t0 = Date.now();
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Cancel me mid-run",
+			index: 0,
+			id: "CancelAgyWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: true,
+			settings: makeSettings(slowBin, { task: "gemini-4-neon-low" }),
+			onProgress: p => {
+				if (!cancelTriggered && p.currentTool === "bash") {
+					cancelTriggered = true;
+					void handleRpcCancelSubagent(rpcSubagents, "CancelAgyWorker").then(ok => {
+						cancelResult = ok;
+					});
+				}
+			},
+		});
+		rpcSubagents.dispose();
+
+		expect(Date.now() - t0).toBeLessThan(5_000);
+		expect(cancelResult).toBe(true);
+		expect(res.exitCode).toBe(1);
+		expect(res.aborted).toBe(true);
+		const ref = AgentRegistry.global().get("CancelAgyWorker");
+		expect(ref?.status).toBe("aborted");
+		expect(ref?.session).toBeNull();
+	}, 30_000);
+
+	it("adopts keepAlive agy subagents for idle IRC wake turns, post-park AgentLifecycleManager revival, and deferred onRelease", async () => {
+		const dir = await makeTempDir("omp-agy-revive-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-rev" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "revive-calls.jsonl");
+
+		const reviveBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-revive-42";
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ conv, promptText }) + "\\n");
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+emit({
+	event: "result",
+	result: {
+		conversation_id: cid,
+		status: "SUCCESS",
+		response: (conv ? "RESUMED(" + conv + "):" : "INITIAL:") + promptText.slice(-40),
+		num_turns: 1,
+		usage: { input_tokens: 120, output_tokens: 30, cache_read_tokens: 60 },
+	},
+});
+`,
+			"fake-agy-revive",
+		);
+
+		// Register a lightweight main recipient in AgentRegistry so wakeRelay replies land cleanly via IrcBus.
+		const receivedRelays: Array<{ from: string; body: string; wakeRelay?: boolean }> = [];
+		const mainSessionStub = {
+			deliverIrcMessage: async (msg: { from: string; body: string; wakeRelay?: boolean }) => {
+				receivedRelays.push({ from: msg.from, body: msg.body, wakeRelay: msg.wakeRelay });
+				return "injected" as const;
+			},
+			emitIrcRelayObservation: () => {},
+		};
+		AgentRegistry.global().register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: mainSessionStub as unknown as import("../../src/session/agent-session-handle").AgentSessionHandle,
+			status: "idle",
+		});
+
+		let releaseCount = 0;
+		const initialRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial keepAlive work",
+			index: 0,
+			id: "KeepAliveAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			onRelease: async () => {
+				releaseCount += 1;
+			},
+			settings: makeSettings(reviveBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(initialRes.exitCode).toBe(0);
+		expect(initialRes.output).toContain("INITIAL:");
+		expect(releaseCount).toBe(0);
+
+		// 1. Adopted into AgentLifecycleManager as idle with live handle (never mistaken for concrete AgentSession).
+		const idleRef = AgentRegistry.global().get("KeepAliveAgy");
+		expect(idleRef?.status).toBe("idle");
+		expect(idleRef?.session).not.toBeNull();
+		expect(isLocalAgentSession(idleRef!.session!)).toBe(false);
+		expect(AgentLifecycleManager.global().has("KeepAliveAgy")).toBe(true);
+
+		// 2. Sending an IRC message wakes the idle agy subagent and relays the reply back to main.
+		const wakeReceipt = await IrcBus.global().send({
+			from: MAIN_AGENT_ID,
+			to: "KeepAliveAgy",
+			body: "Wake question 1",
+		});
+		expect(wakeReceipt.outcome).toBe("woken");
+		await idleRef!.session!.waitForIrcReplies();
+		expect(receivedRelays).toHaveLength(1);
+		expect(receivedRelays[0]?.from).toBe("KeepAliveAgy");
+		expect(receivedRelays[0]?.wakeRelay).toBe(true);
+		expect(receivedRelays[0]?.body).toContain("RESUMED(conv-revive-42):");
+		expect(receivedRelays[0]?.body).toContain("Wake question 1");
+		expect(AgentRegistry.global().get("KeepAliveAgy")?.status).toBe("idle");
+
+		// 3. Park the agent (disposes live handle), then message it again to exercise AgentReviver cold resume.
+		await AgentLifecycleManager.global().park("KeepAliveAgy");
+		const parkedRef = AgentRegistry.global().get("KeepAliveAgy");
+		expect(parkedRef?.status).toBe("parked");
+		expect(parkedRef?.session).toBeNull();
+		expect(releaseCount).toBe(0);
+
+		const reviveReceipt = await IrcBus.global().send({
+			from: MAIN_AGENT_ID,
+			to: "KeepAliveAgy",
+			body: "Revive question 2",
+		});
+		expect(reviveReceipt.outcome).toBe("revived");
+		const revivedSession = AgentRegistry.global().get("KeepAliveAgy")?.session;
+		expect(revivedSession).not.toBeNull();
+		await revivedSession!.waitForIrcReplies();
+		expect(receivedRelays).toHaveLength(2);
+		expect(receivedRelays[1]?.wakeRelay).toBe(true);
+		expect(receivedRelays[1]?.body).toContain("RESUMED(conv-revive-42):");
+		expect(receivedRelays[1]?.body).toContain("Revive question 2");
+
+		// 4. Explicit runSubagentFollowUpTurn also works cleanly on adopted agy subagents.
+		const followUpTurn = await runSubagentFollowUpTurn({
+			id: "KeepAliveAgy",
+			agent: makeAgent(),
+			message: "Follow-up turn 3",
+		});
+		expect(followUpTurn.exitCode).toBe(0);
+		expect(followUpTurn.output).toContain("RESUMED(conv-revive-42):");
+		expect(followUpTurn.output).toContain("Follow-up turn 3");
+
+		// 5. Transcript preserved a single continuous parentId chain across initial + wake + revived + follow-up turns.
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "KeepAliveAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		let prevId: string | null = null;
+		for (const entry of transcriptLines.slice(1)) {
+			expect(entry.parentId).toBe(prevId);
+			prevId = entry.id as string;
+		}
+		expect(JSON.stringify(transcriptLines)).toContain("Wake question 1");
+		expect(JSON.stringify(transcriptLines)).toContain("Revive question 2");
+		expect(JSON.stringify(transcriptLines)).toContain("Follow-up turn 3");
+
+		// 6. Final release runs deferred onRelease exactly once.
+		await AgentLifecycleManager.global().release("KeepAliveAgy");
+		expect(releaseCount).toBe(1);
+		expect(AgentRegistry.global().get("KeepAliveAgy")).toBeUndefined();
+	}, 30_000);
+
+	it("recovers acknowledged follow-ups when child closes stdin early and steers on step_update conversation ID with SIGINT", async () => {
+		const dir = await makeTempDir("omp-agy-p2-stdin-sigint-");
+		const checkpointFile = path.join(dir, "sigint-checkpoint.txt");
+
+		// 1. Child closes fd 0 right after reading prompt, emits Turn 1 SUCCESS, and exits 0;
+		// sibling follow-up accepted after fd 0 closes must still run via --conversation resume.
+		const closeStdinBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+const cid = conv ?? "conv-closed-fd0";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+if (!conv) {
+	try { fs.closeSync(0); } catch {}
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { parameters: { Path: "a.ts" } } } });
+	await Bun.sleep(250);
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { output: "ok" } } });
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "turn1-only", num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "RECOVERED_FOLLOWUP:" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-close-fd0",
+		);
+
+		let sentAfterClose = false;
+		let receipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const closedArtifactsDir = path.join(dir, "closed-artifacts");
+		await fs.mkdir(closedArtifactsDir, { recursive: true });
+		const recoveredRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Close stdin early",
+			index: 0,
+			id: "ClosedFd0Worker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir: closedArtifactsDir,
+			keepAlive: false,
+			settings: makeSettings(closeStdinBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentAfterClose && p.currentTool === "read_file") {
+					sentAfterClose = true;
+					void IrcBus.global()
+						.send({ from: "SiblingPeer", to: "ClosedFd0Worker", body: "Must not be lost" })
+						.then(r => {
+							receipt = r;
+						});
+				}
+			},
+		});
+		expect(receipt?.outcome).toBe("injected");
+		expect(recoveredRes.exitCode).toBe(0);
+		expect(recoveredRes.output).toContain("RECOVERED_FOLLOWUP:");
+		expect(recoveredRes.output).toContain("Must not be lost");
+		// Closed-stdin recovery must record the Turn 1 reply and the recovered prompt exactly ONCE each in JSONL.
+		const closedTranscriptLines = (await fs.readFile(path.join(closedArtifactsDir, "ClosedFd0Worker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		const turn1ReplyEntries = closedTranscriptLines.filter(
+			e =>
+				e.type === "message" &&
+				(e.message as Record<string, unknown>).role === "assistant" &&
+				JSON.stringify(e.message).includes("turn1-only"),
+		);
+		const recoveredPromptEntries = closedTranscriptLines.filter(
+			e =>
+				e.type === "message" &&
+				(e.message as Record<string, unknown>).role === "user" &&
+				JSON.stringify(e.message).includes("Must not be lost"),
+		);
+		expect(turn1ReplyEntries).toHaveLength(1);
+		expect(recoveredPromptEntries).toHaveLength(1);
+
+		// 2. Steer queued BEFORE conversation_id is emitted on step_update (not init) must interrupt promptly
+		// AND deliver SIGINT (not SIGTERM) so the child's SIGINT checkpoint handler runs before resume.
+		const sigintBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+process.on("SIGINT", () => {
+	fs.writeFileSync(${JSON.stringify(checkpointFile)}, "SIGINT");
+	process.exit(130);
+});
+process.on("SIGTERM", () => {
+	fs.writeFileSync(${JSON.stringify(checkpointFile)}, "SIGTERM");
+	process.exit(143);
+});
+if (!conv) {
+	// Emit init WITHOUT conversation_id, wait briefly so steer queues before ID arrives, then emit ID on step_update.
+	emit({ event: "init", init: { model: "gemini-4-neon-medium" } });
+	emit({ event: "step_update", step_update: { step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "prep", tool_info: { parameters: { Path: "p" } } } });
+	await Bun.sleep(150);
+	emit({ event: "step_update", step_update: { conversation_id: "conv-late-id", step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "slow_work", tool_info: { parameters: { Path: "s" } } } });
+	await Bun.sleep(10_000);
+	emit({ event: "result", result: { conversation_id: "conv-late-id", status: "SUCCESS", response: "missed-steer", num_turns: 1 } });
+} else {
+	const sig = fs.existsSync(${JSON.stringify(checkpointFile)}) ? fs.readFileSync(${JSON.stringify(checkpointFile)}, "utf8") : "NONE";
+	emit({ event: "init", conversation_id: conv, init: { model: "gemini-4-neon-medium" } });
+	emit({ event: "result", result: { conversation_id: conv, status: "SUCCESS", response: "SIGNAL=" + sig + ":" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-sigint-late-id",
+		);
+
+		let steerQueuedEarly = false;
+		const tSteer = Date.now();
+		const steerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Late ID + SIGINT test",
+			index: 0,
+			id: "LateIdSigintWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			keepAlive: false,
+			settings: makeSettings(sigintBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!steerQueuedEarly && p.currentTool === "prep") {
+					steerQueuedEarly = true;
+					void IrcBus.global().send({
+						from: MAIN_AGENT_ID,
+						to: "LateIdSigintWorker",
+						body: "Pivot immediately",
+					});
+				}
+			},
+		});
+		expect(Date.now() - tSteer).toBeLessThan(4_000);
+		expect(steerRes.exitCode).toBe(0);
+		expect(steerRes.output).toContain("SIGNAL=SIGINT:");
+		expect(steerRes.output).toContain("Pivot immediately");
+	}, 30_000);
+
+	it("closes one-shot admission and commits terminal state atomically before terminal observers, and pumps agent_end wake messages", async () => {
+		const dir = await makeTempDir("omp-agy-p2-teardown-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-td" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const fastBin = await createFakeAgyBinary(
+			dir,
+			`
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-td-1";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-low" } });
+emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "OK:" + promptText.slice(-30), num_turns: 1 } });
+`,
+			"fake-agy-teardown",
+		);
+
+		// 1. One-shot run: sibling send and RPC cancel from terminal onProgress must both fail/return false, never conflict.
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let terminalSendOutcome: string | undefined;
+		let terminalCancelResult: boolean | undefined;
+		let ranTerminalHooks = false;
+		const oneShotRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "One-shot teardown atomicity",
+			index: 0,
+			id: "OneShotAtomicWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: false,
+			settings: makeSettings(fastBin, { task: "gemini-4-neon-low" }),
+			onProgress: p => {
+				if (p.status === "completed" && !ranTerminalHooks) {
+					ranTerminalHooks = true;
+					void IrcBus.global()
+						.send({ from: "Sibling", to: "OneShotAtomicWorker", body: "too late" })
+						.then(r => {
+							terminalSendOutcome = r.outcome;
+						});
+					void handleRpcCancelSubagent(rpcSubagents, "OneShotAtomicWorker").then(ok => {
+						terminalCancelResult = ok;
+					});
+				}
+			},
+		});
+		await Bun.sleep(30);
+		rpcSubagents.dispose();
+		expect(oneShotRes.exitCode).toBe(0);
+		expect(terminalSendOutcome).toBe("failed");
+		expect(terminalCancelResult).toBe(false);
+
+		// 2. Kept-alive wake: message delivered synchronously inside agent_end must run (not strand ircWakesPending=true).
+		const relays: string[] = [];
+		AgentRegistry.global().register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: {
+				deliverIrcMessage: async (msg: { body: string }) => {
+					relays.push(msg.body);
+					return "injected" as const;
+				},
+				emitIrcRelayObservation: () => {},
+			} as unknown as import("../../src/session/agent-session-handle").AgentSessionHandle,
+			status: "idle",
+		});
+
+		const kaRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "KeepAlive agent_end wake test",
+			index: 0,
+			id: "AgentEndWakeWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			settings: makeSettings(fastBin, { task: "gemini-4-neon-low" }),
+		});
+		expect(kaRes.exitCode).toBe(0);
+		const liveSession = AgentRegistry.global().get("AgentEndWakeWorker")!.session!;
+		let sentDuringAgentEnd = false;
+		let agentEndReceipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const unsubEnd = liveSession.subscribe(ev => {
+			if (ev.type === "agent_end" && !sentDuringAgentEnd) {
+				sentDuringAgentEnd = true;
+				void IrcBus.global()
+					.send({ from: MAIN_AGENT_ID, to: "AgentEndWakeWorker", body: "chained-from-agent-end" })
+					.then(r => {
+						agentEndReceipt = r;
+					});
+			}
+		});
+		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "AgentEndWakeWorker", body: "first-wake" });
+		await liveSession.waitForIrcReplies();
+		await Bun.sleep(50);
+		await liveSession.waitForIrcReplies();
+		unsubEnd();
+
+		expect(agentEndReceipt?.outcome).toBe("woken");
+		expect(relays.some(r => r.includes("first-wake"))).toBe(true);
+		expect(relays.some(r => r.includes("chained-from-agent-end"))).toBe(true);
+		expect(liveSession.ircWakesPending).toBe(false);
+		expect(AgentRegistry.global().get("AgentEndWakeWorker")?.status).toBe("idle");
+	}, 30_000);
+
+	it("serializes concurrent monitored follow-ups, enforces their schema/observer/artifact contract, and bridges agy refs across worker RPC", async () => {
+		const dir = await makeTempDir("omp-agy-p2-fu-bridge-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-fu2" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const followUpBin = await createFakeAgyBinary(
+			dir,
+			`
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-fu-contract";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+await Bun.sleep(120);
+if (promptText.includes("PROSE_BAD")) {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "plain prose", num_turns: 1 } });
+} else if (promptText.includes("JSON_GOOD")) {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: '{"answer":"structured-ok"}', structured_output: { answer: "structured-ok" }, num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "DONE:" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-fu-contract",
+		);
+
+		const initRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial run",
+			index: 0,
+			id: "ContractAgyWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			settings: makeSettings(followUpBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(initRes.exitCode).toBe(0);
+
+		// 1. Concurrent runSubagentFollowUpTurn calls serialize without corrupting <id>.jsonl entry IDs / parentId chain.
+		const [fuA, fuB] = await Promise.all([
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "concurrent-A" }),
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "concurrent-B" }),
+		]);
+		expect(fuA.exitCode).toBe(0);
+		expect(fuB.exitCode).toBe(0);
+		const lines = (await fs.readFile(path.join(artifactsDir, "ContractAgyWorker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		const ids = new Set<string>();
+		let prevId: string | null = null;
+		for (const entry of lines.slice(1)) {
+			const eid = entry.id as string;
+			expect(ids.has(eid)).toBe(false);
+			ids.add(eid);
+			expect(entry.parentId).toBe(prevId);
+			prevId = eid;
+		}
+
+		// 2. Monitored follow-up enforces outputSchema, emits progress/lifecycle events, and updates artifactsDir on success.
+		const fuBus = new EventBus();
+		const fuLifecycles: string[] = [];
+		const fuProgress: string[] = [];
+		fuBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, p => fuLifecycles.push((p as SubagentLifecyclePayload).status));
+		const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+		const badFu = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "PROSE_BAD",
+			outputSchema: schema,
+			outputSchemaMode: "strict",
+			outputSchemaSource: "caller",
+			artifactsDir,
+			eventBus: fuBus,
+			onProgress: p => fuProgress.push(p.status),
+		});
+		expect(badFu.exitCode).toBe(1);
+		expect(badFu.structuredOutput?.status).toBe("invalid");
+		expect(fuLifecycles).toEqual(["started", "failed"]);
+		expect(fuProgress.at(-1)).toBe("failed");
+
+		const goodFu = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "JSON_GOOD",
+			outputSchema: schema,
+			outputSchemaMode: "strict",
+			outputSchemaSource: "caller",
+			artifactsDir,
+		});
+		expect(goodFu.exitCode).toBe(0);
+		expect(goodFu.structuredOutput).toEqual({
+			source: "caller",
+			mode: "strict",
+			status: "valid",
+			data: { answer: "structured-ok" },
+		});
+		expect(JSON.parse(await fs.readFile(path.join(artifactsDir, "ContractAgyWorker.json"), "utf8"))).toEqual({
+			answer: "structured-ok",
+		});
+
+		// 3. Incompatible native-OMP-only follow-up options fail explicitly instead of silently ignoring them.
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", restore: true }),
+		).rejects.toThrow(/restore/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", topicBoard: "board" }),
+		).rejects.toThrow(/topicBoard/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", completionProbe: true }),
+		).rejects.toThrow(/completionProbe/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", softRequestBudget: 1 }),
+		).rejects.toThrow(/softRequestBudget/i);
+
+		// 3b. RPC cancel from a monitored follow-up's terminal onProgress must return false (committed idle first).
+		const fuRpcBus = new EventBus();
+		const fuRpcSubagents = new RpcSubagentRegistry(fuRpcBus, () => {});
+		let fuTerminalCancel: boolean | undefined;
+		let fuCancelChecked = false;
+		const fuCancelRes = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "check-monitored-cancel-atomicity",
+			eventBus: fuRpcBus,
+			onProgress: p => {
+				if (p.status === "completed" && !fuCancelChecked) {
+					fuCancelChecked = true;
+					void handleRpcCancelSubagent(fuRpcSubagents, "ContractAgyWorker").then(ok => {
+						fuTerminalCancel = ok;
+					});
+				}
+			},
+		});
+		await Bun.sleep(20);
+		fuRpcSubagents.dispose();
+		expect(fuCancelRes.exitCode).toBe(0);
+		expect(fuTerminalCancel).toBe(false);
+		expect(AgentRegistry.global().get("ContractAgyWorker")?.status).toBe("idle");
+
+		// 3c. A monitored follow-up triggered the instant the initial run flips idle must wait on the shared turn lock
+		// so it never corrupts the still-flushing initial transcript or gets overwritten by the initial artifact.
+		let earlyFollowUpPromise: Promise<import("../../src/task/task-details").SingleResult> | undefined;
+		const unsubRace = AgentRegistry.global().onChange(ev => {
+			if (
+				ev.type === "status_changed" &&
+				ev.ref.id === "InitialLockRaceWorker" &&
+				ev.ref.status === "idle" &&
+				!earlyFollowUpPromise
+			) {
+				earlyFollowUpPromise = runSubagentFollowUpTurn({
+					id: "InitialLockRaceWorker",
+					agent: makeAgent(),
+					message: "FOLLOWUP_AFTER_IDLE_EVENT",
+					artifactsDir,
+				});
+			}
+		});
+		try {
+			const raceInitRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "INITIAL_LOCK_RACE",
+				index: 0,
+				id: "InitialLockRaceWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(followUpBin, { task: "gemini-4-neon-medium" }),
+			});
+			expect(raceInitRes.exitCode).toBe(0);
+			expect(earlyFollowUpPromise).toBeDefined();
+			const raceFuRes = await earlyFollowUpPromise!;
+			expect(raceFuRes.exitCode).toBe(0);
+			// Final artifact must hold FOLLOWUP_AFTER_IDLE_EVENT (never overwritten by INITIAL_LOCK_RACE).
+			const latestArtifact = await fs.readFile(path.join(artifactsDir, "InitialLockRaceWorker.md"), "utf8");
+			expect(latestArtifact).toContain("FOLLOWUP_AFTER_IDLE_EVENT");
+			// Transcript must be valid JSONL with unique sequential IDs and an intact parentId chain.
+			const raceLines = (await fs.readFile(path.join(artifactsDir, "InitialLockRaceWorker.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(l => JSON.parse(l) as Record<string, unknown>);
+			const raceIds = new Set<string>();
+			let racePrev: string | null = null;
+			for (const entry of raceLines.slice(1)) {
+				const eid = entry.id as string;
+				expect(raceIds.has(eid)).toBe(false);
+				raceIds.add(eid);
+				expect(entry.parentId).toBe(racePrev);
+				racePrev = eid;
+			}
+		} finally {
+			unsubRace();
+		}
+
+		// 4. Real worker calling AgentRegistry.global().get() for a main-homed agy agent crosses the bridge cleanly.
+		const probeReady = Promise.withResolvers<AgentsProbe>();
+		const probeService: ThreadService = {
+			name: "agents-probe",
+			globals: (): AgentsProbeGlobals => ({ ready: received => probeReady.resolve(received) }),
+		};
+		const worker = new SubagentWorker({
+			entry: new URL("../fixtures/agents-bridge-worker.ts", import.meta.url),
+			services: [identityThreadService, agentsThreadService, probeService],
+			initTimeoutMs: 60_000,
+		});
+		try {
+			await worker.ready;
+			const probe = await probeReady.promise;
+			const peerReport = await probe.peer("ContractAgyWorker");
+			expect(peerReport.isPeer).toBe(true);
+			expect(peerReport.key.startsWith("agy:")).toBe(true);
+			expect(peerReport.isStreaming).toBe(false);
+			expect(peerReport.sessionFile).toBe(path.join(artifactsDir, "ContractAgyWorker.jsonl"));
+			expect(peerReport.canonical).toBe(true);
+			expect(peerReport.casBySession).toBe(true);
+		} finally {
+			await worker.terminate("test end");
+		}
+	}, 30_000);
+
+	it("does not duplicate prior answer or follow-up prompt when successor emits ACTIVE then exits 0 without a second result", async () => {
+		const dir = await makeTempDir("omp-agy-successor-exit0-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-s0" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const successorDropBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const cid = conv ?? "conv-successor-drop";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const linesIter = rl[Symbol.asyncIterator]();
+const readPromptLine = async () => {
+	while (true) {
+		const next = await linesIter.next();
+		if (next.done) return null;
+		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
+	}
+};
+
+const firstContent = await readPromptLine();
+if (firstContent !== null) {
+	if (!conv) {
+		// Keep the tool ACTIVE until the follow-up arrives on live stdin (event-driven, no timer race).
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
+		});
+		const secondContent = await readPromptLine();
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+		});
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "UNIQUE_FIRST_ANSWER_841",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 0 },
+			},
+		});
+		if (secondContent !== null) {
+			// Emit one valid successor ACTIVE frame, then exit 0 WITHOUT emitting a second result frame.
+			emit({
+				event: "step_update",
+				step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+			});
+			process.exit(0);
+		}
+	} else {
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "UNIQUE_SECOND_ANSWER_842:" + firstContent.slice(-30),
+				num_turns: 1,
+				usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 0 },
+			},
+		});
+	}
+}
+`,
+			"fake-agy-successor-drop",
+		);
+
+		let injected = false;
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial work before successor drop",
+			index: 0,
+			id: "SuccessorDropAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(successorDropBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!injected && p.currentTool === "bash") {
+					injected = true;
+					void IrcBus.global().send({
+						from: "PeerWorker",
+						to: "SuccessorDropAgy",
+						body: "UNIQUE_FOLLOWUP_PROMPT_841",
+					});
+				}
+			},
+		});
+
+		expect(res.exitCode).toBe(0);
+		expect(res.output).toContain("UNIQUE_SECOND_ANSWER_842:");
+		expect(res.output).toContain("UNIQUE_FOLLOWUP_PROMPT_841");
+
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "SuccessorDropAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				l =>
+					JSON.parse(l) as {
+						type: string;
+						message?: {
+							role?: string;
+							content?: Array<{ text?: string }>;
+							usage?: { input?: number; output?: number };
+						};
+					},
+			);
+
+		const assistantEntries = transcriptLines.filter(e => e.type === "message" && e.message?.role === "assistant");
+		const assistantTexts = assistantEntries.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
+		const userTexts = transcriptLines
+			.filter(e => e.type === "message" && e.message?.role === "user")
+			.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
+
+		expect(assistantTexts.filter(t => t.includes("UNIQUE_FIRST_ANSWER_841"))).toHaveLength(1);
+		expect(userTexts.filter(t => t.includes("UNIQUE_FOLLOWUP_PROMPT_841"))).toHaveLength(1);
+		expect(assistantTexts.filter(t => t.includes("UNIQUE_SECOND_ANSWER_842:"))).toHaveLength(1);
+
+		// Transcript accounting must preserve result-only usage from Turn 1 (40 in / 10 out) plus resumed Turn 2 (50 in / 15 out).
+		const totalTranscriptInput = assistantEntries.reduce((sum, e) => sum + (e.message?.usage?.input ?? 0), 0);
+		const totalTranscriptOutput = assistantEntries.reduce((sum, e) => sum + (e.message?.usage?.output ?? 0), 0);
+		expect(totalTranscriptInput).toBe(90);
+		expect(totalTranscriptOutput).toBe(25);
+		expect(res.usage?.input).toBe(90);
+		expect(res.usage?.output).toBe(25);
+	}, 30_000);
+
+	it("reserves the initial turn lock before exposing the session on registered and commits monitored idle once", async () => {
+		const dir = await makeTempDir("omp-agy-startup-lock-single-idle-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-sl" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const bin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const cid = conv ?? "conv-startup-lock";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let lastContent = "";
+let turns = 0;
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	const msg = JSON.parse(line);
+	lastContent = msg?.message?.content ?? "";
+	turns += 1;
+	await new Promise(r => setTimeout(r, 30));
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "ECHO:" + lastContent.slice(-60),
+			num_turns: turns,
+			usage: { input_tokens: 20, output_tokens: 10, cache_read_tokens: 0 },
+		},
+	});
+}
+`,
+			"fake-agy-startup-lock",
+		);
+
+		// Park an IRC message before the subagent starts so startup hits the async parked-message drain.
+		IrcBus.global().park({
+			from: "PeerStartup",
+			to: "StartupLockWorker",
+			body: "PARKED_BEFORE_START_901",
+		});
+
+		let monitoredFromRegistered: Promise<import("../../src/task/task-details").SingleResult> | undefined;
+		const unsubReg = AgentRegistry.global().onChange(ev => {
+			if (ev.type === "registered" && ev.ref.id === "StartupLockWorker" && !monitoredFromRegistered) {
+				monitoredFromRegistered = runSubagentFollowUpTurn({
+					id: "StartupLockWorker",
+					agent: makeAgent(),
+					message: "MONITORED_FROM_REGISTERED_902",
+					artifactsDir,
+				});
+			}
+		});
+
+		try {
+			const initRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "INITIAL_TASK_900",
+				index: 0,
+				id: "StartupLockWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(bin, { task: "gemini-4-neon-medium" }),
+			});
+
+			expect(monitoredFromRegistered).toBeDefined();
+			const monRes = await monitoredFromRegistered!;
+
+			expect(initRes.exitCode).toBe(0);
+			expect(monRes.exitCode).toBe(0);
+			// Initial turn must consume the parked message; monitored turn must execute second and return its own answer.
+			expect(initRes.output).toContain("PARKED_BEFORE_START_901");
+			expect(monRes.output).toContain("MONITORED_FROM_REGISTERED_902");
+			expect(monRes.output).not.toContain("PARKED_BEFORE_START_901");
+
+			// Final artifact must hold the monitored turn's output (never overwritten by the initial turn).
+			const artifactText = await fs.readFile(path.join(artifactsDir, "StartupLockWorker.md"), "utf8");
+			expect(artifactText).toContain("MONITORED_FROM_REGISTERED_902");
+
+			// Every JSONL line must parse cleanly with unique IDs and intact parentId chain.
+			const rawLines = (await fs.readFile(path.join(artifactsDir, "StartupLockWorker.jsonl"), "utf8"))
+				.trim()
+				.split("\n");
+			const parsed = rawLines.map(l => JSON.parse(l) as Record<string, unknown>);
+			const seenIds = new Set<string>();
+			let prev: string | null = null;
+			for (const entry of parsed.slice(1)) {
+				const eid = entry.id as string;
+				expect(seenIds.has(eid)).toBe(false);
+				seenIds.add(eid);
+				expect(entry.parentId).toBe(prev);
+				prev = eid;
+			}
+		} finally {
+			unsubReg();
+		}
+
+		// Verify observable running->idle settlement and retained-session availability on both normal completion
+		// and caller-aborted monitored turns (caller abort must return the retained ref to idle, not leave it running).
+		const registry = AgentRegistry.global();
+		const observedStatuses: string[] = [];
+		const unsubStatus = registry.onChange(ev => {
+			if (ev.type === "status_changed" && ev.ref.id === "StartupLockWorker") {
+				observedStatuses.push(ev.ref.status);
+			}
+		});
+		try {
+			const secondMon = await runSubagentFollowUpTurn({
+				id: "StartupLockWorker",
+				agent: makeAgent(),
+				message: "NORMAL_SETTLE_903",
+				artifactsDir,
+			});
+			expect(secondMon.exitCode).toBe(0);
+			expect(observedStatuses).toEqual(["running", "idle"]);
+			const idleRefAfterNormal = registry.get("StartupLockWorker");
+			expect(idleRefAfterNormal?.status).toBe("idle");
+			expect(idleRefAfterNormal?.session?.runStartedAt).toBeUndefined();
+
+			// Caller-aborted monitored turn must still transition the owned live ref back to idle and leave
+			// the retained session usable for subsequent turns and lifecycle parking.
+			observedStatuses.length = 0;
+			const slowAbortBin = await createFakeAgyBinary(
+				dir,
+				`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const cid = convIdx >= 0 ? argv[convIdx + 1] : "conv-abort-idle";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	const msg = JSON.parse(line);
+	const content = msg?.message?.content ?? "";
+	if (content.includes("SLOW_CALLER_ABORT_904")) {
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "sleep 10" } } },
+		});
+		await new Promise(r => setTimeout(r, 10_000));
+	}
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "AFTER_ABORT_OK:" + content.slice(-30),
+			num_turns: 1,
+			usage: { input_tokens: 15, output_tokens: 5, cache_read_tokens: 0 },
+		},
+	});
+	break;
+}
+`,
+				"fake-agy-caller-abort",
+			);
+
+			const abortInit = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "ABORT_RETAINED_INIT",
+				index: 0,
+				id: "CallerAbortRetainedWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(slowAbortBin, { task: "gemini-4-neon-medium" }),
+			});
+			expect(abortInit.exitCode).toBe(0);
+
+			const abortStatuses: string[] = [];
+			const unsubAbortStatus = registry.onChange(ev => {
+				if (ev.type === "status_changed" && ev.ref.id === "CallerAbortRetainedWorker") {
+					abortStatuses.push(ev.ref.status);
+				}
+			});
+			try {
+				const callerAbort = new AbortController();
+				const abortedTurn = await runSubagentFollowUpTurn({
+					id: "CallerAbortRetainedWorker",
+					agent: makeAgent(),
+					message: "SLOW_CALLER_ABORT_904",
+					signal: callerAbort.signal,
+					onProgress: p => {
+						if (p.currentTool === "bash" && !callerAbort.signal.aborted) {
+							callerAbort.abort("Caller cancelled turn");
+						}
+					},
+				});
+				expect(abortedTurn.exitCode).toBe(1);
+				expect(abortedTurn.aborted).toBe(true);
+				expect(abortStatuses).toEqual(["running", "idle"]);
+
+				const refAfterCallerAbort = registry.get("CallerAbortRetainedWorker");
+				expect(refAfterCallerAbort?.status).toBe("idle");
+				expect(refAfterCallerAbort?.session).not.toBeNull();
+				expect(refAfterCallerAbort?.session?.runStartedAt).toBeUndefined();
+
+				// A follow-up turn after caller abort still succeeds on the retained session.
+				const recoveredTurn = await runSubagentFollowUpTurn({
+					id: "CallerAbortRetainedWorker",
+					agent: makeAgent(),
+					message: "POST_ABORT_FOLLOWUP_905",
+				});
+				expect(recoveredTurn.exitCode).toBe(0);
+				expect(recoveredTurn.output).toContain("AFTER_ABORT_OK:");
+				expect(recoveredTurn.output).toContain("POST_ABORT_FOLLOWUP_905");
+				expect(registry.get("CallerAbortRetainedWorker")?.status).toBe("idle");
+			} finally {
+				unsubAbortStatus();
+			}
+		} finally {
+			unsubStatus();
+		}
+	}, 30_000);
+
+	it("preserves prior reconciled usage on partial final frames and does not carry first-request context onto a result-only successor", async () => {
+		const dir = await makeTempDir("omp-agy-partial-final-usage-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-pfu" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		// Single shared stdin-gated two-turn fixture driven by scenario-specific Turn 2 actions.
+		const createTwoTurnFixture = (
+			name: string,
+			scenario: {
+				cid: string;
+				turn1Result: Record<string, unknown>;
+				turn2Events?: Array<Record<string, unknown>>;
+				turn2ExitCode?: number;
+			},
+		) =>
+			createFakeAgyBinary(
+				dir,
+				`
+import * as readline from "node:readline";
+const scenario = ${JSON.stringify(scenario)};
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: scenario.cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const linesIter = rl[Symbol.asyncIterator]();
+const readPromptLine = async () => {
+	while (true) {
+		const next = await linesIter.next();
+		if (next.done) return null;
+		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
+	}
+};
+
+const first = await readPromptLine();
+if (first !== null) {
+	// Keep tool ACTIVE until the live follow-up arrives on stdin (no timer race with progress coalescer).
+	emit({
+		event: "step_update",
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
+	});
+	const second = await readPromptLine();
+	emit({
+		event: "step_update",
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+	});
+	emit({ event: "result", result: { conversation_id: scenario.cid, ...scenario.turn1Result } });
+	if (second !== null) {
+		for (const ev of scenario.turn2Events ?? []) {
+			if (ev.event === "result" && ev.result && typeof ev.result === "object") {
+				emit({ ...ev, result: { conversation_id: scenario.cid, ...ev.result } });
+			} else {
+				emit(ev);
+			}
+		}
+		if (typeof scenario.turn2ExitCode === "number") {
+			process.exit(scenario.turn2ExitCode);
+		}
+	}
+}
+`,
+				name,
+			);
+
+		const runTwoTurnCase = async (id: string, bin: string) => {
+			let injected = false;
+			return runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: `Turn 1 for ${id}`,
+				index: 0,
+				id,
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: false,
+				settings: makeSettings(bin, { task: "gemini-4-neon-medium" }),
+				onProgress: p => {
+					if (!injected && p.currentTool === "bash") {
+						injected = true;
+						void IrcBus.global().send({
+							from: `Peer-${id}`,
+							to: id,
+							body: `Turn 2 follow-up for ${id}`,
+						});
+					}
+				},
+			});
+		};
+
+		// 1. Successor reports DONE usage (50/15/12) then partial final SUCCESS with only input_tokens: 90.
+		const partialUsageBin = await createTwoTurnFixture("fake-agy-partial-usage", {
+			cid: "conv-partial-usage",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "TURN1_USAGE_ANSWER",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+			turn2Events: [
+				{
+					event: "step_update",
+					step_update: {
+						step_index: 2,
+						step_type: "agent_response",
+						state: "DONE",
+						text_delta: "TURN2_USAGE_ANSWER",
+						usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
+					},
+				},
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "TURN2_USAGE_ANSWER",
+						num_turns: 2,
+						usage: { input_tokens: 90 },
+					},
+				},
+			],
+		});
+
+		const res = await runTwoTurnCase("PartialUsageAgy", partialUsageBin);
+		expect(res.exitCode).toBe(0);
+		expect(res.output).toBe("TURN2_USAGE_ANSWER");
+		expect(res.usage?.input).toBe(90);
+		expect(res.usage?.output).toBe(25);
+		expect(res.usage?.cacheRead).toBe(20);
+		expect(res.contextTokens).toBe(62);
+
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "PartialUsageAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				l =>
+					JSON.parse(l) as {
+						type: string;
+						message?: {
+							role?: string;
+							content?: Array<{ text?: string }>;
+							usage?: { input?: number; output?: number; cacheRead?: number };
+						};
+					},
+			);
+		const assistantEntries = transcriptLines.filter(e => e.type === "message" && e.message?.role === "assistant");
+		const turn1Entry = assistantEntries.find(e =>
+			(e.message?.content ?? []).some(c => c.text?.includes("TURN1_USAGE_ANSWER")),
+		);
+		const turn2Entry = assistantEntries.find(e =>
+			(e.message?.content ?? []).some(c => c.text?.includes("TURN2_USAGE_ANSWER")),
+		);
+		expect(turn1Entry?.message?.usage?.input).toBe(40);
+		expect(turn1Entry?.message?.usage?.output).toBe(10);
+		expect(turn1Entry?.message?.usage?.cacheRead).toBe(8);
+		expect(turn2Entry?.message?.usage?.input).toBe(50);
+		expect(turn2Entry?.message?.usage?.output).toBe(15);
+		expect(turn2Entry?.message?.usage?.cacheRead).toBe(12);
+
+		// 2. Counted two-turn result-only run: contextTokens must stay undefined instead of Turn 1's 48.
+		const countedTwoTurnBin = await createTwoTurnFixture("fake-agy-result-only-counted", {
+			cid: "conv-result-only-counted",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "RESULT_ONLY_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+			turn2Events: [
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "RESULT_ONLY_TURN2",
+						num_turns: 2,
+						usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+					},
+				},
+			],
+		});
+		const countedRes = await runTwoTurnCase("ResultOnlyCountedAgy", countedTwoTurnBin);
+		expect(countedRes.exitCode).toBe(0);
+		expect(countedRes.output).toBe("RESULT_ONLY_TURN2");
+		expect(countedRes.requests).toBe(2);
+		expect(countedRes.usage?.input).toBe(90);
+		expect(countedRes.usage?.output).toBe(25);
+		expect(countedRes.usage?.cacheRead).toBe(20);
+		expect(countedRes.contextTokens).toBeUndefined();
+
+		// 3. Uncounted two-turn result-only run (Turn 2 omits num_turns): must NOT infer cumulative 110 as single-request context.
+		const uncountedTwoTurnBin = await createTwoTurnFixture("fake-agy-result-only-uncounted", {
+			cid: "conv-result-only-uncounted",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "UNCOUNTED_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+			turn2Events: [
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "UNCOUNTED_TURN2",
+						usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+					},
+				},
+			],
+		});
+		const uncountedRes = await runTwoTurnCase("ResultOnlyUncountedAgy", uncountedTwoTurnBin);
+		expect(uncountedRes.exitCode).toBe(0);
+		expect(uncountedRes.output).toBe("UNCOUNTED_TURN2");
+		expect(uncountedRes.usage?.input).toBe(90);
+		expect(uncountedRes.usage?.output).toBe(25);
+		expect(uncountedRes.usage?.cacheRead).toBe(20);
+		expect(uncountedRes.contextTokens).toBeUndefined();
+
+		// 4. Successor emits ACTIVE then exits nonzero (7) without a second result: must NOT resurrect Turn 1's 48 context.
+		const activeCrashBin = await createTwoTurnFixture("fake-agy-successor-crash", {
+			cid: "conv-successor-crash",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "CRASH_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+			turn2Events: [
+				{
+					event: "step_update",
+					step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+				},
+			],
+			turn2ExitCode: 7,
+		});
+		const crashRes = await runTwoTurnCase("SuccessorCrashContextAgy", activeCrashBin);
+		expect(crashRes.exitCode).toBe(7);
+		expect(crashRes.contextTokens).toBeUndefined();
 	}, 30_000);
 });
