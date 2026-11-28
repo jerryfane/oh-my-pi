@@ -42,6 +42,7 @@ import type { ServingModel } from "../session/retry-fallback-chains";
 import { CURRENT_SESSION_VERSION, type UsageStatistics } from "../session/session-entries";
 import { cfgSessionMaxCost } from "../session/settings";
 import { isMainThread } from "../thread/identity";
+import { registerLocalBridgedHandle } from "../thread/session-directory";
 import { buildOutputValidator, summarizeValidationFailure } from "../tools/output-schema-validator";
 import { truncateTail } from "../tools/streaming-output";
 import type { EventBus } from "../utils/event-bus";
@@ -545,17 +546,15 @@ interface StepRunOutcome {
 	timedOut: boolean;
 	abortReason?: string;
 	interruptedForSteer?: boolean;
-	/** Follow-up prompts written to stdin whose turn had not started before a steer interrupt killed the process. */
-	unstartedFollowUps?: string[];
+	/** Follow-up prompts accepted for this step whose turn was not confirmed by a `result` frame before exit. */
+	unconfirmedFollowUps?: string[];
 }
 
 interface ActiveAgyProcessControl {
 	/** Write a queued next-turn NDJSON user message to `agy`'s live stdin. Returns false if stdin is closed. */
 	writeFollowUp(content: string): boolean;
-	/** Interrupt the active turn (`SIGINT`/graceful stop) so the runner can immediately resume via `--conversation`. */
+	/** Interrupt the active turn (`SIGINT` + bounded tree cleanup) so the runner immediately resumes via `--conversation`. */
 	interruptForSteer(): boolean;
-	/** Close stdin cleanly when no more turns are pending. */
-	closeStdin(): void;
 }
 
 async function runSingleAgyStep(params: {
@@ -598,7 +597,9 @@ async function runSingleAgyStep(params: {
 	let cp: ptree.ChildProcess<"pipe"> | undefined;
 	let stdinClosed = false;
 	let pendingTurns = 0;
-	const unstartedFollowUps: string[] = [];
+	let resultsReceived = 0;
+	const writtenFollowUps: string[] = [];
+	const unwrittenFollowUps: string[] = [];
 
 	const currentUsage = (): StepUsageTotals => ({
 		requests: stepRequests,
@@ -665,7 +666,7 @@ async function runSingleAgyStep(params: {
 			}
 			pendingTurns += 1;
 			if (isFollowUp) {
-				unstartedFollowUps.push(content);
+				writtenFollowUps.push(content);
 			}
 			return true;
 		} catch {
@@ -674,12 +675,38 @@ async function runSingleAgyStep(params: {
 		}
 	};
 
+	const flushDrainedFollowUps = () => {
+		for (const queued of params.drainQueuedFollowUps?.() ?? []) {
+			if (!writePromptToStdin(queued, true)) {
+				unwrittenFollowUps.push(queued);
+			}
+		}
+	};
+
 	const interruptForSteer = (): boolean => {
 		if (!cp || steerInterrupted || params.abortSignal?.aborted) return false;
 		steerInterrupted = true;
 		closeStdinSafely();
-		cp.kill(new ptree.AbortError("steer", ""), STEER_INTERRUPT_GRACE_MS);
+		cp.kill(new ptree.AbortError("steer", ""), STEER_INTERRUPT_GRACE_MS, "SIGINT");
 		return true;
+	};
+
+	const noteConversationId = (rawCid: string | undefined) => {
+		const trimmed = rawCid?.trim();
+		if (!trimmed) return;
+		const isNew = trimmed !== conversationId;
+		conversationId = trimmed;
+		if (isNew) {
+			params.onConversationId?.(trimmed);
+		}
+		if (params.hasPendingSteer?.()) {
+			interruptForSteer();
+		}
+	};
+
+	const collectUnconfirmedFollowUps = (): string[] => {
+		const confirmedCount = Math.max(0, resultsReceived - 1);
+		return [...writtenFollowUps.slice(confirmedCount), ...unwrittenFollowUps];
 	};
 
 	try {
@@ -736,14 +763,11 @@ async function runSingleAgyStep(params: {
 		params.onProcessAttached?.({
 			writeFollowUp: content => writePromptToStdin(content, true),
 			interruptForSteer,
-			closeStdin: closeStdinSafely,
 		});
 
 		writePromptToStdin(initialPrompt, false);
 		// Flush any queued messages that arrived while spawning before the process attached.
-		for (const queued of params.drainQueuedFollowUps?.() ?? []) {
-			writePromptToStdin(queued, true);
-		}
+		flushDrainedFollowUps();
 
 		const decoder = new TextDecoder();
 		let pending = "";
@@ -751,20 +775,11 @@ async function runSingleAgyStep(params: {
 			const parsed = parseAgyStreamLine(rawLine);
 			if (!parsed) return;
 			if (parsed.event === "init") {
-				if (parsed.conversation_id) {
-					conversationId = parsed.conversation_id;
-					params.onConversationId?.(conversationId);
-				}
+				noteConversationId(parsed.conversation_id);
 				if (parsed.init?.model) model = parsed.init.model;
-				if (conversationId && params.hasPendingSteer?.()) {
-					interruptForSteer();
-				}
 			} else if (parsed.event === "step_update") {
 				const su = parsed.step_update;
-				if (su?.conversation_id) {
-					conversationId = su.conversation_id;
-					params.onConversationId?.(conversationId);
-				}
+				noteConversationId(su?.conversation_id);
 				if (su?.step_type === "agent_response") {
 					if (su.text_delta) streamedText += su.text_delta;
 					if (su.state === "DONE") {
@@ -784,21 +799,17 @@ async function runSingleAgyStep(params: {
 			} else if (parsed.event === "result") {
 				resultEvent = parsed.result;
 				resultMalformedReason = parsed.malformedReason;
-				if (parsed.result?.conversation_id) {
-					conversationId = parsed.result.conversation_id;
-					params.onConversationId?.(conversationId);
-				}
+				resultsReceived += 1;
+				noteConversationId(parsed.result?.conversation_id);
 				pendingTurns = Math.max(0, pendingTurns - 1);
 				// Drain any newly queued follow-ups before deciding whether to close stdin.
 				if (!steerInterrupted && !params.abortSignal?.aborted) {
 					const canContinue = !parsed.malformedReason && parsed.result?.status === "SUCCESS";
 					if (canContinue) {
-						for (const queued of params.drainQueuedFollowUps?.() ?? []) {
-							writePromptToStdin(queued, true);
-						}
+						flushDrainedFollowUps();
 					}
 					if (canContinue && pendingTurns > 0) {
-						const nextPrompt = unstartedFollowUps.shift();
+						const nextPrompt = writtenFollowUps[resultsReceived - 1];
 						streamedText = "";
 						if (nextPrompt !== undefined) {
 							params.onIntermediateTurnComplete?.({ prevResult: parsed.result, nextPrompt });
@@ -894,6 +905,7 @@ async function runSingleAgyStep(params: {
 			}
 		}
 
+		const unconfirmedFollowUps = collectUnconfirmedFollowUps();
 		if (steerInterrupted && !aborted && !timedOut) {
 			return {
 				exitCode: 0,
@@ -907,7 +919,7 @@ async function runSingleAgyStep(params: {
 				aborted: false,
 				timedOut: false,
 				interruptedForSteer: true,
-				...(unstartedFollowUps.length > 0 ? { unstartedFollowUps } : {}),
+				...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
 			};
 		}
 
@@ -945,6 +957,7 @@ async function runSingleAgyStep(params: {
 			aborted,
 			timedOut,
 			abortReason,
+			...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
 		};
 	} catch (err) {
 		const message = formatErrorMessage(err);
@@ -1651,6 +1664,58 @@ interface AgyControllerConfig {
 	initialRunning: boolean;
 }
 
+function prepareOutputSchema(outputSchema: unknown): {
+	jsonSchemaStr?: string;
+	jsonPromptInstruction?: string;
+} {
+	if (outputSchema === undefined) return {};
+	const { jsonSchema, normalized, error: schemaErr } = buildOutputValidator(outputSchema);
+	if (schemaErr || normalized === undefined) return {};
+	if (jsonSchema && jsonSchema.type === "object") {
+		// Official `agy --json-schema` requires root `"type": "object"`.
+		return { jsonSchemaStr: JSON.stringify(jsonSchema) };
+	}
+	if (jsonSchema && Object.keys(jsonSchema).length > 0) {
+		return { jsonPromptInstruction: buildJsonSchemaPromptInstruction(JSON.stringify(jsonSchema)) };
+	}
+	// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
+	// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
+	return { jsonPromptInstruction: buildJsonSchemaPromptInstruction() };
+}
+
+interface TurnSequenceInput {
+	steps: Array<{
+		promptText: string;
+		transcriptPrompt: string;
+		isFinalStep: boolean;
+		jsonSchema?: string;
+		jsonPromptInstruction?: string;
+	}>;
+	abortSignal: AbortSignal;
+	deadlineMs?: number;
+	maxRuntimeMs: number;
+	transcript?: AgyTranscriptWriter;
+	progress?: AgentProgress;
+	onScheduleProgress?: (flush?: boolean) => void;
+	onToolResult?: ExecutorOptions["onToolResult"];
+	onTextDelta?: (delta: string) => void;
+	onResolvedModel?: (rawModel: string | undefined) => void;
+	activityRef?: AgentRef;
+	callIdNamespace: string;
+}
+
+interface TurnSequenceSummary {
+	lastOutcome: StepRunOutcome;
+	runtimeExceeded: boolean;
+	completedRequests: number;
+	completedInputTokens: number;
+	completedOutputTokens: number;
+	completedCacheReadTokens: number;
+	finalStepUnrecordedText: string;
+	finalStepResidualUsage?: AgyTranscriptUsage;
+	finalStepDurationMs?: number;
+}
+
 class AgySessionController {
 	readonly id: string;
 	readonly binary: string;
@@ -1665,6 +1730,9 @@ class AgySessionController {
 	#conversationId?: string;
 	#resolvedModel: string;
 	#running: boolean;
+	#inActiveTurn: boolean;
+	#admissionClosed = false;
+	#wakeHoldCount = 0;
 	#runStartedAt: number | undefined;
 	#disposed = false;
 	#activeProcess: ActiveAgyProcessControl | null = null;
@@ -1674,6 +1742,7 @@ class AgySessionController {
 	#queuedFollowUps: QueuedAgyInput[] = [];
 	#wakeQueue: PendingWakeTurn[] = [];
 	#wakeLoopPromise: Promise<void> | null = null;
+	#turnLock: Promise<void> = Promise.resolve();
 	#pendingReplies = new Set<Promise<void>>();
 	#runStateListeners = new Set<(state: "running" | "idle") => void>();
 	#sessionEventListeners = new Set<AgentSessionEventListener>();
@@ -1687,7 +1756,7 @@ class AgySessionController {
 	#inputTokens = 0;
 	#outputTokens = 0;
 	#cacheReadTokens = 0;
-	#wakeStepSeq = 1000;
+	#turnStepSeq = 0;
 
 	constructor(cfg: AgyControllerConfig) {
 		this.id = cfg.id;
@@ -1702,6 +1771,7 @@ class AgySessionController {
 		this.#conversationId = cfg.conversationId;
 		this.#resolvedModel = cfg.resolvedModel;
 		this.#running = cfg.initialRunning;
+		this.#inActiveTurn = cfg.initialRunning;
 		this.#runStartedAt = cfg.initialRunning ? Date.now() : undefined;
 	}
 
@@ -1735,6 +1805,14 @@ class AgySessionController {
 		return this.#running;
 	}
 
+	get isInActiveTurn(): boolean {
+		return this.#inActiveTurn;
+	}
+
+	get isClosedForInput(): boolean {
+		return this.#disposed || this.#admissionClosed;
+	}
+
 	get runStartedAt(): number | undefined {
 		return this.#runStartedAt;
 	}
@@ -1759,12 +1837,9 @@ class AgySessionController {
 		return this.#pendingSteers.length > 0;
 	}
 
-	get hasPendingFollowUp(): boolean {
-		return this.#queuedFollowUps.length > 0;
-	}
-
 	get hasPendingWakeWork(): boolean {
 		return (
+			this.#wakeHoldCount > 0 ||
 			this.#pendingSteers.length > 0 ||
 			this.#queuedFollowUps.length > 0 ||
 			this.#wakeQueue.length > 0 ||
@@ -1823,6 +1898,35 @@ class AgySessionController {
 				});
 			}
 		}
+	}
+
+	/** End in-turn input routing for a retained session so subsequent input routes to wake turns. */
+	endActiveTurn(): void {
+		this.#inActiveTurn = false;
+		this.setRunState("idle");
+	}
+
+	/** Close input admission permanently (one-shot teardown or abort). */
+	closeAdmission(): void {
+		this.#inActiveTurn = false;
+		this.#admissionClosed = true;
+		this.#pendingSteers.length = 0;
+		this.#queuedFollowUps.length = 0;
+		this.setRunState("idle");
+	}
+
+	/** Hold wake-queue pumping while final initial-run transcript flush completes. */
+	holdWakes(): () => void {
+		this.#wakeHoldCount += 1;
+		let released = false;
+		return () => {
+			if (released) return;
+			released = true;
+			this.#wakeHoldCount = Math.max(0, this.#wakeHoldCount - 1);
+			if (this.#wakeHoldCount === 0 && this.#wakeQueue.length > 0 && !this.#disposed && !this.#admissionClosed) {
+				this.#ensureWakeLoop();
+			}
+		};
 	}
 
 	attachProcess(control: ActiveAgyProcessControl): void {
@@ -1954,10 +2058,10 @@ class AgySessionController {
 		return items.map(item => item.text);
 	}
 
-	drainAllPendingMessages(unstartedFollowUps: readonly string[] = []): string[] {
+	drainAllPendingMessages(unconfirmedFollowUps: readonly string[] = []): string[] {
 		const steers = this.#pendingSteers.splice(0).map(item => item.text);
 		const followUps = this.#queuedFollowUps.splice(0).map(item => item.text);
-		return [...unstartedFollowUps, ...steers, ...followUps];
+		return [...unconfirmedFollowUps, ...steers, ...followUps];
 	}
 
 	/** Promote any messages that arrived during initial-run teardown into wake turns so none are stranded at idle. */
@@ -1972,32 +2076,565 @@ class AgySessionController {
 		}
 	}
 
+	#ensureWakeLoop(): void {
+		if (this.#wakeLoopPromise || this.#wakeHoldCount > 0 || this.#disposed || this.#admissionClosed) return;
+		const loopPromise = this.#pumpWakeQueue();
+		this.#wakeLoopPromise = loopPromise;
+		this.#pendingReplies.add(loopPromise);
+		void loopPromise.finally(() => {
+			if (this.#wakeLoopPromise === loopPromise) {
+				this.#wakeLoopPromise = null;
+			}
+			this.#pendingReplies.delete(loopPromise);
+			if (this.#wakeQueue.length > 0 && !this.#disposed && !this.#admissionClosed && this.#wakeHoldCount === 0) {
+				this.#ensureWakeLoop();
+			}
+		});
+	}
+
 	scheduleWakeTurn(item: PendingWakeTurn): void {
 		this.#wakeQueue.push(item);
-		if (!this.#wakeLoopPromise) {
-			const loopPromise = this.#pumpWakeQueue();
-			this.#wakeLoopPromise = loopPromise;
-			this.#pendingReplies.add(loopPromise);
-			void loopPromise.finally(() => {
-				if (this.#wakeLoopPromise === loopPromise) {
-					this.#wakeLoopPromise = null;
-				}
-				this.#pendingReplies.delete(loopPromise);
-			});
-		}
+		this.#ensureWakeLoop();
 	}
 
 	async runForegroundPrompt(text: string): Promise<boolean> {
-		if (this.#disposed) return false;
+		if (this.#disposed || this.#admissionClosed) return false;
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
 		this.scheduleWakeTurn({ text, resolve, reject });
 		await promise;
 		return true;
 	}
 
+	async #withTurnLock<T>(signal: AbortSignal | undefined, fn: () => Promise<T>): Promise<T> {
+		if (signal?.aborted) {
+			throw new Error(abortReasonOf(signal, "Cancelled"));
+		}
+		const prev = this.#turnLock;
+		let release!: () => void;
+		const gate = new Promise<void>(resolve => {
+			release = resolve;
+		});
+		this.#turnLock = prev.then(() => gate);
+		try {
+			if (signal) {
+				await new Promise<void>((resolve, reject) => {
+					const onAbort = () => reject(new Error(abortReasonOf(signal, "Cancelled")));
+					signal.addEventListener("abort", onAbort, { once: true });
+					void prev.then(() => {
+						signal.removeEventListener("abort", onAbort);
+						if (signal.aborted) {
+							reject(new Error(abortReasonOf(signal, "Cancelled")));
+						} else {
+							resolve();
+						}
+					});
+				});
+			} else {
+				await prev;
+			}
+			return await fn();
+		} finally {
+			release();
+		}
+	}
+
+	/**
+	 * Single unified turn execution loop shared by initial runs, idle/revived IRC wake turns,
+	 * and monitored `runSubagentFollowUpTurn` calls. Owns process attach/detach, single-source
+	 * conversation ID publication, tool/usage streaming, unconfirmed follow-up recovery, and
+	 * immediate mid-turn steer interruption/resumption.
+	 */
+	async executeTurnSequence(input: TurnSequenceInput): Promise<TurnSequenceSummary> {
+		let runtimeExceeded = false;
+		let completedRequests = 0;
+		let completedInputTokens = 0;
+		let completedOutputTokens = 0;
+		let completedCacheReadTokens = 0;
+		let finalStepUnrecordedText = "";
+		let finalStepResidualUsage: AgyTranscriptUsage | undefined;
+		let finalStepDurationMs: number | undefined;
+		let lastOutcome: StepRunOutcome = {
+			exitCode: 1,
+			response: "",
+			responseIsAuthoritative: false,
+			usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
+			durationMs: 0,
+			stderr: "",
+			aborted: false,
+			timedOut: false,
+		};
+		const registry = AgentRegistry.global();
+
+		for (let i = 0; i < input.steps.length; i++) {
+			const step = input.steps[i]!;
+			let currentTranscriptPrompt = step.transcriptPrompt;
+			let currentStepPrompt = step.promptText;
+			let steerAttempt = 0;
+			let stepFailed = false;
+
+			while (true) {
+				if (input.deadlineMs !== undefined && Date.now() >= input.deadlineMs) {
+					runtimeExceeded = true;
+					stepFailed = true;
+					break;
+				}
+				if (input.abortSignal.aborted || this.#disposed) {
+					stepFailed = true;
+					break;
+				}
+
+				input.transcript?.recordUserPrompt(currentTranscriptPrompt);
+				this.recordUserMessage(currentTranscriptPrompt);
+				let liveStepRequests = 0;
+				let liveStepTokens = 0;
+				let recordedStepInput = 0;
+				let recordedStepOutput = 0;
+				let recordedStepCacheRead = 0;
+				let pendingTurnUsage: { input: number; output: number; cacheRead: number; durationMs?: number } | undefined;
+				let toolCallSeq = 0;
+				let pendingAssistantText = "";
+				const stepNumber = ++this.#turnStepSeq;
+				const stepCallPrefix =
+					steerAttempt === 0 ? `${input.callIdNamespace}-${i}` : `${input.callIdNamespace}-${i}-s${steerAttempt}`;
+				const activeToolsByStep = new Map<
+					number,
+					{ callId: string; tool: string; args: string; argsKey?: string; startMs: number }
+				>();
+				const unindexedToolQueue: Array<{
+					callId: string;
+					tool: string;
+					args: string;
+					argsKey?: string;
+					startMs: number;
+				}> = [];
+
+				const consumePendingTurnUsage = (): { usage?: AgyTranscriptUsage; durationMs?: number } => {
+					if (!pendingTurnUsage) return {};
+					const current = pendingTurnUsage;
+					pendingTurnUsage = undefined;
+					recordedStepInput += current.input;
+					recordedStepOutput += current.output;
+					recordedStepCacheRead += current.cacheRead;
+					return {
+						usage: buildTranscriptUsage(current.input, current.output, current.cacheRead),
+						durationMs: current.durationMs,
+					};
+				};
+
+				const stepPromise = runSingleAgyStep({
+					binary: this.binary,
+					cwd: this.cwd,
+					model: this.configuredModel,
+					conversationId: this.#conversationId,
+					additionalDirectories: this.additionalDirectories,
+					jsonSchema: step.isFinalStep ? step.jsonSchema : undefined,
+					promptText: currentStepPrompt,
+					id: this.id,
+					stepIndex: stepNumber,
+					abortSignal: input.abortSignal,
+					deadlineMs: input.deadlineMs,
+					maxRuntimeMs: input.maxRuntimeMs,
+					onProcessAttached: control => this.attachProcess(control),
+					onProcessDetached: () => this.detachProcess(),
+					onConversationId: cid => {
+						this.setConversationId(cid);
+						input.transcript?.recordAgySession(cid);
+					},
+					onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
+						const prevReply =
+							typeof prevResult?.response === "string" ? prevResult.response : pendingAssistantText;
+						if (prevReply) {
+							input.transcript?.recordAssistantTurn({
+								text: prevReply,
+								stopReason: "stop",
+							});
+							this.recordAssistantMessage(prevReply);
+						}
+						pendingAssistantText = "";
+						input.transcript?.recordUserPrompt(nextPrompt);
+						this.recordUserMessage(nextPrompt);
+					},
+					drainQueuedFollowUps: () => this.drainQueuedFollowUps(),
+					hasPendingSteer: () => this.hasPendingSteer,
+					onEvent: ev => {
+						if (ev.event === "init") {
+							if (ev.init?.model) {
+								if (input.onResolvedModel) {
+									input.onResolvedModel(ev.init.model);
+								} else {
+									const display = formatResolvedAgyModel(ev.init.model);
+									this.setResolvedModel(display);
+									input.transcript?.recordModelChange(display);
+								}
+								input.onScheduleProgress?.();
+							}
+							return;
+						}
+						if (ev.event === "step_update" && ev.step_update) {
+							const su = ev.step_update;
+							if (su.step_type === "tool") {
+								const frameToolName = su.tool_name || su.tool_info?.name;
+								const stepKey = su.step_index;
+								if (su.state === "ACTIVE") {
+									const toolName = frameToolName || "tool";
+									const summarized = summarizeToolArgs(su.tool_info?.parameters, this.cwd);
+									const existing = stepKey !== undefined ? activeToolsByStep.get(stepKey) : undefined;
+									if (existing) {
+										if (frameToolName) existing.tool = frameToolName;
+										if (summarized.args) {
+											existing.args = summarized.args;
+											existing.argsKey = summarized.argsKey;
+										}
+										if (input.progress) {
+											input.progress.currentTool = existing.tool;
+											input.progress.currentToolArgs = existing.args;
+											input.progress.currentToolArgsKey = existing.argsKey;
+											input.progress.currentToolStartMs = existing.startMs;
+											input.progress.streaming = undefined;
+										}
+										if (input.activityRef) {
+											registry.setActivity(
+												this.id,
+												existing.args ? `${existing.tool}: ${existing.args}` : existing.tool,
+												input.activityRef,
+											);
+										}
+										input.onScheduleProgress?.();
+										return;
+									}
+									const startedAt = Date.now();
+									const callId = `${stepCallPrefix}-${++toolCallSeq}`;
+									const activeEntry = {
+										callId,
+										tool: toolName,
+										args: summarized.args,
+										argsKey: summarized.argsKey,
+										startMs: startedAt,
+									};
+									if (stepKey !== undefined) {
+										activeToolsByStep.set(stepKey, activeEntry);
+									} else {
+										unindexedToolQueue.push(activeEntry);
+									}
+									const intent = summarized.args ? `${toolName}: ${summarized.args}` : toolName;
+									const attached = consumePendingTurnUsage();
+									this.noteToolStart(callId);
+									if (input.activityRef) {
+										registry.setActivity(this.id, intent, input.activityRef);
+									}
+									input.transcript?.recordToolStart({
+										callId,
+										toolName,
+										toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, summarized.args),
+										intent,
+										precedingText: pendingAssistantText,
+										usage: attached.usage,
+										durationMs: attached.durationMs,
+									});
+									pendingAssistantText = "";
+									if (input.progress) {
+										input.progress.currentTool = toolName;
+										input.progress.currentToolArgs = summarized.args;
+										input.progress.currentToolArgsKey = summarized.argsKey;
+										input.progress.currentToolStartMs = startedAt;
+										input.progress.streaming = undefined;
+									}
+									input.onScheduleProgress?.();
+								} else if (su.state === "DONE") {
+									let prior:
+										| { callId: string; tool: string; args: string; argsKey?: string; startMs: number }
+										| undefined;
+									if (stepKey !== undefined) {
+										prior = activeToolsByStep.get(stepKey);
+										activeToolsByStep.delete(stepKey);
+									} else if (frameToolName) {
+										const matchIdx = unindexedToolQueue.findIndex(entry => entry.tool === frameToolName);
+										if (matchIdx !== -1) {
+											prior = unindexedToolQueue.splice(matchIdx, 1)[0];
+										}
+									} else {
+										prior = unindexedToolQueue.shift();
+									}
+									const resolvedName = frameToolName || prior?.tool || "tool";
+									const summarized = summarizeToolArgs(su.tool_info?.parameters, this.cwd);
+									const resolvedArgs = summarized.args || prior?.args || "";
+									const resolvedArgsKey = summarized.argsKey ?? prior?.argsKey;
+									let callId = prior?.callId;
+									if (!callId) {
+										callId = `${stepCallPrefix}-${++toolCallSeq}`;
+										const intent = resolvedArgs ? `${resolvedName}: ${resolvedArgs}` : resolvedName;
+										const attached = consumePendingTurnUsage();
+										this.noteToolStart(callId);
+										input.transcript?.recordToolStart({
+											callId,
+											toolName: resolvedName,
+											toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, resolvedArgs),
+											intent,
+											precedingText: pendingAssistantText,
+											usage: attached.usage,
+											durationMs: attached.durationMs,
+										});
+										pendingAssistantText = "";
+									}
+									this.noteToolDone(callId);
+									input.transcript?.recordToolResult({
+										callId,
+										toolName: resolvedName,
+										output: su.tool_info?.output ?? "",
+									});
+									if (input.progress) {
+										input.progress.toolCount += 1;
+										input.progress.recentTools.push({
+											tool: resolvedName,
+											args: resolvedArgs,
+											argsKey: resolvedArgsKey,
+											endMs: Date.now(),
+										});
+										if (input.progress.recentTools.length > RECENT_TOOLS_LIMIT) {
+											input.progress.recentTools.shift();
+										}
+										const remaining = activeToolsByStep.values().next().value ?? unindexedToolQueue[0];
+										if (remaining) {
+											input.progress.currentTool = remaining.tool;
+											input.progress.currentToolArgs = remaining.args;
+											input.progress.currentToolArgsKey = remaining.argsKey;
+											input.progress.currentToolStartMs = remaining.startMs;
+										} else {
+											input.progress.currentTool = undefined;
+											input.progress.currentToolArgs = undefined;
+											input.progress.currentToolArgsKey = undefined;
+											input.progress.currentToolStartMs = undefined;
+										}
+									}
+									if (input.onToolResult) {
+										invokeObserverSafely(
+											"agy onToolResult callback failed",
+											{ id: this.id, tool: resolvedName },
+											() =>
+												input.onToolResult?.({
+													tool: resolvedName,
+													text: su.tool_info?.output ?? "",
+													isError: false,
+												}),
+										);
+									}
+									input.onScheduleProgress?.();
+								}
+							} else if (su.step_type === "agent_response") {
+								if (pendingTurnUsage && (su.state === "ACTIVE" || su.text_delta || su.state === "DONE")) {
+									const flushed = consumePendingTurnUsage();
+									input.transcript?.recordAssistantTurn({
+										text: pendingAssistantText.trim(),
+										stopReason: "stop",
+										usage: flushed.usage,
+										durationMs: flushed.durationMs,
+									});
+									pendingAssistantText = "";
+								}
+								if (su.text_delta) {
+									input.onTextDelta?.(su.text_delta);
+									pendingAssistantText += su.text_delta;
+								}
+								if (su.state === "ACTIVE") {
+									if (input.progress) input.progress.streaming = { kind: "text" };
+									input.onScheduleProgress?.();
+								} else if (su.state === "DONE") {
+									if (input.progress) input.progress.streaming = undefined;
+									liveStepRequests += 1;
+									if (su.usage) {
+										const inp = su.usage.input_tokens ?? 0;
+										const out = su.usage.output_tokens ?? 0;
+										const cacheRead = su.usage.cache_read_tokens ?? 0;
+										liveStepTokens += inp + out;
+										const ctx = inp + cacheRead;
+										if (ctx > 0 && input.progress) input.progress.contextTokens = ctx;
+										pendingTurnUsage = {
+											input: inp,
+											output: out,
+											cacheRead,
+											durationMs:
+												su.duration_seconds !== undefined
+													? Math.max(0, Math.round(su.duration_seconds * 1000))
+													: undefined,
+										};
+									}
+									if (input.progress) {
+										input.progress.requests = completedRequests + liveStepRequests;
+										input.progress.tokens = completedInputTokens + completedOutputTokens + liveStepTokens;
+									}
+									input.onScheduleProgress?.();
+								}
+							}
+						}
+					},
+				});
+				this.trackStepPromise(stepPromise);
+				lastOutcome = await stepPromise;
+
+				completedRequests += lastOutcome.usage.requests;
+				completedInputTokens += lastOutcome.usage.inputTokens;
+				completedOutputTokens += lastOutcome.usage.outputTokens;
+				completedCacheReadTokens += lastOutcome.usage.cacheReadTokens;
+				this.addUsage(
+					lastOutcome.usage.inputTokens,
+					lastOutcome.usage.outputTokens,
+					lastOutcome.usage.cacheReadTokens,
+				);
+				if (input.progress) {
+					input.progress.requests = completedRequests;
+					input.progress.tokens = completedInputTokens + completedOutputTokens;
+					if (lastOutcome.usage.lastContextTokens !== undefined) {
+						input.progress.contextTokens = lastOutcome.usage.lastContextTokens;
+					}
+				}
+				if (lastOutcome.timedOut) {
+					runtimeExceeded = true;
+				}
+				if (lastOutcome.model) {
+					if (input.onResolvedModel) {
+						input.onResolvedModel(lastOutcome.model);
+					} else {
+						const display = formatResolvedAgyModel(lastOutcome.model);
+						this.setResolvedModel(display);
+						input.transcript?.recordModelChange(display);
+					}
+				}
+
+				const remInput = Math.max(0, lastOutcome.usage.inputTokens - recordedStepInput);
+				const remOutput = Math.max(0, lastOutcome.usage.outputTokens - recordedStepOutput);
+				const remCacheRead = Math.max(0, lastOutcome.usage.cacheReadTokens - recordedStepCacheRead);
+				const hasResidualUsage =
+					remInput > 0 ||
+					remOutput > 0 ||
+					remCacheRead > 0 ||
+					(recordedStepInput === 0 &&
+						recordedStepOutput === 0 &&
+						recordedStepCacheRead === 0 &&
+						lastOutcome.usage.requests > 0);
+				const stepResidualUsage = hasResidualUsage
+					? buildTranscriptUsage(remInput, remOutput, remCacheRead)
+					: undefined;
+				const stepDurationMs = pendingTurnUsage?.durationMs ?? lastOutcome.durationMs;
+
+				if (lastOutcome.aborted || runtimeExceeded || input.abortSignal.aborted || this.#disposed) {
+					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
+						? lastOutcome.response
+						: pendingAssistantText;
+					finalStepResidualUsage = stepResidualUsage;
+					finalStepDurationMs = stepDurationMs;
+					stepFailed = true;
+					break;
+				}
+
+				// Recover unconfirmed stdin follow-ups (e.g. child closed fd 0) and mid-turn steers/queued input.
+				const pendingNext =
+					lastOutcome.exitCode === 0 || lastOutcome.interruptedForSteer
+						? this.drainAllPendingMessages(lastOutcome.unconfirmedFollowUps)
+						: [];
+				if (lastOutcome.interruptedForSteer || pendingNext.length > 0) {
+					if (!this.#conversationId) {
+						const missingCidErr =
+							"agy exited without a conversation ID before delivering accepted follow-up/steering message(s)";
+						lastOutcome = {
+							...lastOutcome,
+							exitCode: 1,
+							error: lastOutcome.error ?? missingCidErr,
+							stderr: lastOutcome.stderr || missingCidErr,
+						};
+						finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
+							? lastOutcome.response
+							: pendingAssistantText;
+						finalStepResidualUsage = stepResidualUsage;
+						finalStepDurationMs = stepDurationMs;
+						stepFailed = true;
+						break;
+					}
+					if (!lastOutcome.interruptedForSteer) {
+						const prevReply = lastOutcome.responseIsAuthoritative ? lastOutcome.response : pendingAssistantText;
+						if (prevReply || stepResidualUsage) {
+							input.transcript?.recordAssistantTurn({
+								text: prevReply,
+								stopReason: "stop",
+								usage: stepResidualUsage,
+								durationMs: stepDurationMs,
+							});
+							this.recordAssistantMessage(prevReply);
+						}
+					}
+					if (pendingNext.length > 0) {
+						const combinedPrompt = pendingNext.join("\n\n");
+						currentTranscriptPrompt = combinedPrompt;
+						currentStepPrompt =
+							step.isFinalStep && step.jsonPromptInstruction
+								? `${combinedPrompt}\n\n${step.jsonPromptInstruction}`
+								: combinedPrompt;
+						steerAttempt += 1;
+						continue;
+					}
+				}
+
+				if (lastOutcome.exitCode !== 0) {
+					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
+						? lastOutcome.response
+						: pendingAssistantText;
+					finalStepResidualUsage = stepResidualUsage;
+					finalStepDurationMs = stepDurationMs;
+					stepFailed = true;
+					break;
+				}
+
+				if (!step.isFinalStep) {
+					const stepReplyText = lastOutcome.responseIsAuthoritative ? lastOutcome.response : pendingAssistantText;
+					if (stepReplyText || stepResidualUsage) {
+						input.transcript?.recordAssistantTurn({
+							text: stepReplyText,
+							stopReason: "stop",
+							usage: stepResidualUsage,
+							durationMs: stepDurationMs,
+						});
+						this.recordAssistantMessage(stepReplyText);
+					}
+					pendingAssistantText = "";
+					finalStepUnrecordedText = "";
+					finalStepResidualUsage = undefined;
+					finalStepDurationMs = undefined;
+				} else {
+					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
+						? lastOutcome.response
+						: pendingAssistantText;
+					finalStepResidualUsage = stepResidualUsage;
+					finalStepDurationMs = stepDurationMs;
+				}
+				break;
+			}
+			if (stepFailed) break;
+		}
+
+		return {
+			lastOutcome,
+			runtimeExceeded,
+			completedRequests,
+			completedInputTokens,
+			completedOutputTokens,
+			completedCacheReadTokens,
+			finalStepUnrecordedText,
+			finalStepResidualUsage,
+			finalStepDurationMs,
+		};
+	}
+
 	async runMonitoredFollowUpTurn(options: FollowUpTurnOptions, startTime: number): Promise<SingleResult> {
+		if (options.restore || options.steps !== undefined) {
+			throw new Error("External agy CLI subagents do not support restore/stepped-resume follow-up turns.");
+		}
+		if (options.topicBoard !== undefined) {
+			throw new Error("External agy CLI subagents do not support topicBoard follow-up turns.");
+		}
+		if (options.workPoolYieldItems && options.workPoolYieldItems.length > 0) {
+			throw new Error("External agy CLI subagents do not support workPoolYieldItems follow-up turns.");
+		}
 		const index = options.index ?? 0;
-		if (this.#disposed) {
+		if (this.#disposed || this.#admissionClosed) {
 			return {
 				index,
 				id: options.id,
@@ -2017,190 +2654,384 @@ class AgySessionController {
 				error: "agy subagent session is disposed",
 			};
 		}
-		// Wait for any prior wake turn to settle before starting the monitored follow-up turn.
-		if (this.#wakeLoopPromise) {
-			await this.#wakeLoopPromise.catch(() => {});
-		}
-		if (options.signal?.aborted) {
-			const reason = abortReasonOf(options.signal, "Cancelled");
-			return {
-				index,
-				id: options.id,
-				agent: options.agent.name,
-				agentSource: options.agent.source,
-				task: options.message,
-				description: options.description,
-				exitCode: 1,
-				output: "",
-				stderr: reason,
-				truncated: false,
-				durationMs: Math.max(0, Date.now() - startTime),
-				tokens: 0,
-				requests: 0,
-				resolvedModel: this.#resolvedModel,
-				resolvedModelIdentity: this.#resolvedModel,
-				error: reason,
-				aborted: true,
-				abortReason: reason,
-			};
-		}
-		if (this.#runAbortController.signal.aborted) {
-			this.#runAbortController = new AbortController();
-		}
-		const combinedAbort = combineAbortSignals([options.signal, this.#runAbortController.signal]);
-		this.setRunState("running");
-		this.emitSessionEvent({ type: "agent_start" });
-		let transcript: AgyTranscriptWriter | undefined;
-		let totalRequests = 0;
-		let totalInput = 0;
-		let totalOutput = 0;
-		let totalCacheRead = 0;
-		let lastOutcome: StepRunOutcome = {
-			exitCode: 1,
-			response: "",
-			responseIsAuthoritative: false,
-			usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
-			durationMs: 0,
-			stderr: "",
-			aborted: false,
-			timedOut: false,
-		};
+
 		try {
-			if (this.#transcriptPath) {
-				transcript = await AgyTranscriptWriter.openForAppend({
-					filePath: this.#transcriptPath,
-					agentId: this.id,
-					initialModel: this.#resolvedModel,
-				});
-			}
-			const maxRuntimeMs = options.maxRuntimeMs ?? this.maxRuntimeMs;
-			const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
-			let currentPrompt = options.message;
-			while (!this.#disposed && !combinedAbort.signal.aborted) {
-				transcript?.recordUserPrompt(currentPrompt);
-				this.recordUserMessage(currentPrompt);
-				const stepId = ++this.#wakeStepSeq;
-				const stepPromise = runSingleAgyStep({
-					binary: this.binary,
-					cwd: this.cwd,
-					model: this.configuredModel,
-					conversationId: this.#conversationId,
-					additionalDirectories: this.additionalDirectories,
-					promptText: currentPrompt,
-					id: this.id,
-					stepIndex: stepId,
-					abortSignal: combinedAbort.signal,
-					deadlineMs,
-					maxRuntimeMs,
-					onProcessAttached: control => this.attachProcess(control),
-					onProcessDetached: () => this.detachProcess(),
-					onConversationId: cid => {
-						this.setConversationId(cid);
-						transcript?.recordAgySession(cid);
-					},
-					onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
-						if (prevResult?.response) {
-							transcript?.recordAssistantTurn({ text: prevResult.response, stopReason: "stop" });
-							this.recordAssistantMessage(prevResult.response);
+			return await this.#withTurnLock(options.signal, async () => {
+				if (this.#disposed || this.#admissionClosed) {
+					return {
+						index,
+						id: options.id,
+						agent: options.agent.name,
+						agentSource: options.agent.source,
+						task: options.message,
+						description: options.description,
+						exitCode: 1,
+						output: "",
+						stderr: "agy subagent session is disposed",
+						truncated: false,
+						durationMs: Math.max(0, Date.now() - startTime),
+						tokens: 0,
+						requests: 0,
+						resolvedModel: this.#resolvedModel,
+						resolvedModelIdentity: this.#resolvedModel,
+						error: "agy subagent session is disposed",
+					};
+				}
+				if (this.#runAbortController.signal.aborted) {
+					this.#runAbortController = new AbortController();
+				}
+				const combinedAbort = combineAbortSignals([options.signal, this.#runAbortController.signal]);
+				const maxRuntimeMs = Math.max(0, Math.trunc(Number(options.maxRuntimeMs ?? this.maxRuntimeMs) || 0));
+				const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
+				const { jsonSchemaStr, jsonPromptInstruction } = prepareOutputSchema(options.outputSchema);
+
+				const progress: AgentProgress = {
+					index,
+					id: options.id,
+					agent: options.agent.name,
+					agentSource: options.agent.source,
+					status: "running",
+					task: options.message,
+					description: options.description,
+					recentTools: [],
+					recentOutput: [],
+					toolCount: 0,
+					requests: 0,
+					tokens: 0,
+					cost: 0,
+					durationMs: 0,
+					modelRole: options.modelRole,
+					resolvedModel: this.#resolvedModel,
+					resolvedModelIdentity: this.#resolvedModel,
+				};
+				let recentOutputTail = "";
+				let recentOutputDirty = false;
+				let lastProgressEmitMs = 0;
+				let progressTimer: ReturnType<typeof setTimeout> | null = null;
+				const appendRecentText = (delta: string) => {
+					recentOutputTail += delta;
+					if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES * 2) {
+						recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
+					}
+					recentOutputDirty = true;
+				};
+				const emitProgressNow = () => {
+					if (recentOutputDirty) {
+						recentOutputDirty = false;
+						const tail =
+							recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES
+								? recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES)
+								: recentOutputTail;
+						progress.recentOutput = tail
+							.split("\n")
+							.filter(line => line.trim())
+							.slice(-RECENT_OUTPUT_LINES)
+							.reverse();
+					}
+					progress.durationMs = Date.now() - startTime;
+					if (options.onProgress) {
+						invokeObserverSafely(
+							"agy follow-up onProgress failed",
+							{ id: this.id, status: progress.status },
+							() => options.onProgress?.({ ...progress }),
+						);
+					}
+					emitSubagentFrameSafely(
+						options.eventBus,
+						options.subagentEventBus,
+						TASK_SUBAGENT_PROGRESS_CHANNEL,
+						{
+							index,
+							agent: options.agent.name,
+							agentSource: options.agent.source,
+							task: options.message,
+							parentToolCallId: options.parentToolCallId,
+							detached: true,
+							...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
+							progress: { ...progress },
+						},
+						{ id: this.id, status: progress.status },
+					);
+					lastProgressEmitMs = Date.now();
+				};
+				const scheduleProgress = (flush = false) => {
+					if (flush) {
+						if (progressTimer) {
+							clearTimeout(progressTimer);
+							progressTimer = null;
 						}
-						transcript?.recordUserPrompt(nextPrompt);
-						this.recordUserMessage(nextPrompt);
+						emitProgressNow();
+						return;
+					}
+					const elapsed = Date.now() - lastProgressEmitMs;
+					if (lastProgressEmitMs === 0 || elapsed >= PROGRESS_COALESCE_MS) {
+						if (progressTimer) {
+							clearTimeout(progressTimer);
+							progressTimer = null;
+						}
+						emitProgressNow();
+						return;
+					}
+					if (progressTimer) return;
+					progressTimer = setTimeout(() => {
+						progressTimer = null;
+						emitProgressNow();
+					}, PROGRESS_COALESCE_MS - elapsed);
+				};
+
+				let transcript: AgyTranscriptWriter | undefined;
+				this.#inActiveTurn = true;
+				this.setRunState("running");
+				this.emitSessionEvent({ type: "agent_start" });
+				emitSubagentFrameSafely(
+					options.eventBus,
+					options.subagentEventBus,
+					TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+					{
+						id: options.id,
+						agent: options.agent.name,
+						parentToolCallId: options.parentToolCallId,
+						detached: true,
+						agentSource: options.agent.source,
+						description: options.description,
+						...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
+						status: "started" as const,
+						index,
 					},
-					drainQueuedFollowUps: () => this.drainQueuedFollowUps(),
-					hasPendingSteer: () => this.hasPendingSteer,
-					onEvent: ev => {
-						if (ev.event === "init" && ev.init?.model) {
-							const display = formatResolvedAgyModel(ev.init.model);
+					{ id: this.id, status: "started" },
+				);
+				scheduleProgress(true);
+
+				const releaseWakeHold = this.holdWakes();
+				try {
+					if (this.#transcriptPath) {
+						transcript = await AgyTranscriptWriter.openForAppend({
+							filePath: this.#transcriptPath,
+							agentId: this.id,
+							initialModel: this.#resolvedModel,
+						});
+					}
+					const preparedSteps = [
+						{
+							transcriptPrompt: options.message,
+							promptText: jsonPromptInstruction
+								? `${options.message}\n\n${jsonPromptInstruction}`
+								: options.message,
+							isFinalStep: true,
+							jsonSchema: jsonSchemaStr,
+							jsonPromptInstruction,
+						},
+					];
+					const summary = await this.executeTurnSequence({
+						steps: preparedSteps,
+						abortSignal: combinedAbort.signal,
+						deadlineMs,
+						maxRuntimeMs,
+						transcript,
+						progress,
+						onScheduleProgress: scheduleProgress,
+						onTextDelta: appendRecentText,
+						onResolvedModel: rawModel => {
+							if (!rawModel) return;
+							const display = formatResolvedAgyModel(rawModel);
+							progress.resolvedModel = display;
+							progress.resolvedModelIdentity = display;
 							this.setResolvedModel(display);
 							transcript?.recordModelChange(display);
+						},
+						activityRef: AgentRegistry.global().get(this.id),
+						callIdNamespace: `agy-fu-${++this.#turnStepSeq}`,
+					});
+
+					const wasAborted =
+						summary.runtimeExceeded || summary.lastOutcome.aborted || Boolean(combinedAbort.signal.aborted);
+					const abortReason = wasAborted
+						? summary.runtimeExceeded
+							? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
+							: (summary.lastOutcome.abortReason ?? abortReasonOf(combinedAbort.signal, "Cancelled"))
+						: undefined;
+					let exitCode = wasAborted ? 1 : summary.lastOutcome.exitCode;
+					let error = wasAborted ? (abortReason ?? summary.lastOutcome.error) : summary.lastOutcome.error;
+					let rawOutput = typeof summary.lastOutcome.response === "string" ? summary.lastOutcome.response : "";
+					let structuredOutput: StructuredSubagentOutput | undefined;
+					let truncatedOutput = rawOutput;
+					let truncated = false;
+					let outputPath: string | undefined;
+					let outputMeta: { lineCount: number; charCount: number } | undefined;
+
+					try {
+						const structured = finalizeStructuredOutput({
+							outputSchema: options.outputSchema,
+							outputSchemaMode: options.outputSchemaMode,
+							outputSchemaSource: options.outputSchemaSource,
+							exitCode,
+							rawOutput,
+							parsedFromAgy: summary.lastOutcome.structuredOutput,
+							error,
+						});
+						rawOutput = typeof structured.rawOutput === "string" ? structured.rawOutput : "";
+						exitCode = structured.exitCode;
+						error = structured.error;
+						structuredOutput = structured.structuredOutput;
+
+						const truncatedResult = truncateTail(rawOutput, {
+							maxBytes: MAX_OUTPUT_BYTES,
+							maxLines: MAX_OUTPUT_LINES,
+						});
+						truncatedOutput = truncatedResult.content;
+						truncated = Boolean(truncatedResult.truncated);
+
+						// Honor FollowUpTurnOptions.artifactsDir: rewrite artifacts only on valid structured
+						// output or a successful non-empty message turn; preserve prior artifacts otherwise.
+						const shouldPersistArtifacts =
+							options.artifactsDir !== undefined &&
+							!wasAborted &&
+							(structuredOutput?.status === "valid" || (exitCode === 0 && rawOutput.trim().length > 0));
+						if (shouldPersistArtifacts && options.artifactsDir) {
+							const persisted = await persistSubagentOutputArtifacts({
+								artifactsDir: options.artifactsDir,
+								id: options.id,
+								rawOutput,
+								structuredOutput,
+							});
+							outputPath = persisted.outputPath;
+							outputMeta = persisted.outputMeta;
 						}
-					},
-				});
-				this.trackStepPromise(stepPromise);
-				lastOutcome = await stepPromise;
-				totalRequests += lastOutcome.usage.requests;
-				totalInput += lastOutcome.usage.inputTokens;
-				totalOutput += lastOutcome.usage.outputTokens;
-				totalCacheRead += lastOutcome.usage.cacheReadTokens;
-				this.addUsage(
-					lastOutcome.usage.inputTokens,
-					lastOutcome.usage.outputTokens,
-					lastOutcome.usage.cacheReadTokens,
-				);
-				if (lastOutcome.conversationId) {
-					this.setConversationId(lastOutcome.conversationId);
-					transcript?.recordAgySession(lastOutcome.conversationId);
-				}
-				if (lastOutcome.aborted || combinedAbort.signal.aborted || this.#disposed) break;
-				const pendingNext = this.drainAllPendingMessages(lastOutcome.unstartedFollowUps);
-				if ((lastOutcome.interruptedForSteer || pendingNext.length > 0) && this.#conversationId) {
-					if (!lastOutcome.interruptedForSteer && lastOutcome.response) {
-						transcript?.recordAssistantTurn({ text: lastOutcome.response, stopReason: "stop" });
-						this.recordAssistantMessage(lastOutcome.response);
+					} catch (err) {
+						const message = formatErrorMessage(err);
+						exitCode = 1;
+						error = error ?? message;
 					}
-					if (pendingNext.length > 0) {
-						currentPrompt = pendingNext.join("\n\n");
-						continue;
+
+					progress.currentTool = undefined;
+					progress.currentToolArgs = undefined;
+					progress.currentToolArgsKey = undefined;
+					progress.currentToolStartMs = undefined;
+					progress.streaming = undefined;
+					progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+
+					const finalTranscriptText =
+						summary.lastOutcome.responseIsAuthoritative || structuredOutput?.status === "valid"
+							? truncatedOutput
+							: truncateTail(summary.finalStepUnrecordedText, {
+									maxBytes: MAX_OUTPUT_BYTES,
+									maxLines: MAX_OUTPUT_LINES,
+								}).content;
+					if (truncatedOutput) {
+						this.recordAssistantMessage(truncatedOutput);
 					}
+					await transcript?.finish({
+						status: progress.status,
+						text: finalTranscriptText,
+						errorMessage: error,
+						modelDisplay: progress.resolvedModel,
+						usage: summary.finalStepResidualUsage,
+						durationMs: summary.finalStepDurationMs,
+					});
+
+					// Stop accepting in-turn input BEFORE terminal observers and `agent_end` so late
+					// messages route cleanly to the wake queue instead of being stranded.
+					this.#inActiveTurn = false;
+					this.promoteLatePendingToWakeTurns();
+
+					scheduleProgress(true);
+					emitSubagentFrameSafely(
+						options.eventBus,
+						options.subagentEventBus,
+						TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+						{
+							id: options.id,
+							agent: options.agent.name,
+							parentToolCallId: options.parentToolCallId,
+							detached: true,
+							agentSource: options.agent.source,
+							description: options.description,
+							...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
+							status: progress.status,
+							index,
+						},
+						{ id: this.id, status: progress.status },
+					);
+					if (outputPath) {
+						invokeObserverSafely("agy follow-up setHistory failed", { id: this.id }, () => {
+							AgentRegistry.global().setHistory(this.id, { outputPath });
+						});
+					}
+
+					return {
+						index,
+						id: options.id,
+						agent: options.agent.name,
+						agentSource: options.agent.source,
+						task: options.message,
+						description: options.description,
+						exitCode,
+						output: truncatedOutput,
+						stderr: summary.lastOutcome.stderr || error || "",
+						truncated,
+						...(structuredOutput ? { structuredOutput } : {}),
+						durationMs: Math.max(0, Date.now() - startTime),
+						tokens: summary.completedInputTokens + summary.completedOutputTokens,
+						requests: summary.completedRequests,
+						contextTokens: progress.contextTokens,
+						modelRole: options.modelRole,
+						resolvedModel: progress.resolvedModel,
+						resolvedModelIdentity: progress.resolvedModelIdentity,
+						error,
+						...(wasAborted ? { aborted: true, abortReason } : {}),
+						usage: {
+							input: summary.completedInputTokens,
+							output: summary.completedOutputTokens,
+							cacheRead: summary.completedCacheReadTokens,
+							cacheWrite: 0,
+							totalTokens:
+								summary.completedInputTokens + summary.completedOutputTokens + summary.completedCacheReadTokens,
+							cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+						},
+						outputPath,
+						outputMeta,
+					};
+				} finally {
+					if (progressTimer) {
+						clearTimeout(progressTimer);
+						progressTimer = null;
+					}
+					this.#inActiveTurn = false;
+					combinedAbort.dispose();
+					await transcript?.close().catch(() => {});
+					this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
+					if (this.#wakeQueue.length === 0 || this.#disposed) {
+						this.setRunState("idle");
+					}
+					releaseWakeHold();
 				}
-				break;
-			}
-			const wasAborted = lastOutcome.aborted || combinedAbort.signal.aborted;
-			const status: "completed" | "failed" | "aborted" = wasAborted
-				? "aborted"
-				: lastOutcome.exitCode === 0
-					? "completed"
-					: "failed";
-			if (lastOutcome.response) {
-				this.recordAssistantMessage(lastOutcome.response);
-			}
-			await transcript?.finish({
-				status,
-				text: lastOutcome.response,
-				errorMessage: lastOutcome.error,
-				modelDisplay: this.#resolvedModel,
-				usage: buildTranscriptUsage(totalInput, totalOutput, totalCacheRead),
-				durationMs: Math.max(0, Date.now() - startTime),
 			});
-			const truncatedResult = truncateTail(lastOutcome.response, {
-				maxBytes: MAX_OUTPUT_BYTES,
-				maxLines: MAX_OUTPUT_LINES,
-			});
-			return {
-				index,
-				id: options.id,
-				agent: options.agent.name,
-				agentSource: options.agent.source,
-				task: options.message,
-				description: options.description,
-				exitCode: wasAborted ? 1 : lastOutcome.exitCode,
-				output: truncatedResult.content,
-				stderr: lastOutcome.stderr || lastOutcome.error || "",
-				truncated: Boolean(truncatedResult.truncated),
-				durationMs: Math.max(0, Date.now() - startTime),
-				tokens: totalInput + totalOutput,
-				requests: totalRequests,
-				modelRole: options.modelRole,
-				resolvedModel: this.#resolvedModel,
-				resolvedModelIdentity: this.#resolvedModel,
-				error: wasAborted ? (lastOutcome.abortReason ?? lastOutcome.error ?? "Cancelled") : lastOutcome.error,
-				...(wasAborted ? { aborted: true, abortReason: lastOutcome.abortReason ?? "Cancelled" } : {}),
-				usage: {
-					input: totalInput,
-					output: totalOutput,
-					cacheRead: totalCacheRead,
-					cacheWrite: 0,
-					totalTokens: totalInput + totalOutput + totalCacheRead,
-					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
-				},
-			};
-		} finally {
-			combinedAbort.dispose();
-			await transcript?.close().catch(() => {});
-			this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
-			if (this.#wakeQueue.length === 0 || this.#disposed) {
-				this.setRunState("idle");
+		} catch (err) {
+			if (options.signal?.aborted) {
+				const reason = abortReasonOf(options.signal, "Cancelled");
+				return {
+					index,
+					id: options.id,
+					agent: options.agent.name,
+					agentSource: options.agent.source,
+					task: options.message,
+					description: options.description,
+					exitCode: 1,
+					output: "",
+					stderr: reason,
+					truncated: false,
+					durationMs: Math.max(0, Date.now() - startTime),
+					tokens: 0,
+					requests: 0,
+					modelRole: options.modelRole,
+					resolvedModel: this.#resolvedModel,
+					resolvedModelIdentity: this.#resolvedModel,
+					error: reason,
+					aborted: true,
+					abortReason: reason,
+				};
 			}
+			throw err;
 		}
 	}
 
@@ -2234,6 +3065,8 @@ class AgySessionController {
 	async dispose(): Promise<void> {
 		if (this.#disposed) return;
 		this.#disposed = true;
+		this.#inActiveTurn = false;
+		this.#admissionClosed = true;
 		for (const fn of this.#disposers.splice(0)) {
 			try {
 				fn();
@@ -2247,229 +3080,113 @@ class AgySessionController {
 	}
 
 	async #pumpWakeQueue(): Promise<void> {
-		while (this.#wakeQueue.length > 0 && !this.#disposed) {
+		while (this.#wakeQueue.length > 0 && !this.#disposed && !this.#admissionClosed) {
 			const item = this.#wakeQueue.shift()!;
-			// Fresh abort controller per wake turn so an earlier aborted wake does not poison a reopened turn.
-			if (this.#runAbortController.signal.aborted) {
-				this.#runAbortController = new AbortController();
-			}
-			this.setRunState("running");
-			this.emitSessionEvent({ type: "agent_start" });
-			let wakeTranscript: AgyTranscriptWriter | undefined;
-			let finalReply = "";
-			let wakeError: string | undefined;
-			let wakeStatus: "completed" | "failed" | "aborted" = "completed";
-			try {
-				if (this.#transcriptPath) {
-					wakeTranscript = await AgyTranscriptWriter.openForAppend({
-						filePath: this.#transcriptPath,
-						agentId: this.id,
-						initialModel: this.#resolvedModel,
-					});
+			await this.#withTurnLock(undefined, async () => {
+				if (this.#disposed || this.#admissionClosed) {
+					item.reject?.(new Error("agy subagent session is disposed"));
+					return;
 				}
-				const deadlineMs = this.maxRuntimeMs > 0 ? Date.now() + this.maxRuntimeMs : undefined;
-				let currentPrompt = item.text;
-				let lastOutcome: StepRunOutcome | undefined;
-
-				while (!this.#disposed && !this.#runAbortController.signal.aborted) {
-					wakeTranscript?.recordUserPrompt(currentPrompt);
-					this.recordUserMessage(currentPrompt);
-					let wakeToolSeq = 0;
-					const stepId = ++this.#wakeStepSeq;
-					const activeToolsByStep = new Map<number, { callId: string; tool: string }>();
-					const unindexedTools: Array<{ callId: string; tool: string }> = [];
-
-					const stepPromise = runSingleAgyStep({
-						binary: this.binary,
-						cwd: this.cwd,
-						model: this.configuredModel,
-						conversationId: this.#conversationId,
-						additionalDirectories: this.additionalDirectories,
-						promptText: currentPrompt,
-						id: this.id,
-						stepIndex: stepId,
+				if (this.#runAbortController.signal.aborted) {
+					this.#runAbortController = new AbortController();
+				}
+				this.#inActiveTurn = true;
+				this.setRunState("running");
+				this.emitSessionEvent({ type: "agent_start" });
+				let wakeTranscript: AgyTranscriptWriter | undefined;
+				let finalReply = "";
+				let wakeError: string | undefined;
+				let wakeStatus: "completed" | "failed" | "aborted" = "completed";
+				try {
+					if (this.#transcriptPath) {
+						wakeTranscript = await AgyTranscriptWriter.openForAppend({
+							filePath: this.#transcriptPath,
+							agentId: this.id,
+							initialModel: this.#resolvedModel,
+						});
+					}
+					const deadlineMs = this.maxRuntimeMs > 0 ? Date.now() + this.maxRuntimeMs : undefined;
+					const summary = await this.executeTurnSequence({
+						steps: [
+							{
+								promptText: item.text,
+								transcriptPrompt: item.text,
+								isFinalStep: true,
+							},
+						],
 						abortSignal: this.#runAbortController.signal,
 						deadlineMs,
 						maxRuntimeMs: this.maxRuntimeMs,
-						onProcessAttached: control => this.attachProcess(control),
-						onProcessDetached: () => this.detachProcess(),
-						onConversationId: cid => {
-							this.setConversationId(cid);
-							wakeTranscript?.recordAgySession(cid);
-						},
-						onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
-							if (prevResult?.response) {
-								wakeTranscript?.recordAssistantTurn({
-									text: prevResult.response,
-									stopReason: "stop",
-								});
-								this.recordAssistantMessage(prevResult.response);
-							}
-							wakeTranscript?.recordUserPrompt(nextPrompt);
-							this.recordUserMessage(nextPrompt);
-						},
-						drainQueuedFollowUps: () => this.drainQueuedFollowUps(),
-						hasPendingSteer: () => this.hasPendingSteer,
-						onEvent: ev => {
-							if (ev.event === "init") {
-								if (ev.conversation_id) {
-									this.setConversationId(ev.conversation_id);
-									wakeTranscript?.recordAgySession(ev.conversation_id);
-								}
-								if (ev.init?.model) {
-									const display = formatResolvedAgyModel(ev.init.model);
-									this.setResolvedModel(display);
-									wakeTranscript?.recordModelChange(display);
-								}
-								return;
-							}
-							if (ev.event === "step_update" && ev.step_update) {
-								const su = ev.step_update;
-								if (su.conversation_id) {
-									this.setConversationId(su.conversation_id);
-									wakeTranscript?.recordAgySession(su.conversation_id);
-								}
-								if (su.step_type === "tool") {
-									const toolName = su.tool_name || su.tool_info?.name || "tool";
-									if (su.state === "ACTIVE") {
-										const existing =
-											su.step_index !== undefined ? activeToolsByStep.get(su.step_index) : undefined;
-										if (!existing) {
-											const callId = `agy-wake-${stepId}-${++wakeToolSeq}`;
-											const entry = { callId, tool: toolName };
-											if (su.step_index !== undefined) activeToolsByStep.set(su.step_index, entry);
-											else unindexedTools.push(entry);
-											const summarized = summarizeToolArgs(su.tool_info?.parameters, this.cwd);
-											this.noteToolStart(callId);
-											wakeTranscript?.recordToolStart({
-												callId,
-												toolName,
-												toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, summarized.args),
-												intent: summarized.args ? `${toolName}: ${summarized.args}` : toolName,
-											});
-										}
-									} else if (su.state === "DONE") {
-										let prior: { callId: string; tool: string } | undefined;
-										if (su.step_index !== undefined) {
-											prior = activeToolsByStep.get(su.step_index);
-											activeToolsByStep.delete(su.step_index);
-										} else {
-											prior = unindexedTools.shift();
-										}
-										const callId = prior?.callId ?? `agy-wake-${stepId}-${++wakeToolSeq}`;
-										this.noteToolDone(callId);
-										wakeTranscript?.recordToolResult({
-											callId,
-											toolName,
-											output: su.tool_info?.output ?? "",
-										});
-									}
-								}
-							}
-						},
+						transcript: wakeTranscript,
+						callIdNamespace: `agy-wake-${++this.#turnStepSeq}`,
 					});
-					this.trackStepPromise(stepPromise);
-					lastOutcome = await stepPromise;
-
-					this.addUsage(
-						lastOutcome.usage.inputTokens,
-						lastOutcome.usage.outputTokens,
-						lastOutcome.usage.cacheReadTokens,
-					);
-					if (lastOutcome.conversationId) {
-						this.setConversationId(lastOutcome.conversationId);
-						wakeTranscript?.recordAgySession(lastOutcome.conversationId);
-					}
-					if (lastOutcome.model) {
-						const display = formatResolvedAgyModel(lastOutcome.model);
-						this.setResolvedModel(display);
-						wakeTranscript?.recordModelChange(display);
-					}
-
-					if (lastOutcome.aborted || this.#runAbortController.signal.aborted || this.#disposed) {
+					const wasAborted =
+						summary.runtimeExceeded || summary.lastOutcome.aborted || this.#runAbortController.signal.aborted;
+					finalReply = summary.lastOutcome.response;
+					if (wasAborted) {
 						wakeStatus = "aborted";
-						wakeError = lastOutcome.abortReason ?? lastOutcome.error ?? "Cancelled";
-						finalReply = lastOutcome.response;
-						break;
-					}
-
-					const pendingNext = this.drainAllPendingMessages(lastOutcome.unstartedFollowUps);
-					if ((lastOutcome.interruptedForSteer || pendingNext.length > 0) && this.#conversationId) {
-						if (!lastOutcome.interruptedForSteer && lastOutcome.response) {
-							wakeTranscript?.recordAssistantTurn({
-								text: lastOutcome.response,
-								stopReason: "stop",
-							});
-							this.recordAssistantMessage(lastOutcome.response);
-						}
-						if (pendingNext.length > 0) {
-							currentPrompt = pendingNext.join("\n\n");
-							continue;
-						}
-					}
-
-					finalReply = lastOutcome.response;
-					if (lastOutcome.exitCode !== 0) {
+						wakeError = summary.lastOutcome.abortReason ?? summary.lastOutcome.error ?? "Cancelled";
+					} else if (summary.lastOutcome.exitCode !== 0) {
 						wakeStatus = "failed";
-						wakeError = lastOutcome.error ?? `agy exited with code ${lastOutcome.exitCode}`;
+						wakeError = summary.lastOutcome.error ?? `agy exited with code ${summary.lastOutcome.exitCode}`;
 					} else {
 						wakeStatus = "completed";
 					}
-					break;
-				}
+					if (finalReply) {
+						this.recordAssistantMessage(finalReply);
+					}
+					await wakeTranscript?.finish({
+						status: wakeStatus,
+						text: finalReply,
+						errorMessage: wakeError,
+						modelDisplay: this.#resolvedModel,
+						usage: summary.finalStepResidualUsage,
+						durationMs: summary.finalStepDurationMs,
+					});
 
-				if (finalReply) {
-					this.recordAssistantMessage(finalReply);
-				}
-				await wakeTranscript?.finish({
-					status: wakeStatus,
-					text: finalReply,
-					errorMessage: wakeError,
-					modelDisplay: this.#resolvedModel,
-					usage: lastOutcome
-						? buildTranscriptUsage(
-								lastOutcome.usage.inputTokens,
-								lastOutcome.usage.outputTokens,
-								lastOutcome.usage.cacheReadTokens,
-							)
-						: undefined,
-					durationMs: lastOutcome?.durationMs,
-				});
+					// Stop accepting in-turn input BEFORE emitting `agent_end` or relaying so any
+					// synchronous reply/message delivered inside `agent_end` enters `#wakeQueue`
+					// and runs on the very next loop iteration instead of being stranded at idle.
+					this.#inActiveTurn = false;
+					this.promoteLatePendingToWakeTurns();
 
-				if (item.relayTo && !this.#disposed) {
-					const body =
-						wakeStatus === "completed" && finalReply.trim()
-							? finalReply
-							: wakeError
-								? `[agy subagent ${wakeStatus}: ${wakeError}]`
-								: finalReply || `[agy subagent ${wakeStatus}]`;
-					try {
-						await IrcBus.global().send({
-							from: this.id,
-							to: item.relayTo.to,
-							body,
-							replyTo: item.relayTo.replyTo,
-							wakeRelay: true,
-						});
-					} catch (err) {
-						logger.warn("agy wake relay failed", {
-							id: this.id,
-							to: item.relayTo.to,
-							error: formatErrorMessage(err),
-						});
+					if (item.relayTo && !this.#disposed) {
+						const body =
+							wakeStatus === "completed" && finalReply.trim()
+								? finalReply
+								: wakeError
+									? `[agy subagent ${wakeStatus}: ${wakeError}]`
+									: finalReply || `[agy subagent ${wakeStatus}]`;
+						try {
+							await IrcBus.global().send({
+								from: this.id,
+								to: item.relayTo.to,
+								body,
+								replyTo: item.relayTo.replyTo,
+								wakeRelay: true,
+							});
+						} catch (err) {
+							logger.warn("agy wake relay failed", {
+								id: this.id,
+								to: item.relayTo.to,
+								error: formatErrorMessage(err),
+							});
+						}
+					}
+					item.resolve?.();
+				} catch (err) {
+					await wakeTranscript?.close().catch(() => {});
+					item.reject?.(err);
+					logger.warn("agy wake turn failed", { id: this.id, error: formatErrorMessage(err) });
+				} finally {
+					this.#inActiveTurn = false;
+					this.promoteLatePendingToWakeTurns();
+					this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
+					if (this.#wakeQueue.length === 0 || this.#disposed) {
+						this.setRunState("idle");
 					}
 				}
-				item.resolve?.();
-			} catch (err) {
-				await wakeTranscript?.close().catch(() => {});
-				item.reject?.(err);
-				logger.warn("agy wake turn failed", { id: this.id, error: formatErrorMessage(err) });
-			} finally {
-				this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
-				if (this.#wakeQueue.length === 0 || this.#disposed) {
-					this.setRunState("idle");
-				}
-			}
+			});
 		}
 	}
 }
@@ -2488,8 +3205,10 @@ class AgySessionHandle implements AgentSessionHandle {
 	constructor(controller: AgySessionController) {
 		this.#controller = controller;
 		// Distinct prefix from `${currentThreadId()}:` so `isLocalAgentSession()` never mistakes this
-		// external-CLI handle for a concrete in-process `AgentSession` instance.
+		// external-CLI handle for a concrete in-process `AgentSession` instance, while registering it
+		// in the local bridged-handle directory so worker threads can still read main's registry refs.
 		this.instanceKey = `agy:${crypto.randomUUID()}`;
+		registerLocalBridgedHandle(this);
 		this.agent = {
 			isPaused: false,
 			state: {
@@ -2568,12 +3287,12 @@ class AgySessionHandle implements AgentSessionHandle {
 	}
 
 	async deliverIrcMessage(msg: IrcMessage): Promise<"injected" | "woken"> {
-		if (this.#controller.isDisposed) {
-			throw new Error("Recipient agy subagent session is disposed.");
+		if (this.#controller.isClosedForInput) {
+			throw new Error("Recipient agy subagent session is closed.");
 		}
 		const shouldRelay = msg.wakeRelay !== true && msg.broadcast !== true && msg.progress !== true;
 		const relayTo = shouldRelay ? { to: msg.from, replyTo: msg.id } : undefined;
-		if (this.#controller.isRunning) {
+		if (this.#controller.isInActiveTurn) {
 			const directParent =
 				!msg.progress && !msg.broadcast && isParentOrAncestor(msg.from, this.#controller.parentId);
 			if (directParent) {
@@ -2600,13 +3319,13 @@ class AgySessionHandle implements AgentSessionHandle {
 	}
 
 	async prompt(text: string, options?: PromptOptions): Promise<boolean> {
-		if (this.#controller.isDisposed) {
+		if (this.#controller.isClosedForInput) {
 			if (options?.throwOnDrop) {
-				throw new Error("agy subagent session is disposed");
+				throw new Error("agy subagent session is closed");
 			}
 			return false;
 		}
-		if (this.#controller.isRunning) {
+		if (this.#controller.isInActiveTurn) {
 			if (options?.streamingBehavior === "followUp" || options?.streamingBehavior === "aside") {
 				this.#controller.enqueueFollowUp(text);
 			} else {
@@ -2620,10 +3339,10 @@ class AgySessionHandle implements AgentSessionHandle {
 	}
 
 	async steer(text: string, _images?: ImageContent[], _options?: SteerOptions): Promise<void> {
-		if (this.#controller.isDisposed) {
-			throw new Error("agy subagent session is disposed");
+		if (this.#controller.isClosedForInput) {
+			throw new Error("agy subagent session is closed");
 		}
-		if (this.#controller.isRunning) {
+		if (this.#controller.isInActiveTurn) {
 			this.#controller.enqueueSteer(text);
 			return;
 		}
@@ -2659,14 +3378,6 @@ class AgySessionHandle implements AgentSessionHandle {
 
 export function isAgySessionHandle(session: AgentSessionHandle): session is AgySessionHandle {
 	return session instanceof AgySessionHandle;
-}
-
-export function runAgyFollowUpTurn(
-	session: AgySessionHandle,
-	options: FollowUpTurnOptions,
-	startTime: number,
-): Promise<SingleResult> {
-	return session.runFollowUpTurn(options, startTime);
 }
 
 function createAgyReviver(params: {
@@ -2936,483 +3647,63 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	scheduleProgress(true);
 
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
-	let runtimeExceeded = false;
-	let conversationId: string | undefined;
-	let lastOutcome: StepRunOutcome = {
-		exitCode: 1,
-		response: "",
-		responseIsAuthoritative: false,
-		usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
-		durationMs: 0,
-		stderr: "",
-		aborted: false,
-		timedOut: false,
+	let summary: TurnSequenceSummary = {
+		lastOutcome: {
+			exitCode: 1,
+			response: "",
+			responseIsAuthoritative: false,
+			usage: { requests: 0, inputTokens: 0, outputTokens: 0, cacheReadTokens: 0 },
+			durationMs: 0,
+			stderr: "",
+			aborted: false,
+			timedOut: false,
+		},
+		runtimeExceeded: false,
+		completedRequests: 0,
+		completedInputTokens: 0,
+		completedOutputTokens: 0,
+		completedCacheReadTokens: 0,
+		finalStepUnrecordedText: "",
 	};
-	// Accumulated totals across completed steps; live step deltas are tracked inside each step and added on step end.
-	let completedRequests = 0;
-	let completedInputTokens = 0;
-	let completedOutputTokens = 0;
-	let completedCacheReadTokens = 0;
-	// Unrecorded tail text and residual usage for the terminal step so `finish()` neither replays
-	// pre-tool chatter on streamed fallbacks nor double-counts per-turn usage.
-	let finalStepUnrecordedText = "";
-	let finalStepResidualUsage: AgyTranscriptUsage | undefined;
-	let finalStepDurationMs: number | undefined;
 
 	try {
-		let jsonSchemaStr: string | undefined;
-		let jsonPromptInstruction: string | undefined;
-		if (outputSchema !== undefined) {
-			const { jsonSchema, normalized, error: schemaErr } = buildOutputValidator(outputSchema);
-			if (!schemaErr && normalized !== undefined) {
-				if (jsonSchema && jsonSchema.type === "object") {
-					// Official `agy --json-schema` requires root `"type": "object"`.
-					jsonSchemaStr = JSON.stringify(jsonSchema);
-				} else if (jsonSchema && Object.keys(jsonSchema).length > 0) {
-					jsonPromptInstruction = buildJsonSchemaPromptInstruction(JSON.stringify(jsonSchema));
-				} else {
-					// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
-					// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
-					jsonPromptInstruction = buildJsonSchemaPromptInstruction();
-				}
-			}
-		}
-
+		const { jsonSchemaStr, jsonPromptInstruction } = prepareOutputSchema(outputSchema);
 		const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
-		for (let i = 0; i < stepPrompts.length; i++) {
-			if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
-				runtimeExceeded = true;
-				break;
-			}
+		const preparedSteps = stepPrompts.map((stepPrompt, i) => {
 			const isFinalStep = i === stepPrompts.length - 1;
-			const stepPrompt = stepPrompts[i]!;
 			const basePrompt = buildAgyPrompt(options, stepPrompt, i === 0);
-			let currentTranscriptPrompt = stepPrompt;
-			let currentStepPrompt =
-				isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt;
-			let steerAttempt = 0;
-			let stepFailed = false;
-
-			while (true) {
-				if (deadlineMs !== undefined && Date.now() >= deadlineMs) {
-					runtimeExceeded = true;
-					stepFailed = true;
-					break;
-				}
-				if (combinedAbort.signal.aborted) {
-					stepFailed = true;
-					break;
-				}
-				transcript?.recordUserPrompt(currentTranscriptPrompt);
-				controller.recordUserMessage(currentTranscriptPrompt);
-				let liveStepRequests = 0;
-				let liveStepTokens = 0;
-				let recordedStepInput = 0;
-				let recordedStepOutput = 0;
-				let recordedStepCacheRead = 0;
-				let pendingTurnUsage: { input: number; output: number; cacheRead: number; durationMs?: number } | undefined;
-				let toolCallSeq = 0;
-				let pendingAssistantText = "";
-				const stepCallPrefix = steerAttempt === 0 ? `${i}` : `${i}-s${steerAttempt}`;
-				const activeToolsByStep = new Map<
-					number,
-					{ callId: string; tool: string; args: string; argsKey?: string; startMs: number }
-				>();
-				const unindexedToolQueue: Array<{
-					callId: string;
-					tool: string;
-					args: string;
-					argsKey?: string;
-					startMs: number;
-				}> = [];
-
-				const consumePendingTurnUsage = (): { usage?: AgyTranscriptUsage; durationMs?: number } => {
-					if (!pendingTurnUsage) return {};
-					const current = pendingTurnUsage;
-					pendingTurnUsage = undefined;
-					recordedStepInput += current.input;
-					recordedStepOutput += current.output;
-					recordedStepCacheRead += current.cacheRead;
-					return {
-						usage: buildTranscriptUsage(current.input, current.output, current.cacheRead),
-						durationMs: current.durationMs,
-					};
-				};
-
-				const stepPromise = runSingleAgyStep({
-					binary: config.binary,
-					cwd: runCwd,
-					model: config.model,
-					conversationId,
-					additionalDirectories: additionalDirs,
-					jsonSchema: isFinalStep ? jsonSchemaStr : undefined,
-					promptText: currentStepPrompt,
-					id,
-					stepIndex: i * 100 + steerAttempt,
-					abortSignal: combinedAbort.signal,
-					deadlineMs,
-					maxRuntimeMs,
-					onProcessAttached: control => controller.attachProcess(control),
-					onProcessDetached: () => controller.detachProcess(),
-					onConversationId: cid => {
-						conversationId = cid;
-						controller.setConversationId(cid);
-						transcript?.recordAgySession(cid);
-					},
-					onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
-						const prevReply =
-							typeof prevResult?.response === "string" ? prevResult.response : pendingAssistantText;
-						if (prevReply) {
-							transcript?.recordAssistantTurn({
-								text: prevReply,
-								stopReason: "stop",
-							});
-							controller.recordAssistantMessage(prevReply);
-						}
-						pendingAssistantText = "";
-						transcript?.recordUserPrompt(nextPrompt);
-						controller.recordUserMessage(nextPrompt);
-					},
-					drainQueuedFollowUps: () => controller.drainQueuedFollowUps(),
-					hasPendingSteer: () => controller.hasPendingSteer,
-					onEvent: ev => {
-						if (ev.event === "init") {
-							if (ev.conversation_id) {
-								conversationId = ev.conversation_id;
-								controller.setConversationId(ev.conversation_id);
-								transcript?.recordAgySession(ev.conversation_id);
-							}
-							if (ev.init?.model) {
-								updateResolvedModel(ev.init.model);
-								scheduleProgress();
-							}
-							return;
-						}
-						if (ev.event === "step_update" && ev.step_update) {
-							const su = ev.step_update;
-							if (su.conversation_id) {
-								conversationId = su.conversation_id;
-								controller.setConversationId(su.conversation_id);
-								transcript?.recordAgySession(su.conversation_id);
-							}
-							if (su.step_type === "tool") {
-								const frameToolName = su.tool_name || su.tool_info?.name;
-								const stepKey = su.step_index;
-								if (su.state === "ACTIVE") {
-									const toolName = frameToolName || "tool";
-									const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
-									const existing = stepKey !== undefined ? activeToolsByStep.get(stepKey) : undefined;
-									if (existing) {
-										// Repeated ACTIVE frames for the same step_index update live progress without
-										// minting duplicate call IDs or transcript entries.
-										if (frameToolName) existing.tool = frameToolName;
-										if (summarized.args) {
-											existing.args = summarized.args;
-											existing.argsKey = summarized.argsKey;
-										}
-										progress.currentTool = existing.tool;
-										progress.currentToolArgs = existing.args;
-										progress.currentToolArgsKey = existing.argsKey;
-										progress.currentToolStartMs = existing.startMs;
-										progress.streaming = undefined;
-										registry.setActivity(
-											id,
-											existing.args ? `${existing.tool}: ${existing.args}` : existing.tool,
-											registeredRef,
-										);
-										scheduleProgress();
-										return;
-									}
-									const startedAt = Date.now();
-									const callId = `agy-call-${stepCallPrefix}-${++toolCallSeq}`;
-									const activeEntry = {
-										callId,
-										tool: toolName,
-										args: summarized.args,
-										argsKey: summarized.argsKey,
-										startMs: startedAt,
-									};
-									if (stepKey !== undefined) {
-										activeToolsByStep.set(stepKey, activeEntry);
-									} else {
-										unindexedToolQueue.push(activeEntry);
-									}
-									const intent = summarized.args ? `${toolName}: ${summarized.args}` : toolName;
-									const attached = consumePendingTurnUsage();
-									controller.noteToolStart(callId);
-									registry.setActivity(id, intent, registeredRef);
-									transcript?.recordToolStart({
-										callId,
-										toolName,
-										toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, summarized.args),
-										intent,
-										precedingText: pendingAssistantText,
-										usage: attached.usage,
-										durationMs: attached.durationMs,
-									});
-									pendingAssistantText = "";
-									progress.currentTool = toolName;
-									progress.currentToolArgs = summarized.args;
-									progress.currentToolArgsKey = summarized.argsKey;
-									progress.currentToolStartMs = startedAt;
-									progress.streaming = undefined;
-									scheduleProgress();
-								} else if (su.state === "DONE") {
-									let prior:
-										| { callId: string; tool: string; args: string; argsKey?: string; startMs: number }
-										| undefined;
-									if (stepKey !== undefined) {
-										prior = activeToolsByStep.get(stepKey);
-										activeToolsByStep.delete(stepKey);
-									} else if (frameToolName) {
-										const matchIdx = unindexedToolQueue.findIndex(entry => entry.tool === frameToolName);
-										if (matchIdx !== -1) {
-											prior = unindexedToolQueue.splice(matchIdx, 1)[0];
-										}
-									} else {
-										prior = unindexedToolQueue.shift();
-									}
-									const resolvedName = frameToolName || prior?.tool || "tool";
-									const summarized = summarizeToolArgs(su.tool_info?.parameters, runCwd);
-									const resolvedArgs = summarized.args || prior?.args || "";
-									const resolvedArgsKey = summarized.argsKey ?? prior?.argsKey;
-									let callId = prior?.callId;
-									if (!callId) {
-										callId = `agy-call-${stepCallPrefix}-${++toolCallSeq}`;
-										const intent = resolvedArgs ? `${resolvedName}: ${resolvedArgs}` : resolvedName;
-										const attached = consumePendingTurnUsage();
-										controller.noteToolStart(callId);
-										transcript?.recordToolStart({
-											callId,
-											toolName: resolvedName,
-											toolArgs: sanitizeTranscriptToolArgs(su.tool_info?.parameters, resolvedArgs),
-											intent,
-											precedingText: pendingAssistantText,
-											usage: attached.usage,
-											durationMs: attached.durationMs,
-										});
-										pendingAssistantText = "";
-									}
-									controller.noteToolDone(callId);
-									transcript?.recordToolResult({
-										callId,
-										toolName: resolvedName,
-										output: su.tool_info?.output ?? "",
-									});
-									progress.toolCount += 1;
-									progress.recentTools.push({
-										tool: resolvedName,
-										args: resolvedArgs,
-										argsKey: resolvedArgsKey,
-										endMs: Date.now(),
-									});
-									if (progress.recentTools.length > RECENT_TOOLS_LIMIT) {
-										progress.recentTools.shift();
-									}
-									const remaining = activeToolsByStep.values().next().value ?? unindexedToolQueue[0];
-									if (remaining) {
-										progress.currentTool = remaining.tool;
-										progress.currentToolArgs = remaining.args;
-										progress.currentToolArgsKey = remaining.argsKey;
-										progress.currentToolStartMs = remaining.startMs;
-									} else {
-										progress.currentTool = undefined;
-										progress.currentToolArgs = undefined;
-										progress.currentToolArgsKey = undefined;
-										progress.currentToolStartMs = undefined;
-									}
-									if (options.onToolResult) {
-										invokeObserverSafely("agy onToolResult callback failed", { id, tool: resolvedName }, () =>
-											options.onToolResult?.({
-												tool: resolvedName,
-												text: su.tool_info?.output ?? "",
-												isError: false,
-											}),
-										);
-									}
-									scheduleProgress();
-								}
-							} else if (su.step_type === "agent_response") {
-								if (pendingTurnUsage && (su.state === "ACTIVE" || su.text_delta || su.state === "DONE")) {
-									// Flush an earlier turn's pending usage before accumulating a new turn's text or usage.
-									const flushed = consumePendingTurnUsage();
-									transcript?.recordAssistantTurn({
-										text: pendingAssistantText.trim(),
-										stopReason: "stop",
-										usage: flushed.usage,
-										durationMs: flushed.durationMs,
-									});
-									pendingAssistantText = "";
-								}
-								if (su.text_delta) {
-									appendRecentText(su.text_delta);
-									pendingAssistantText += su.text_delta;
-								}
-								if (su.state === "ACTIVE") {
-									progress.streaming = { kind: "text" };
-									scheduleProgress();
-								} else if (su.state === "DONE") {
-									progress.streaming = undefined;
-									liveStepRequests += 1;
-									if (su.usage) {
-										const inp = su.usage.input_tokens ?? 0;
-										const out = su.usage.output_tokens ?? 0;
-										const cacheRead = su.usage.cache_read_tokens ?? 0;
-										liveStepTokens += inp + out;
-										const ctx = inp + cacheRead;
-										if (ctx > 0) progress.contextTokens = ctx;
-										pendingTurnUsage = {
-											input: inp,
-											output: out,
-											cacheRead,
-											durationMs:
-												su.duration_seconds !== undefined
-													? Math.max(0, Math.round(su.duration_seconds * 1000))
-													: undefined,
-										};
-									}
-									progress.requests = completedRequests + liveStepRequests;
-									progress.tokens = completedInputTokens + completedOutputTokens + liveStepTokens;
-									scheduleProgress();
-								}
-							}
-						} else if (ev.event === "result" && ev.result?.conversation_id) {
-							conversationId = ev.result.conversation_id;
-							controller.setConversationId(ev.result.conversation_id);
-							transcript?.recordAgySession(ev.result.conversation_id);
-						}
-					},
-				});
-				controller.trackStepPromise(stepPromise);
-				lastOutcome = await stepPromise;
-
-				// Fold reconciled per-step totals into run totals.
-				completedRequests += lastOutcome.usage.requests;
-				completedInputTokens += lastOutcome.usage.inputTokens;
-				completedOutputTokens += lastOutcome.usage.outputTokens;
-				completedCacheReadTokens += lastOutcome.usage.cacheReadTokens;
-				controller.addUsage(
-					lastOutcome.usage.inputTokens,
-					lastOutcome.usage.outputTokens,
-					lastOutcome.usage.cacheReadTokens,
-				);
-				progress.requests = completedRequests;
-				progress.tokens = completedInputTokens + completedOutputTokens;
-				if (lastOutcome.usage.lastContextTokens !== undefined) {
-					progress.contextTokens = lastOutcome.usage.lastContextTokens;
-				}
-				if (lastOutcome.timedOut) {
-					runtimeExceeded = true;
-				}
-
-				conversationId = lastOutcome.conversationId ?? conversationId;
-				if (conversationId) {
-					controller.setConversationId(conversationId);
-					transcript?.recordAgySession(conversationId);
-				}
-				updateResolvedModel(lastOutcome.model);
-
-				const remInput = Math.max(0, lastOutcome.usage.inputTokens - recordedStepInput);
-				const remOutput = Math.max(0, lastOutcome.usage.outputTokens - recordedStepOutput);
-				const remCacheRead = Math.max(0, lastOutcome.usage.cacheReadTokens - recordedStepCacheRead);
-				const hasResidualUsage =
-					remInput > 0 ||
-					remOutput > 0 ||
-					remCacheRead > 0 ||
-					(recordedStepInput === 0 &&
-						recordedStepOutput === 0 &&
-						recordedStepCacheRead === 0 &&
-						lastOutcome.usage.requests > 0);
-				const stepResidualUsage = hasResidualUsage
-					? buildTranscriptUsage(remInput, remOutput, remCacheRead)
-					: undefined;
-				const stepDurationMs = pendingTurnUsage?.durationMs ?? lastOutcome.durationMs;
-
-				if (lastOutcome.aborted || runtimeExceeded || combinedAbort.signal.aborted) {
-					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
-						? lastOutcome.response
-						: pendingAssistantText;
-					finalStepResidualUsage = stepResidualUsage;
-					finalStepDurationMs = stepDurationMs;
-					stepFailed = true;
-					break;
-				}
-
-				// If a mid-turn steer interrupted `agy` (or a steer/follow-up raced right as the turn finished),
-				// immediately resume the same `conversationId` with the steering prompt(s).
-				const pendingSteerMessages = controller.drainAllPendingMessages(lastOutcome.unstartedFollowUps);
-				if ((lastOutcome.interruptedForSteer || pendingSteerMessages.length > 0) && conversationId) {
-					if (!lastOutcome.interruptedForSteer) {
-						const stepReplyText = lastOutcome.responseIsAuthoritative
-							? lastOutcome.response
-							: pendingAssistantText;
-						if (stepReplyText || stepResidualUsage) {
-							transcript?.recordAssistantTurn({
-								text: stepReplyText,
-								stopReason: "stop",
-								usage: stepResidualUsage,
-								durationMs: stepDurationMs,
-							});
-							controller.recordAssistantMessage(stepReplyText);
-						}
-					}
-					if (pendingSteerMessages.length > 0) {
-						const combinedPrompt = pendingSteerMessages.join("\n\n");
-						currentTranscriptPrompt = combinedPrompt;
-						currentStepPrompt =
-							isFinalStep && jsonPromptInstruction
-								? `${combinedPrompt}\n\n${jsonPromptInstruction}`
-								: combinedPrompt;
-						steerAttempt += 1;
-						continue;
-					}
-				}
-
-				if (lastOutcome.exitCode !== 0) {
-					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
-						? lastOutcome.response
-						: pendingAssistantText;
-					finalStepResidualUsage = stepResidualUsage;
-					finalStepDurationMs = stepDurationMs;
-					stepFailed = true;
-					break;
-				}
-
-				// For intermediate steps in a multi-step run, record the step's completed reply
-				// before the next step's user prompt is appended.
-				if (!isFinalStep) {
-					const stepReplyText = lastOutcome.responseIsAuthoritative ? lastOutcome.response : pendingAssistantText;
-					if (stepReplyText || stepResidualUsage) {
-						transcript?.recordAssistantTurn({
-							text: stepReplyText,
-							stopReason: "stop",
-							usage: stepResidualUsage,
-							durationMs: stepDurationMs,
-						});
-						controller.recordAssistantMessage(stepReplyText);
-					}
-					pendingAssistantText = "";
-					finalStepUnrecordedText = "";
-					finalStepResidualUsage = undefined;
-					finalStepDurationMs = undefined;
-				} else {
-					finalStepUnrecordedText = lastOutcome.responseIsAuthoritative
-						? lastOutcome.response
-						: pendingAssistantText;
-					finalStepResidualUsage = stepResidualUsage;
-					finalStepDurationMs = stepDurationMs;
-				}
-				break;
-			}
-			if (stepFailed) break;
-		}
+			return {
+				transcriptPrompt: stepPrompt,
+				promptText: isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt,
+				isFinalStep,
+				jsonSchema: isFinalStep ? jsonSchemaStr : undefined,
+				jsonPromptInstruction: isFinalStep ? jsonPromptInstruction : undefined,
+			};
+		});
+		summary = await controller.executeTurnSequence({
+			steps: preparedSteps,
+			abortSignal: combinedAbort.signal,
+			deadlineMs,
+			maxRuntimeMs,
+			transcript,
+			progress,
+			onScheduleProgress: scheduleProgress,
+			onToolResult: options.onToolResult,
+			onTextDelta: appendRecentText,
+			onResolvedModel: updateResolvedModel,
+			activityRef: registeredRef,
+			callIdNamespace: "agy-call",
+		});
 	} catch (err) {
 		const message = formatErrorMessage(err);
-		lastOutcome = {
-			...lastOutcome,
-			exitCode: 1,
-			error: lastOutcome.error ?? message,
-			stderr: lastOutcome.stderr || message,
+		summary = {
+			...summary,
+			lastOutcome: {
+				...summary.lastOutcome,
+				exitCode: 1,
+				error: summary.lastOutcome.error ?? message,
+				stderr: summary.lastOutcome.stderr || message,
+			},
 		};
 	} finally {
 		if (progressTimer) {
@@ -3422,7 +3713,79 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		combinedAbort.dispose();
 	}
 
-	const wasAborted = runtimeExceeded || lastOutcome.aborted || Boolean(combinedAbort.signal.aborted);
+	const {
+		lastOutcome,
+		runtimeExceeded,
+		completedInputTokens,
+		completedOutputTokens,
+		completedCacheReadTokens,
+		finalStepUnrecordedText,
+		finalStepResidualUsage,
+		finalStepDurationMs,
+	} = summary;
+
+	// Atomically commit the terminal registry transition BEFORE any async artifact/transcript I/O or
+	// terminal progress callbacks so RPC `cancel_subagent` can never succeed while the same run reports
+	// completion, and one-shot teardown can never falsely acknowledge new mid-job messages.
+	const refAtCommit = registry.get(id);
+	let wasAborted =
+		runtimeExceeded ||
+		lastOutcome.aborted ||
+		Boolean(combinedAbort.signal.aborted) ||
+		registeredRef.status === "aborted";
+	let releaseWakeHold: (() => void) | undefined;
+	const adoptConversationId =
+		!wasAborted &&
+		options.keepAlive !== false &&
+		worktree === undefined &&
+		controller.conversationId !== undefined &&
+		refAtCommit === registeredRef
+			? controller.conversationId
+			: undefined;
+
+	if (adoptConversationId !== undefined) {
+		releaseWakeHold = controller.holdWakes();
+		controller.endActiveTurn();
+		if (registry.setStatus(id, "idle", registeredRef)) {
+			AgentLifecycleManager.global().adopt(
+				id,
+				{
+					idleTtlMs: cfgTaskAgentIdleTtlMs.get(settings),
+					revive: createAgyReviver({
+						id,
+						binary: config.binary,
+						model: config.model,
+						resolvedModel: progress.resolvedModel ?? initialResolvedModel,
+						cwd: runCwd,
+						additionalDirectories: additionalDirs,
+						artifactsDir: options.artifactsDir,
+						transcriptPath: transcript?.activePath,
+						parentId: options.parentAgentId,
+						maxRuntimeMs,
+						conversationId: adoptConversationId,
+					}),
+					onRelease: options.onRelease,
+				},
+				registeredRef,
+			);
+			onReleaseTransferred = true;
+			controller.promoteLatePendingToWakeTurns();
+		} else {
+			// An explicit cancel won the transition to `aborted`.
+			wasAborted = true;
+			releaseWakeHold();
+			releaseWakeHold = undefined;
+			controller.closeAdmission();
+		}
+	} else {
+		controller.closeAdmission();
+		if (!wasAborted && refAtCommit === registeredRef && registeredRef.status !== "aborted") {
+			registry.unregister(id, registeredRef);
+		} else if (registeredRef.status === "aborted") {
+			wasAborted = true;
+		}
+	}
+
 	const abortReason = wasAborted
 		? runtimeExceeded
 			? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
@@ -3487,10 +3850,8 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 	progress.streaming = undefined;
 	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
 
-	// Flush final assistant turn and `session_exit` to `<id>.jsonl` before announcing terminal
-	// lifecycle so observers (e.g. Herdr Chat view) immediately settle the subagent's status.
-	// When falling back to streamed text (no authoritative `result.response`), write only the
-	// unrecorded tail since the last tool call so pre-tool prose is never duplicated in the transcript.
+	// Flush final assistant turn and `session_exit` to `<id>.jsonl` before releasing any queued
+	// wake turns or announcing terminal lifecycle so observers immediately settle the subagent's status.
 	const finalTranscriptText =
 		lastOutcome.responseIsAuthoritative || structuredOutput?.status === "valid"
 			? truncatedOutput
@@ -3504,13 +3865,12 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		durationMs: finalStepDurationMs,
 	});
 
-	scheduleProgress(true);
-
 	const finalSessionFile = transcript?.activePath;
 	controller.setTranscriptPath(finalSessionFile);
 	if (truncatedOutput) {
 		controller.recordAssistantMessage(truncatedOutput);
 	}
+	scheduleProgress(true);
 	emitSubagentFrameSafely(
 		options.eventBus,
 		options.subagentEventBus,
@@ -3538,43 +3898,8 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		});
 	});
 
-	const adoptConversationId =
-		options.keepAlive !== false &&
-		worktree === undefined &&
-		!wasAborted &&
-		conversationId !== undefined &&
-		registry.get(id) === registeredRef &&
-		registeredRef.status !== "aborted"
-			? conversationId
-			: undefined;
-	if (adoptConversationId !== undefined) {
-		controller.setRunState("idle");
-		if (registry.setStatus(id, "idle", registeredRef)) {
-			AgentLifecycleManager.global().adopt(
-				id,
-				{
-					idleTtlMs: cfgTaskAgentIdleTtlMs.get(settings),
-					revive: createAgyReviver({
-						id,
-						binary: config.binary,
-						model: config.model,
-						resolvedModel: progress.resolvedModel ?? initialResolvedModel,
-						cwd: runCwd,
-						additionalDirectories: additionalDirs,
-						artifactsDir: options.artifactsDir,
-						transcriptPath: finalSessionFile,
-						parentId: options.parentAgentId,
-						maxRuntimeMs,
-						conversationId: adoptConversationId,
-					}),
-					onRelease: options.onRelease,
-				},
-				registeredRef,
-			);
-			onReleaseTransferred = true;
-			controller.promoteLatePendingToWakeTurns();
-		}
-	}
+	releaseWakeHold?.();
+
 	if (!onReleaseTransferred) {
 		await sessionHandle.dispose();
 		if (registry.get(id) === registeredRef && registeredRef.status !== "aborted") {

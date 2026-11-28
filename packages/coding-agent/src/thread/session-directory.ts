@@ -30,6 +30,16 @@ const localFinalizer = new FinalizationRegistry<string>(key => {
 });
 const localListeners = new Set<(session: AgentSession) => void>();
 
+/**
+ * Non-`AgentSession` local handles (e.g. main-homed external CLI subagent handles)
+ * that can cross the worker registry/session bridge without being misclassified as
+ * concrete `AgentSession` instances or published via `SessionPublisher`.
+ */
+const localBridgedHandles = new Map<string, WeakRef<AgentSessionHandle>>();
+const localBridgedHandleFinalizer = new FinalizationRegistry<string>(key => {
+	if (!localBridgedHandles.get(key)?.deref()) localBridgedHandles.delete(key);
+});
+
 const remoteHeld = new Map<string, AgentSessionHandle>();
 const remoteWeak = new Map<string, WeakRef<AgentSessionHandle>>();
 const remoteFinalizer = new FinalizationRegistry<string>(key => {
@@ -63,6 +73,28 @@ export function isRegisteredLocalSession(value: unknown): value is AgentSession 
 	if (typeof value !== "object" || value === null) return false;
 	const key: unknown = Reflect.get(value, "instanceKey");
 	return typeof key === "string" && findLocalSession(key) === value;
+}
+
+/**
+ * Register a non-`AgentSession` local {@link AgentSessionHandle} so the `"agent-session"`
+ * thread codec can pass it across the main↔worker registry bridge as a {@link SessionToken}
+ * without classifying it as a concrete `AgentSession`.
+ */
+export function registerLocalBridgedHandle(handle: AgentSessionHandle): void {
+	localBridgedHandles.set(handle.instanceKey, new WeakRef(handle));
+	localBridgedHandleFinalizer.register(handle, handle.instanceKey);
+}
+
+/** The live non-`AgentSession` bridged handle homed on this thread under `key`. */
+export function findLocalBridgedHandle(key: string): AgentSessionHandle | undefined {
+	return localBridgedHandles.get(key)?.deref();
+}
+
+/** Whether `value` is a non-`AgentSession` bridged handle registered on this thread. */
+export function isRegisteredLocalBridgedHandle(value: unknown): value is AgentSessionHandle {
+	if (typeof value !== "object" || value === null) return false;
+	const key: unknown = Reflect.get(value, "instanceKey");
+	return typeof key === "string" && findLocalBridgedHandle(key) === value;
 }
 
 /** Observe sessions constructed on this thread from now on; returns the unsubscribe function. */

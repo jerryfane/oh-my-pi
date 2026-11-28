@@ -483,7 +483,7 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this.proc.exitCode !== null || this.proc.signalCode !== null;
 	}
 
-	kill(reason?: Exception, gracefulMs?: number) {
+	kill(reason?: Exception, gracefulMs?: number, gracefulSignal: "SIGTERM" | "SIGINT" = "SIGTERM") {
 		if (reason && !this.#exitReasonPending) {
 			this.#exitReasonPending = reason;
 			// The normalized exit promise may already have resolved from a dead
@@ -513,7 +513,9 @@ export class ChildProcess<In extends InMask = InMask> {
 				if (graceMs < 0) escalate();
 				// A stop that fails part-way (a native handle that cannot be used)
 				// must not count as a finished termination: signal the subreaper directly.
-				const stop = this.#stopSubreaperTree(root, graceMs, escalated).catch(() => this.#signalChild(graceMs));
+				const stop = this.#stopSubreaperTree(root, graceMs, escalated, gracefulSignal).catch(() =>
+					this.#signalChild(graceMs, gracefulSignal),
+				);
 				this.#subreaperStop = { escalate };
 				this.#terminating = stop;
 				return;
@@ -553,13 +555,17 @@ export class ChildProcess<In extends InMask = InMask> {
 			this.#clearDrainTimer();
 		}
 		if (!this.proc.killed) {
-			const options =
-				gracefulMs === undefined
-					? this.#terminateGroup
-						? { group: true }
-						: undefined
-					: { gracefulMs, group: this.#terminateGroup };
-			this.#terminating = this.#terminateTree(options);
+			if (gracefulSignal === "SIGINT") {
+				this.#terminating = this.#signalChild(gracefulMs ?? 1000, "SIGINT");
+			} else {
+				const options =
+					gracefulMs === undefined
+						? this.#terminateGroup
+							? { group: true }
+							: undefined
+						: { gracefulMs, group: this.#terminateGroup };
+				this.#terminating = this.#terminateTree(options);
+			}
 		}
 	}
 
@@ -578,8 +584,8 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this.#signalChild(gracefulMs);
 	}
 
-	/** SIGTERM the child (its group when it leads one), then SIGKILL if it outlives `gracefulMs`. */
-	async #signalChild(gracefulMs: number): Promise<void> {
+	/** Send `gracefulSignal` to the child (its group when it leads one), then SIGKILL if it outlives `gracefulMs`. */
+	async #signalChild(gracefulMs: number, gracefulSignal: "SIGTERM" | "SIGINT" = "SIGTERM"): Promise<void> {
 		const signal = (name: NodeJS.Signals) => {
 			try {
 				if (this.#terminateGroup && process.platform !== "win32") process.kill(-this.proc.pid, name);
@@ -587,17 +593,17 @@ export class ChildProcess<In extends InMask = InMask> {
 			} catch {}
 		};
 		if (gracefulMs >= 0) {
-			signal("SIGTERM");
+			signal(gracefulSignal);
 			await Promise.race([this.proc.exited, Bun.sleep(gracefulMs)]);
 		}
 		if (!this.#isRootExited()) signal("SIGKILL");
 	}
 
 	/**
-	 * Stop a subreaper-supervised command: SIGTERM to each of the subreaper's
-	 * children and their trees (never the subreaper itself), then, after
+	 * Stop a subreaper-supervised command: send `gracefulSignal` (default SIGTERM) to each
+	 * of the subreaper's children and their trees (never the subreaper itself), then, after
 	 * `gracefulMs`, the subreaper's own exit, or `escalated`, the hard sweep.
-	 * A negative `gracefulMs` skips the SIGTERM; zero sends it and sweeps at once.
+	 * A negative `gracefulMs` skips the graceful signal; zero sends it and sweeps at once.
 	 * The subreaper stays alive through the grace period, so a descendant
 	 * orphaned in it is still the subreaper's child when the sweep runs.
 	 *
@@ -612,7 +618,14 @@ export class ChildProcess<In extends InMask = InMask> {
 	 * cleared as soon as the sequence moves on, so a finished stop never keeps
 	 * the caller's process alive.
 	 */
-	async #stopSubreaperTree(root: Process, gracefulMs: number, escalated: Promise<void>): Promise<void> {
+	async #stopSubreaperTree(
+		root: Process,
+		gracefulMs: number,
+		escalated: Promise<void>,
+		gracefulSignal: "SIGTERM" | "SIGINT" = "SIGTERM",
+	): Promise<void> {
+		const initialSig =
+			gracefulMs < 0 ? 9 : gracefulSignal === "SIGINT" ? os.constants.signals.SIGINT : os.constants.signals.SIGTERM;
 		let children = root.children();
 		if (children.length === 0) {
 			try {
@@ -624,13 +637,13 @@ export class ChildProcess<In extends InMask = InMask> {
 				}
 				// It launched the command just before the freeze: the first wave
 				// goes to the snapshot taken while it cannot fork.
-				for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+				for (const child of children) child.killTree(initialSig);
 			} finally {
 				root.killTree(os.constants.signals.SIGCONT);
 			}
 		} else {
 			// The subreaper launches one command; once it has a child, no later launch can escape the snapshot.
-			for (const child of children) child.killTree(gracefulMs < 0 ? 9 : 15);
+			for (const child of children) child.killTree(initialSig);
 		}
 		if (gracefulMs >= 0) {
 			const { promise: graceOver, resolve: endGrace } = Promise.withResolvers<void>();

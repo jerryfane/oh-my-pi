@@ -131,7 +131,7 @@ import { resolveAgentPrewalkDefault } from "./prewalk";
 import { isReadOnlyAgent } from "./read-only-policy";
 import { formatTaskResultSummary } from "./result-summary";
 import { resolveSubagentStartModel } from "./subagent-start-model";
-import { isAgySessionHandle, resolveAgySubagentConfig, runAgyFollowUpTurn, runAgySubagent } from "./agy-cli-runner";
+import { isAgySessionHandle, resolveAgySubagentConfig, runAgySubagent } from "./agy-cli-runner";
 import { persistSubagentOutputArtifacts } from "./output-artifacts";
 import { subprocessToolRegistry } from "./subprocess-tool-registry";
 import { recordStepsSent, type StepProgress, type StepReportRoute, sendStepReport } from "./steps";
@@ -4125,7 +4125,7 @@ function ownAttachedSession(id: string): AgentSession | undefined {
 export async function runSubagentFollowUpTurn(options: FollowUpTurnOptions): Promise<SingleResult> {
 	const startTime = Date.now();
 	const session = await AgentLifecycleManager.global().ensureLive(options.id);
-	if (isAgySessionHandle(session)) return runAgyFollowUpTurn(session, options, startTime);
+	if (isAgySessionHandle(session)) return session.runFollowUpTurn(options, startTime);
 	if (!isLocalAgentSession(session)) return runFollowUpTurnOnHome(session, options);
 	// A turn of a main-homed session loads the main thread like a placed run.
 	const endMainRun = isMainThread() ? existingSubagentWorkerPool()?.beginMainRun() : undefined;

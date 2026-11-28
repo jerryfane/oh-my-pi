@@ -21,7 +21,12 @@ import { runIsolatedSubprocess } from "../../src/task/isolation-runner";
 import type { AgentProgress } from "../../src/task/task-details";
 import type { AgentDefinition, SubagentLifecyclePayload, SubagentProgressPayload } from "../../src/task/types";
 import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from "../../src/task/types";
+import type { ThreadService } from "../../src/thread/services";
+import { agentsThreadService } from "../../src/thread/services/agents";
+import { identityThreadService } from "../../src/thread/services/identity";
+import { SubagentWorker } from "../../src/thread/subagent-worker";
 import { EventBus } from "../../src/utils/event-bus";
+import type { AgentsProbe, AgentsProbeGlobals } from "../fixtures/agents-bridge-worker";
 
 const tempDirs: string[] = [];
 
@@ -1935,5 +1940,385 @@ emit({
 		await AgentLifecycleManager.global().release("KeepAliveAgy");
 		expect(releaseCount).toBe(1);
 		expect(AgentRegistry.global().get("KeepAliveAgy")).toBeUndefined();
+	}, 30_000);
+
+	it("recovers acknowledged follow-ups when child closes stdin early and steers on step_update conversation ID with SIGINT", async () => {
+		const dir = await makeTempDir("omp-agy-p2-stdin-sigint-");
+		const checkpointFile = path.join(dir, "sigint-checkpoint.txt");
+
+		// 1. Child closes fd 0 right after reading prompt, emits Turn 1 SUCCESS, and exits 0;
+		// sibling follow-up accepted after fd 0 closes must still run via --conversation resume.
+		const closeStdinBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+const cid = conv ?? "conv-closed-fd0";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+if (!conv) {
+	try { fs.closeSync(0); } catch {}
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { parameters: { Path: "a.ts" } } } });
+	await Bun.sleep(250);
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { output: "ok" } } });
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "turn1-only", num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "RECOVERED_FOLLOWUP:" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-close-fd0",
+		);
+
+		let sentAfterClose = false;
+		let receipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const recoveredRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Close stdin early",
+			index: 0,
+			id: "ClosedFd0Worker",
+			parentAgentId: MAIN_AGENT_ID,
+			keepAlive: false,
+			settings: makeSettings(closeStdinBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentAfterClose && p.currentTool === "read_file") {
+					sentAfterClose = true;
+					void IrcBus.global()
+						.send({ from: "SiblingPeer", to: "ClosedFd0Worker", body: "Must not be lost" })
+						.then(r => {
+							receipt = r;
+						});
+				}
+			},
+		});
+		expect(receipt?.outcome).toBe("injected");
+		expect(recoveredRes.exitCode).toBe(0);
+		expect(recoveredRes.output).toContain("RECOVERED_FOLLOWUP:");
+		expect(recoveredRes.output).toContain("Must not be lost");
+
+		// 2. Steer queued BEFORE conversation_id is emitted on step_update (not init) must interrupt promptly
+		// AND deliver SIGINT (not SIGTERM) so the child's SIGINT checkpoint handler runs before resume.
+		const sigintBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+process.on("SIGINT", () => {
+	fs.writeFileSync(${JSON.stringify(checkpointFile)}, "SIGINT");
+	process.exit(130);
+});
+process.on("SIGTERM", () => {
+	fs.writeFileSync(${JSON.stringify(checkpointFile)}, "SIGTERM");
+	process.exit(143);
+});
+if (!conv) {
+	// Emit init WITHOUT conversation_id, wait briefly so steer queues before ID arrives, then emit ID on step_update.
+	emit({ event: "init", init: { model: "gemini-4-neon-medium" } });
+	emit({ event: "step_update", step_update: { step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "prep", tool_info: { parameters: { Path: "p" } } } });
+	await Bun.sleep(150);
+	emit({ event: "step_update", step_update: { conversation_id: "conv-late-id", step_index: 2, state: "ACTIVE", step_type: "tool", tool_name: "slow_work", tool_info: { parameters: { Path: "s" } } } });
+	await Bun.sleep(10_000);
+	emit({ event: "result", result: { conversation_id: "conv-late-id", status: "SUCCESS", response: "missed-steer", num_turns: 1 } });
+} else {
+	const sig = fs.existsSync(${JSON.stringify(checkpointFile)}) ? fs.readFileSync(${JSON.stringify(checkpointFile)}, "utf8") : "NONE";
+	emit({ event: "init", conversation_id: conv, init: { model: "gemini-4-neon-medium" } });
+	emit({ event: "result", result: { conversation_id: conv, status: "SUCCESS", response: "SIGNAL=" + sig + ":" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-sigint-late-id",
+		);
+
+		let steerQueuedEarly = false;
+		const tSteer = Date.now();
+		const steerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Late ID + SIGINT test",
+			index: 0,
+			id: "LateIdSigintWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			keepAlive: false,
+			settings: makeSettings(sigintBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!steerQueuedEarly && p.currentTool === "prep") {
+					steerQueuedEarly = true;
+					void IrcBus.global().send({
+						from: MAIN_AGENT_ID,
+						to: "LateIdSigintWorker",
+						body: "Pivot immediately",
+					});
+				}
+			},
+		});
+		expect(Date.now() - tSteer).toBeLessThan(4_000);
+		expect(steerRes.exitCode).toBe(0);
+		expect(steerRes.output).toContain("SIGNAL=SIGINT:");
+		expect(steerRes.output).toContain("Pivot immediately");
+	}, 30_000);
+
+	it("closes one-shot admission and commits terminal state atomically before terminal observers, and pumps agent_end wake messages", async () => {
+		const dir = await makeTempDir("omp-agy-p2-teardown-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-td" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const fastBin = await createFakeAgyBinary(
+			dir,
+			`
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-td-1";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-low" } });
+emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "OK:" + promptText.slice(-30), num_turns: 1 } });
+`,
+			"fake-agy-teardown",
+		);
+
+		// 1. One-shot run: sibling send and RPC cancel from terminal onProgress must both fail/return false, never conflict.
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let terminalSendOutcome: string | undefined;
+		let terminalCancelResult: boolean | undefined;
+		let ranTerminalHooks = false;
+		const oneShotRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "One-shot teardown atomicity",
+			index: 0,
+			id: "OneShotAtomicWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: false,
+			settings: makeSettings(fastBin, { task: "gemini-4-neon-low" }),
+			onProgress: p => {
+				if (p.status === "completed" && !ranTerminalHooks) {
+					ranTerminalHooks = true;
+					void IrcBus.global()
+						.send({ from: "Sibling", to: "OneShotAtomicWorker", body: "too late" })
+						.then(r => {
+							terminalSendOutcome = r.outcome;
+						});
+					void handleRpcCancelSubagent(rpcSubagents, "OneShotAtomicWorker").then(ok => {
+						terminalCancelResult = ok;
+					});
+				}
+			},
+		});
+		await Bun.sleep(30);
+		rpcSubagents.dispose();
+		expect(oneShotRes.exitCode).toBe(0);
+		expect(terminalSendOutcome).toBe("failed");
+		expect(terminalCancelResult).toBe(false);
+
+		// 2. Kept-alive wake: message delivered synchronously inside agent_end must run (not strand ircWakesPending=true).
+		const relays: string[] = [];
+		AgentRegistry.global().register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: {
+				deliverIrcMessage: async (msg: { body: string }) => {
+					relays.push(msg.body);
+					return "injected" as const;
+				},
+				emitIrcRelayObservation: () => {},
+			} as unknown as import("../../src/session/agent-session-handle").AgentSessionHandle,
+			status: "idle",
+		});
+
+		const kaRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "KeepAlive agent_end wake test",
+			index: 0,
+			id: "AgentEndWakeWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			settings: makeSettings(fastBin, { task: "gemini-4-neon-low" }),
+		});
+		expect(kaRes.exitCode).toBe(0);
+		const liveSession = AgentRegistry.global().get("AgentEndWakeWorker")!.session!;
+		let sentDuringAgentEnd = false;
+		let agentEndReceipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const unsubEnd = liveSession.subscribe(ev => {
+			if (ev.type === "agent_end" && !sentDuringAgentEnd) {
+				sentDuringAgentEnd = true;
+				void IrcBus.global()
+					.send({ from: MAIN_AGENT_ID, to: "AgentEndWakeWorker", body: "chained-from-agent-end" })
+					.then(r => {
+						agentEndReceipt = r;
+					});
+			}
+		});
+		await IrcBus.global().send({ from: MAIN_AGENT_ID, to: "AgentEndWakeWorker", body: "first-wake" });
+		await liveSession.waitForIrcReplies();
+		await Bun.sleep(50);
+		await liveSession.waitForIrcReplies();
+		unsubEnd();
+
+		expect(agentEndReceipt?.outcome).toBe("woken");
+		expect(relays.some(r => r.includes("first-wake"))).toBe(true);
+		expect(relays.some(r => r.includes("chained-from-agent-end"))).toBe(true);
+		expect(liveSession.ircWakesPending).toBe(false);
+		expect(AgentRegistry.global().get("AgentEndWakeWorker")?.status).toBe("idle");
+	}, 30_000);
+
+	it("serializes concurrent monitored follow-ups, enforces their schema/observer/artifact contract, and bridges agy refs across worker RPC", async () => {
+		const dir = await makeTempDir("omp-agy-p2-fu-bridge-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-fu2" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const followUpBin = await createFakeAgyBinary(
+			dir,
+			`
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-fu-contract";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+await Bun.sleep(120);
+if (promptText.includes("PROSE_BAD")) {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "plain prose", num_turns: 1 } });
+} else if (promptText.includes("JSON_GOOD")) {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: '{"answer":"structured-ok"}', structured_output: { answer: "structured-ok" }, num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "DONE:" + promptText, num_turns: 1 } });
+}
+`,
+			"fake-agy-fu-contract",
+		);
+
+		const initRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial run",
+			index: 0,
+			id: "ContractAgyWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			settings: makeSettings(followUpBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(initRes.exitCode).toBe(0);
+
+		// 1. Concurrent runSubagentFollowUpTurn calls serialize without corrupting <id>.jsonl entry IDs / parentId chain.
+		const [fuA, fuB] = await Promise.all([
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "concurrent-A" }),
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "concurrent-B" }),
+		]);
+		expect(fuA.exitCode).toBe(0);
+		expect(fuB.exitCode).toBe(0);
+		const lines = (await fs.readFile(path.join(artifactsDir, "ContractAgyWorker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		const ids = new Set<string>();
+		let prevId: string | null = null;
+		for (const entry of lines.slice(1)) {
+			const eid = entry.id as string;
+			expect(ids.has(eid)).toBe(false);
+			ids.add(eid);
+			expect(entry.parentId).toBe(prevId);
+			prevId = eid;
+		}
+
+		// 2. Monitored follow-up enforces outputSchema, emits progress/lifecycle events, and updates artifactsDir on success.
+		const fuBus = new EventBus();
+		const fuLifecycles: string[] = [];
+		const fuProgress: string[] = [];
+		fuBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, p => fuLifecycles.push((p as SubagentLifecyclePayload).status));
+		const schema = { type: "object", properties: { answer: { type: "string" } }, required: ["answer"] };
+		const badFu = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "PROSE_BAD",
+			outputSchema: schema,
+			outputSchemaMode: "strict",
+			outputSchemaSource: "caller",
+			artifactsDir,
+			eventBus: fuBus,
+			onProgress: p => fuProgress.push(p.status),
+		});
+		expect(badFu.exitCode).toBe(1);
+		expect(badFu.structuredOutput?.status).toBe("invalid");
+		expect(fuLifecycles).toEqual(["started", "failed"]);
+		expect(fuProgress.at(-1)).toBe("failed");
+
+		const goodFu = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "JSON_GOOD",
+			outputSchema: schema,
+			outputSchemaMode: "strict",
+			outputSchemaSource: "caller",
+			artifactsDir,
+		});
+		expect(goodFu.exitCode).toBe(0);
+		expect(goodFu.structuredOutput).toEqual({
+			source: "caller",
+			mode: "strict",
+			status: "valid",
+			data: { answer: "structured-ok" },
+		});
+		expect(JSON.parse(await fs.readFile(path.join(artifactsDir, "ContractAgyWorker.json"), "utf8"))).toEqual({
+			answer: "structured-ok",
+		});
+
+		// 3. Incompatible native-OMP-only follow-up options fail explicitly instead of silently ignoring them.
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", restore: true }),
+		).rejects.toThrow(/restore/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", topicBoard: "board" }),
+		).rejects.toThrow(/topicBoard/i);
+
+		// 4. Real worker calling AgentRegistry.global().get() for a main-homed agy agent crosses the bridge cleanly.
+		const probeReady = Promise.withResolvers<AgentsProbe>();
+		const probeService: ThreadService = {
+			name: "agents-probe",
+			globals: (): AgentsProbeGlobals => ({ ready: received => probeReady.resolve(received) }),
+		};
+		const worker = new SubagentWorker({
+			entry: new URL("../fixtures/agents-bridge-worker.ts", import.meta.url),
+			services: [identityThreadService, agentsThreadService, probeService],
+			initTimeoutMs: 60_000,
+		});
+		try {
+			await worker.ready;
+			const probe = await probeReady.promise;
+			const peerReport = await probe.peer("ContractAgyWorker");
+			expect(peerReport.isPeer).toBe(true);
+			expect(peerReport.key.startsWith("agy:")).toBe(true);
+			expect(peerReport.isStreaming).toBe(false);
+			expect(peerReport.sessionFile).toBe(path.join(artifactsDir, "ContractAgyWorker.jsonl"));
+			expect(peerReport.canonical).toBe(true);
+			expect(peerReport.casBySession).toBe(true);
+		} finally {
+			await worker.terminate("test end");
+		}
 	}, 30_000);
 });
