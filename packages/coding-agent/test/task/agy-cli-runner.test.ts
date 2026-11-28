@@ -3,9 +3,20 @@ import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
 import { Settings } from "../../src/config/settings";
+import { IrcBus } from "../../src/irc/bus";
+import { handleRpcCancelSubagent, handleRpcSteerSubagent } from "../../src/modes/rpc/rpc-mode";
+import { RpcSubagentRegistry } from "../../src/modes/rpc/rpc-subagents";
+import { AgentLifecycleManager } from "../../src/registry/agent-lifecycle";
+import { AgentRegistry, MAIN_AGENT_ID } from "../../src/registry/agent-registry";
+import { isLocalAgentSession } from "../../src/session/agent-session-handle";
 import { CostGate } from "../../src/session/cost-gate";
 import { resolveAgySubagentConfig } from "../../src/task/agy-cli-runner";
-import { type ExecutorOptions, runSubprocess, type SubagentToolResult } from "../../src/task/executor";
+import {
+	type ExecutorOptions,
+	runSubagentFollowUpTurn,
+	runSubprocess,
+	type SubagentToolResult,
+} from "../../src/task/executor";
 import { runIsolatedSubprocess } from "../../src/task/isolation-runner";
 import type { AgentProgress } from "../../src/task/task-details";
 import type { AgentDefinition, SubagentLifecyclePayload, SubagentProgressPayload } from "../../src/task/types";
@@ -13,6 +24,42 @@ import { TASK_SUBAGENT_LIFECYCLE_CHANNEL, TASK_SUBAGENT_PROGRESS_CHANNEL } from 
 import { EventBus } from "../../src/utils/event-bus";
 
 const tempDirs: string[] = [];
+
+/** Helper snippet embedded in fake Bun `agy` binaries to read the first NDJSON user prompt from stdin. */
+const READ_FIRST_STDIN_PROMPT_SNIPPET = `
+async function readFirstPrompt() {
+	const reader = Bun.stdin.stream().getReader();
+	const decoder = new TextDecoder();
+	let buf = "";
+	while (true) {
+		const { value, done } = await reader.read();
+		if (value) buf += decoder.decode(value, { stream: true });
+		const nl = buf.indexOf("\\n");
+		if (nl !== -1) {
+			const line = buf.slice(0, nl).trim();
+			reader.releaseLock();
+			if (!line) return "";
+			try {
+				const obj = JSON.parse(line);
+				return typeof obj?.message?.content === "string" ? obj.message.content : "";
+			} catch {
+				return line;
+			}
+		}
+		if (done) {
+			reader.releaseLock();
+			const trimmed = (buf + decoder.decode()).trim();
+			if (!trimmed) return "";
+			try {
+				const obj = JSON.parse(trimmed);
+				return typeof obj?.message?.content === "string" ? obj.message.content : "";
+			} catch {
+				return trimmed;
+			}
+		}
+	}
+}
+`;
 
 async function makeTempDir(prefix: string): Promise<string> {
 	const dir = await fs.mkdtemp(path.join(os.tmpdir(), prefix));
@@ -57,6 +104,10 @@ function makeSettings(
 }
 
 afterEach(async () => {
+	await AgentLifecycleManager.global().dispose();
+	AgentLifecycleManager.resetGlobalForTests();
+	AgentRegistry.resetGlobalForTests();
+	IrcBus.resetGlobalForTests();
 	while (tempDirs.length > 0) {
 		const dir = tempDirs.pop()!;
 		await fs.rm(dir, { recursive: true, force: true });
@@ -143,8 +194,12 @@ describe("agy CLI subagent runner", () => {
 			model: "gemini-4-neon-low",
 		});
 
-		// Seeded/resumable topic lifecycles and OMP-only contracts stay on native OMP
-		expect(resolveAgySubagentConfig(base({ keepAlive: true }))).toBeUndefined();
+		// keepAlive subagents now route to agy (with live registry + mid-job messaging + revival);
+		// seeded topic lifecycles and OMP-only contracts still stay on native OMP.
+		expect(resolveAgySubagentConfig(base({ keepAlive: true }))).toEqual({
+			binary: bin,
+			model: "gemini-4-neon-medium",
+		});
 		expect(resolveAgySubagentConfig(base({ topicBoard: "board" }))).toBeUndefined();
 		expect(resolveAgySubagentConfig(base({ launchSignal: new AbortController().signal }))).toBeUndefined();
 		expect(
@@ -164,6 +219,7 @@ describe("agy CLI subagent runner", () => {
 		const artifactsDir = path.join(dir, "artifacts");
 		await fs.mkdir(artifactsDir, { recursive: true });
 		const argvDump = path.join(dir, "argv.json");
+		const stdinDump = path.join(dir, "stdin.txt");
 		// Seed a stale JSON sidecar from an earlier run to prove plain replacement clears it
 		const staleSidecar = path.join(artifactsDir, "WorkerDemo.json");
 		await fs.writeFile(staleSidecar, '{"stale":true}\n');
@@ -172,7 +228,10 @@ describe("agy CLI subagent runner", () => {
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 fs.writeFileSync(${JSON.stringify(argvDump)}, JSON.stringify(process.argv.slice(2)));
+const firstPrompt = await readFirstPrompt();
+fs.writeFileSync(${JSON.stringify(stdinDump)}, firstPrompt);
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-123", init: { model: "gemini-4-neon-medium", cwd: process.cwd(), permission_mode: "always-proceed" } });
 emit({ event: "step_update", step_update: { conversation_id: "conv-123", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { name: "read_file", parameters: { Path: "/tmp/demo.ts" } } } });
@@ -238,15 +297,16 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 		expect(progressFrames.length).toBeGreaterThanOrEqual(2);
 
 		const argv = JSON.parse(await fs.readFile(argvDump, "utf8")) as string[];
+		expect(argv).toContain("--input-format");
 		expect(argv).toContain("--output-format");
 		expect(argv).toContain("stream-json");
 		expect(argv).toContain("--dangerously-skip-permissions");
 		expect(argv).toContain("--model");
 		expect(argv).toContain("gemini-4-neon-medium");
-		const printArg = argv.find(a => a.startsWith("--print="));
-		expect(printArg).toBeDefined();
-		expect(printArg).toContain("Shared repo context");
-		expect(printArg).toContain("--check-leading-dash find target");
+		expect(argv.some(a => a.startsWith("--print="))).toBe(false);
+		const sentPrompt = await fs.readFile(stdinDump, "utf8");
+		expect(sentPrompt).toContain("Shared repo context");
+		expect(sentPrompt).toContain("--check-leading-dash find target");
 	});
 
 	it("validates constrained, unconstrained (true / {}), non-object, and strict-invalid structured output schemas", async () => {
@@ -261,9 +321,10 @@ emit({ event: "result", result: { conversation_id: "conv-123", status: "SUCCESS"
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const idx = argv.indexOf("--json-schema");
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
+const promptText = await readFirstPrompt();
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 if (idx >= 0) {
 	const rawSchema = argv[idx + 1] ?? "";
@@ -275,8 +336,8 @@ if (idx >= 0) {
 	fs.writeFileSync(${JSON.stringify(schemaCapture)}, rawSchema);
 	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
 	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: '{"summary":"all good"}', structured_output: { summary: "all good" }, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
-} else if (printArg.includes("<output_format>") && printArg.includes("raw valid JSON")) {
-	const payload = printArg.includes('"type":"array"') ? '["a","b"]' : '{"summary":"all good"}';
+} else if (promptText.includes("<output_format>") && promptText.includes("raw valid JSON")) {
+	const payload = promptText.includes('"type":"array"') ? '["a","b"]' : '{"summary":"all good"}';
 	emit({ event: "init", conversation_id: "conv-s1", init: { model: "gemini-4-neon-low" } });
 	emit({ event: "result", result: { conversation_id: "conv-s1", status: "SUCCESS", response: payload, num_turns: 1, usage: { input_tokens: 100, output_tokens: 20 } } });
 } else {
@@ -390,7 +451,7 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 		expect(bad.structuredOutput?.status).toBe("invalid");
 	}, 30_000);
 
-	it("accumulates multi-step usage per step, spills oversized prompts, and settles cleanly on spill failure or missing result", async () => {
+	it("accumulates multi-step usage per step, streams huge prompts over stdin without E2BIG, and settles cleanly on missing result", async () => {
 		const dir = await makeTempDir("agy-runner-steps-");
 		const logPath = path.join(dir, "invocations.jsonl");
 
@@ -400,11 +461,12 @@ emit({ event: "result", result: { conversation_id: "conv-s2", status: "SUCCESS",
 			dir,
 			`
 import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const convIdx = argv.indexOf("--conversation");
 const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
-fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ conv, printLen: printArg.length, printArg: printArg.slice(0, 140) }) + "\\n");
+const promptText = await readFirstPrompt();
+fs.appendFileSync(${JSON.stringify(logPath)}, JSON.stringify({ conv, argvLen: JSON.stringify(argv).length, promptLen: promptText.length }) + "\\n");
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 const cid = conv ?? "conv-step-1";
 emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
@@ -419,7 +481,7 @@ if (!conv) {
 			"fake-agy-steps",
 		);
 
-		// Portable spill (> 96 KiB direct Unix argv limit) works on all platforms
+		// Huge prompts (> 100 KiB) travel cleanly over NDJSON stdin without touching argv or temp spill files
 		const hugePrompt = "a\n".repeat(55_000);
 		const result = await runSubprocess({
 			cwd: dir,
@@ -442,33 +504,14 @@ if (!conv) {
 		const calls = (await fs.readFile(logPath, "utf8"))
 			.trim()
 			.split("\n")
-			.map(l => JSON.parse(l) as { conv: string | null; printLen: number; printArg: string });
+			.map(l => JSON.parse(l) as { conv: string | null; argvLen: number; promptLen: number });
 		expect(calls.length).toBe(2);
 		expect(calls[0]?.conv).toBeNull();
-		expect(calls[0]?.printLen).toBeLessThan(1024);
+		expect(calls[0]?.argvLen).toBeLessThan(1024);
+		expect(calls[0]?.promptLen).toBeGreaterThan(100_000);
 		expect(calls[1]?.conv).toBe("conv-step-1");
 		const leftovers = (await fs.readdir(dir)).filter(f => f.includes("agy-prompt-"));
 		expect(leftovers).toEqual([]);
-
-		// Linux-only subreaper JSON-env transport: a 90,000-byte multiline prompt (< 96 KiB raw, > 128 KiB JSON-encoded) must spill instead of E2BIG
-		if (process.platform === "linux") {
-			const linuxMultilinePrompt = "a\n".repeat(45_000);
-			const linuxSpillRes = await runSubprocess({
-				cwd: dir,
-				agent: makeAgent(),
-				task: linuxMultilinePrompt,
-				index: 0,
-				id: "LinuxJsonEnvSpill",
-				artifactsDir: dir,
-				settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
-			});
-			expect(linuxSpillRes.exitCode).toBe(0);
-			const allCalls = (await fs.readFile(logPath, "utf8"))
-				.trim()
-				.split("\n")
-				.map(l => JSON.parse(l) as { printLen: number });
-			expect(allCalls.at(-1)?.printLen).toBeLessThan(1024);
-		}
 
 		// Single-step partial step_update usage preserves latest per-request contextTokens separately from aggregate usage
 		const singlePartial = await runSubprocess({
@@ -484,24 +527,6 @@ if (!conv) {
 		expect(singlePartial.tokens).toBe(330);
 		expect(singlePartial.usage?.cacheRead).toBe(90);
 		expect(singlePartial.contextTokens).toBe(140);
-
-		// Spill write failure emits terminal failed lifecycle instead of rejecting unhandled
-		const spillBus = new EventBus();
-		const spillLifecycles: SubagentLifecyclePayload[] = [];
-		spillBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, d => spillLifecycles.push(d as SubagentLifecyclePayload));
-		const spillFail = await runSubprocess({
-			cwd: dir,
-			agent: makeAgent(),
-			task: hugePrompt,
-			index: 0,
-			id: "SpillFail",
-			artifactsDir: path.join(dir, "missing-nonexistent-dir"),
-			eventBus: spillBus,
-			settings: makeSettings(bin, { "*": "gemini-4-neon-medium" }),
-		});
-		expect(spillFail.exitCode).toBe(1);
-		expect(spillFail.error).toBeDefined();
-		expect(spillLifecycles.map(l => l.status)).toEqual(["started", "failed"]);
 
 		// Zero-exit process without a terminal result frame fails and stops multi-step execution
 		const truncatedBin = await createFakeAgyBinary(
@@ -668,10 +693,11 @@ exit 0
 		const usageEdgeBin = await createFakeAgyBinary(
 			dir,
 			`
-const printArg = process.argv.slice(2).find(a => a.startsWith("--print=")) ?? "";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const promptText = await readFirstPrompt();
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: "conv-u", init: { model: "gemini-4-neon-low" } });
-if (printArg.includes("ZERO_CASE")) {
+if (promptText.includes("ZERO_CASE")) {
 	emit({ event: "step_update", step_update: { conversation_id: "conv-u", step_index: 1, state: "DONE", step_type: "agent_response", text_delta: "ok", usage: { input_tokens: 100, output_tokens: 10, cache_read_tokens: 40 } } });
 	emit({ event: "result", result: { conversation_id: "conv-u", status: "SUCCESS", response: "ok", num_turns: 0, usage: { input_tokens: 0, output_tokens: 0, cache_read_tokens: 0 } } });
 } else {
@@ -707,20 +733,18 @@ if (printArg.includes("ZERO_CASE")) {
 		expect(multiTurnRes.usage?.cacheRead).toBe(300);
 		expect(multiTurnRes.contextTokens).toBeUndefined();
 
-		// 4. Short prompt + valid 75 KB root-object JSON schema spills schema into instructions instead of hitting E2BIG
+		// 4. Short prompt + valid 75 KB root-object JSON schema folds schema into stdin prompt instead of hitting E2BIG
 		const spillSchemaBin = await createFakeAgyBinary(
 			dir,
 			`
-import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
 const argv = process.argv.slice(2);
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-const printArg = argv.find(a => a.startsWith("--print=")) ?? "";
-const match = printArg.match(/from (\\S+) and execute/);
-const spillContent = match ? fs.readFileSync(match[1], "utf8") : "";
-const hasSchemaInSpill = spillContent.includes("<output_format>") && spillContent.includes('"summary"');
+const promptText = await readFirstPrompt();
+const hasSchemaInPrompt = promptText.includes("<output_format>") && promptText.includes('"summary"');
 const hasFlag = argv.includes("--json-schema");
 emit({ event: "init", conversation_id: "conv-bigschema", init: { model: "gemini-4-neon-low" } });
-if (!hasFlag && hasSchemaInSpill) {
+if (!hasFlag && hasSchemaInPrompt) {
 	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: '{"summary":"validated"}', num_turns: 1 } });
 } else {
 	emit({ event: "result", result: { conversation_id: "conv-bigschema", status: "SUCCESS", response: "plain prose", num_turns: 1 } });
@@ -1135,6 +1159,7 @@ exit 0
 					task: `check ${releaseMode} release hook`,
 					index: 0,
 					id: `ReleaseHook-${releaseMode}`,
+					keepAlive: false,
 					eventBus: releaseBus,
 					onRelease:
 						releaseMode === "sync-throw"
@@ -1479,5 +1504,436 @@ exit 0
 		const finalAssistant = fbEntries.at(-2)?.message as Record<string, unknown>;
 		expect(JSON.stringify(finalAssistant.content)).toContain("Tail answer only.");
 		expect(JSON.stringify(finalAssistant.content)).not.toContain("I will inspect.");
+	}, 30_000);
+
+	it("delivers mid-job queued follow-ups over live stream-json stdin in the same agy process without interrupting turn 1", async () => {
+		const dir = await makeTempDir("omp-agy-midjob-followup-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-fu" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "turns.jsonl");
+
+		// Stateful stream-json fake agy: reads NDJSON user turns until stdin EOF and runs each in one process.
+		const streamBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+const reader = Bun.stdin.stream().getReader();
+const decoder = new TextDecoder();
+let buf = "";
+let turn = 0;
+const cid = "conv-live-stream";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+async function handleTurn(content) {
+	turn += 1;
+	fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ pid: process.pid, turn, content }) + "\\n");
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: turn, state: "ACTIVE", step_type: "tool", tool_name: "read_file", tool_info: { parameters: { Path: "turn-" + turn } } } });
+	await Bun.sleep(turn === 1 ? 260 : 80);
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: turn, state: "DONE", step_type: "tool", tool_name: "read_file", tool_info: { output: "ok-" + turn } } });
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "reply-turn-" + turn + ":" + content.slice(-30),
+			num_turns: turn,
+			usage: { input_tokens: 100 * turn, output_tokens: 20 * turn, cache_read_tokens: 50 * turn },
+		},
+	});
+}
+
+while (true) {
+	const { value, done } = await reader.read();
+	if (value) buf += decoder.decode(value, { stream: true });
+	let nl = buf.indexOf("\\n");
+	while (nl !== -1) {
+		const line = buf.slice(0, nl).trim();
+		buf = buf.slice(nl + 1);
+		if (line) {
+			const parsed = JSON.parse(line);
+			await handleTurn(parsed?.message?.content ?? "");
+		}
+		nl = buf.indexOf("\\n");
+	}
+	if (done) break;
+}
+`,
+			"fake-agy-stream-followup",
+		);
+
+		let sentFollowUp = false;
+		let followUpReceipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const runPromise = runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial assignment",
+			index: 0,
+			id: "StreamFollowUpWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(streamBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentFollowUp && p.currentTool === "read_file") {
+					sentFollowUp = true;
+					// Sibling message (non-parent) queues as a next-turn follow-up on live stdin without killing Turn 1.
+					void IrcBus.global()
+						.send({ from: "SiblingWorker", to: "StreamFollowUpWorker", body: "Also check bar.ts" })
+						.then(r => {
+							followUpReceipt = r;
+						});
+				}
+			},
+		});
+
+		const res = await runPromise;
+		expect(res.exitCode).toBe(0);
+		expect(followUpReceipt?.outcome).toBe("injected");
+		expect(res.output).toContain("reply-turn-2");
+		expect(res.output).toContain("Also check bar.ts");
+		expect(res.requests).toBe(2);
+
+		// Both turns ran inside the exact same live agy process (same PID, no restart).
+		const logged = (await fs.readFile(logFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as { pid: number; turn: number; content: string });
+		expect(logged).toHaveLength(2);
+		expect(logged[0]?.pid).toBe(logged[1]?.pid);
+		expect(logged[0]?.turn).toBe(1);
+		expect(logged[1]?.turn).toBe(2);
+		expect(logged[1]?.content).toContain("SiblingWorker");
+		expect(logged[1]?.content).toContain("Also check bar.ts");
+
+		// Transcript preserves intact parentId chain and records the queued follow-up prompt between turns.
+		const entries = (await fs.readFile(path.join(artifactsDir, "StreamFollowUpWorker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		let prevId: string | null = null;
+		for (const entry of entries.slice(1)) {
+			expect(entry.parentId).toBe(prevId);
+			prevId = entry.id as string;
+		}
+		expect(
+			entries.some(
+				e =>
+					e.type === "message" &&
+					(e.message as Record<string, unknown>).role === "user" &&
+					JSON.stringify(e.message).includes("Also check bar.ts"),
+			),
+		).toBe(true);
+	}, 30_000);
+
+	it("interrupts an active agy turn on mid-job parent IRC steer and RPC steer_subagent, then resumes via --conversation", async () => {
+		const dir = await makeTempDir("omp-agy-midjob-steer-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-st" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "steer-invocations.jsonl");
+
+		// First invocation sleeps for 15s (simulating a long turn) so an immediate steer MUST interrupt it;
+		// resumed invocation (--conversation conv-steer-1) completes immediately with the steered answer.
+		const steerBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ pid: process.pid, conv, promptText }) + "\\n");
+const cid = conv ?? "conv-steer-1";
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+if (!conv) {
+	emit({ event: "step_update", step_update: { conversation_id: cid, step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "run_command", tool_info: { parameters: { CommandLine: "sleep 15" } } } });
+	await Bun.sleep(15_000);
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "unsteered-slow-finish", num_turns: 1 } });
+} else {
+	emit({ event: "result", result: { conversation_id: cid, status: "SUCCESS", response: "STEERED_OK:" + promptText, num_turns: 2, usage: { input_tokens: 150, output_tokens: 40, cache_read_tokens: 80 } } });
+}
+`,
+			"fake-agy-steer",
+		);
+
+		// 1. Direct parent IRC steer interrupts long turn immediately and resumes via --conversation.
+		let sentParentSteer = false;
+		const t0 = Date.now();
+		const parentSteerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Long initial task",
+			index: 0,
+			id: "ParentSteerWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(steerBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!sentParentSteer && p.currentTool === "run_command") {
+					sentParentSteer = true;
+					void IrcBus.global().send({
+						from: MAIN_AGENT_ID,
+						to: "ParentSteerWorker",
+						body: "Stop and switch to fix-B instead",
+					});
+				}
+			},
+		});
+		const elapsedParentSteer = Date.now() - t0;
+		expect(parentSteerRes.exitCode).toBe(0);
+		expect(parentSteerRes.aborted).toBeUndefined();
+		expect(parentSteerRes.output).toContain("STEERED_OK:");
+		expect(parentSteerRes.output).toContain("Stop and switch to fix-B instead");
+		// Interrupted long 15s turn promptly rather than waiting for Turn 1 to finish.
+		expect(elapsedParentSteer).toBeLessThan(5_000);
+
+		const parentCalls = (await fs.readFile(logFile, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as { pid: number; conv: string | null; promptText: string });
+		expect(parentCalls).toHaveLength(2);
+		expect(parentCalls[0]?.conv).toBeNull();
+		expect(parentCalls[1]?.conv).toBe("conv-steer-1");
+		expect(parentCalls[1]?.promptText).toContain("Stop and switch to fix-B instead");
+
+		// 2. Herdrup/RPC handleRpcSteerSubagent resolves live agy subagent and steers it mid-turn.
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let rpcSteerErr: string | undefined = "not-called";
+		let rpcSteerSent = false;
+		const rpcSteerRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Long RPC task",
+			index: 0,
+			id: "RpcSteerWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: false,
+			settings: makeSettings(steerBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!rpcSteerSent && p.currentTool === "run_command") {
+					rpcSteerSent = true;
+					void handleRpcSteerSubagent(rpcSubagents, "RpcSteerWorker", "Pivot from Herdrup UI").then(err => {
+						rpcSteerErr = err;
+					});
+				}
+			},
+		});
+		rpcSubagents.dispose();
+		expect(rpcSteerErr).toBeUndefined();
+		expect(rpcSteerRes.exitCode).toBe(0);
+		expect(rpcSteerRes.output).toContain("STEERED_OK:Pivot from Herdrup UI");
+	}, 30_000);
+
+	it("cancels a running agy subagent cleanly via RPC cancel_subagent and preserves its aborted tombstone", async () => {
+		const dir = await makeTempDir("omp-agy-rpc-cancel-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-cancel" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const slowBin = await createFakeAgyBinary(
+			dir,
+			`
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: "conv-cancel-1", init: { model: "gemini-4-neon-low" } });
+emit({ event: "step_update", step_update: { conversation_id: "conv-cancel-1", step_index: 1, state: "ACTIVE", step_type: "tool", tool_name: "bash", tool_info: { parameters: { command: "sleep 30" } } } });
+await Bun.sleep(30_000);
+`,
+			"fake-agy-slow-cancel",
+		);
+
+		const rpcBus = new EventBus();
+		const rpcSubagents = new RpcSubagentRegistry(rpcBus, () => {});
+		let cancelTriggered = false;
+		let cancelResult = false;
+		const t0 = Date.now();
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Cancel me mid-run",
+			index: 0,
+			id: "CancelAgyWorker",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: rpcBus,
+			keepAlive: true,
+			settings: makeSettings(slowBin, { task: "gemini-4-neon-low" }),
+			onProgress: p => {
+				if (!cancelTriggered && p.currentTool === "bash") {
+					cancelTriggered = true;
+					void handleRpcCancelSubagent(rpcSubagents, "CancelAgyWorker").then(ok => {
+						cancelResult = ok;
+					});
+				}
+			},
+		});
+		rpcSubagents.dispose();
+
+		expect(Date.now() - t0).toBeLessThan(5_000);
+		expect(cancelResult).toBe(true);
+		expect(res.exitCode).toBe(1);
+		expect(res.aborted).toBe(true);
+		const ref = AgentRegistry.global().get("CancelAgyWorker");
+		expect(ref?.status).toBe("aborted");
+		expect(ref?.session).toBeNull();
+	}, 30_000);
+
+	it("adopts keepAlive agy subagents for idle IRC wake turns, post-park AgentLifecycleManager revival, and deferred onRelease", async () => {
+		const dir = await makeTempDir("omp-agy-revive-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-rev" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+		const logFile = path.join(dir, "revive-calls.jsonl");
+
+		const reviveBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as fs from "node:fs";
+${READ_FIRST_STDIN_PROMPT_SNIPPET}
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const conv = convIdx >= 0 ? argv[convIdx + 1] : null;
+const promptText = await readFirstPrompt();
+const cid = conv ?? "conv-revive-42";
+fs.appendFileSync(${JSON.stringify(logFile)}, JSON.stringify({ conv, promptText }) + "\\n");
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+emit({
+	event: "result",
+	result: {
+		conversation_id: cid,
+		status: "SUCCESS",
+		response: (conv ? "RESUMED(" + conv + "):" : "INITIAL:") + promptText.slice(-40),
+		num_turns: 1,
+		usage: { input_tokens: 120, output_tokens: 30, cache_read_tokens: 60 },
+	},
+});
+`,
+			"fake-agy-revive",
+		);
+
+		// Register a lightweight main recipient in AgentRegistry so wakeRelay replies land cleanly via IrcBus.
+		const receivedRelays: Array<{ from: string; body: string; wakeRelay?: boolean }> = [];
+		const mainSessionStub = {
+			deliverIrcMessage: async (msg: { from: string; body: string; wakeRelay?: boolean }) => {
+				receivedRelays.push({ from: msg.from, body: msg.body, wakeRelay: msg.wakeRelay });
+				return "injected" as const;
+			},
+			emitIrcRelayObservation: () => {},
+		};
+		AgentRegistry.global().register({
+			id: MAIN_AGENT_ID,
+			displayName: MAIN_AGENT_ID,
+			kind: "main",
+			session: mainSessionStub as unknown as import("../../src/session/agent-session-handle").AgentSessionHandle,
+			status: "idle",
+		});
+
+		let releaseCount = 0;
+		const initialRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Initial keepAlive work",
+			index: 0,
+			id: "KeepAliveAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: true,
+			onRelease: async () => {
+				releaseCount += 1;
+			},
+			settings: makeSettings(reviveBin, { task: "gemini-4-neon-medium" }),
+		});
+		expect(initialRes.exitCode).toBe(0);
+		expect(initialRes.output).toContain("INITIAL:");
+		expect(releaseCount).toBe(0);
+
+		// 1. Adopted into AgentLifecycleManager as idle with live handle (never mistaken for concrete AgentSession).
+		const idleRef = AgentRegistry.global().get("KeepAliveAgy");
+		expect(idleRef?.status).toBe("idle");
+		expect(idleRef?.session).not.toBeNull();
+		expect(isLocalAgentSession(idleRef!.session!)).toBe(false);
+		expect(AgentLifecycleManager.global().has("KeepAliveAgy")).toBe(true);
+
+		// 2. Sending an IRC message wakes the idle agy subagent and relays the reply back to main.
+		const wakeReceipt = await IrcBus.global().send({
+			from: MAIN_AGENT_ID,
+			to: "KeepAliveAgy",
+			body: "Wake question 1",
+		});
+		expect(wakeReceipt.outcome).toBe("woken");
+		await idleRef!.session!.waitForIrcReplies();
+		expect(receivedRelays).toHaveLength(1);
+		expect(receivedRelays[0]?.from).toBe("KeepAliveAgy");
+		expect(receivedRelays[0]?.wakeRelay).toBe(true);
+		expect(receivedRelays[0]?.body).toContain("RESUMED(conv-revive-42):");
+		expect(receivedRelays[0]?.body).toContain("Wake question 1");
+		expect(AgentRegistry.global().get("KeepAliveAgy")?.status).toBe("idle");
+
+		// 3. Park the agent (disposes live handle), then message it again to exercise AgentReviver cold resume.
+		await AgentLifecycleManager.global().park("KeepAliveAgy");
+		const parkedRef = AgentRegistry.global().get("KeepAliveAgy");
+		expect(parkedRef?.status).toBe("parked");
+		expect(parkedRef?.session).toBeNull();
+		expect(releaseCount).toBe(0);
+
+		const reviveReceipt = await IrcBus.global().send({
+			from: MAIN_AGENT_ID,
+			to: "KeepAliveAgy",
+			body: "Revive question 2",
+		});
+		expect(reviveReceipt.outcome).toBe("revived");
+		const revivedSession = AgentRegistry.global().get("KeepAliveAgy")?.session;
+		expect(revivedSession).not.toBeNull();
+		await revivedSession!.waitForIrcReplies();
+		expect(receivedRelays).toHaveLength(2);
+		expect(receivedRelays[1]?.wakeRelay).toBe(true);
+		expect(receivedRelays[1]?.body).toContain("RESUMED(conv-revive-42):");
+		expect(receivedRelays[1]?.body).toContain("Revive question 2");
+
+		// 4. Explicit runSubagentFollowUpTurn also works cleanly on adopted agy subagents.
+		const followUpTurn = await runSubagentFollowUpTurn({
+			id: "KeepAliveAgy",
+			agent: makeAgent(),
+			message: "Follow-up turn 3",
+		});
+		expect(followUpTurn.exitCode).toBe(0);
+		expect(followUpTurn.output).toContain("RESUMED(conv-revive-42):");
+		expect(followUpTurn.output).toContain("Follow-up turn 3");
+
+		// 5. Transcript preserved a single continuous parentId chain across initial + wake + revived + follow-up turns.
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "KeepAliveAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		let prevId: string | null = null;
+		for (const entry of transcriptLines.slice(1)) {
+			expect(entry.parentId).toBe(prevId);
+			prevId = entry.id as string;
+		}
+		expect(JSON.stringify(transcriptLines)).toContain("Wake question 1");
+		expect(JSON.stringify(transcriptLines)).toContain("Revive question 2");
+		expect(JSON.stringify(transcriptLines)).toContain("Follow-up turn 3");
+
+		// 6. Final release runs deferred onRelease exactly once.
+		await AgentLifecycleManager.global().release("KeepAliveAgy");
+		expect(releaseCount).toBe(1);
+		expect(AgentRegistry.global().get("KeepAliveAgy")).toBeUndefined();
 	}, 30_000);
 });
