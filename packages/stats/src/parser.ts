@@ -31,6 +31,15 @@ import type {
 	UserMessageStats,
 } from "./types";
 import {
+	AGY_CLI_PROVIDER,
+	type AgyParserState,
+	getAgyAppDataDir,
+	getAgySessionEntry,
+	isAgyTranscriptPath,
+	listAgyTranscriptFiles,
+	parseAgyTranscriptFile,
+} from "./agy-parser";
+import {
 	emptySpotlightRows,
 	emptySpotlightState,
 	SpotlightCollector,
@@ -333,6 +342,10 @@ function extractStats(
 	const msg = entry.message as AssistantMessage;
 	if (msg?.role !== "assistant") return null;
 	if (typeof msg.model !== "string" || typeof msg.provider !== "string" || typeof msg.api !== "string") return null;
+	// Official `agy` CLI usage is ingested canonically from `agy`'s own per-turn
+	// `brain/<id>/.system_generated/logs/transcript.jsonl` when enabled; skip OMP
+	// child mirror rows so OMP-spawned `agy` subagents are never double-counted.
+	if (msg.provider === AGY_CLI_PROVIDER && getAgyAppDataDir() !== null) return null;
 	const rawUsage = msg.usage as Partial<Usage> | undefined;
 	if (!rawUsage || typeof rawUsage !== "object") return null;
 
@@ -473,6 +486,7 @@ function extractToolCalls(
 	// `tool_calls` columns are NOT NULL: skip turns that can't be attributed
 	// (malformed persisted entries — see extractStats) and blocks missing ids.
 	if (typeof msg.model !== "string" || typeof msg.provider !== "string") return [];
+	if (msg.provider === AGY_CLI_PROVIDER && getAgyAppDataDir() !== null) return [];
 
 	const blocks = msg.content.filter(
 		(block): block is ToolCall =>
@@ -683,6 +697,8 @@ export interface SessionParserState {
 	spotlight?: SpotlightParserState;
 	/** Absent in cursors persisted before replies were tracked; such a cursor is rebuilt from the transcript prefix. */
 	pendingReplies?: Record<string, string>;
+	/** Present only for `agy` conversation transcripts under `<agyAppDataDir>/brain`. */
+	agy?: AgyParserState;
 }
 
 export interface ParseSessionResult {
@@ -730,6 +746,9 @@ export async function parseSessionFile(
 	state?: SessionParserState,
 	replay = false,
 ): Promise<ParseSessionResult> {
+	if (isAgyTranscriptPath(sessionPath)) {
+		return parseAgyTranscriptFile(sessionPath, fromOffset, state, replay);
+	}
 	let bytes: Uint8Array;
 	let start = fromOffset;
 	let reset = false;
@@ -955,17 +974,21 @@ export async function listSessionFiles(folderPath: string): Promise<string[]> {
 }
 
 /**
- * List all session files across all folders.
+ * List all session files across all folders (OMP sessions plus `agy` conversation transcripts).
  */
 export async function listAllSessionFiles(): Promise<string[]> {
-	const folders = await listSessionFolders();
-	return (await Promise.all(folders.map(listSessionFiles))).flat();
+	const [folders, agyFiles] = await Promise.all([listSessionFolders(), listAgyTranscriptFiles()]);
+	const ompFiles = (await Promise.all(folders.map(listSessionFiles))).flat();
+	return [...ompFiles, ...agyFiles];
 }
 
 /**
  * Find a specific entry in a session file.
  */
 export async function getSessionEntry(sessionPath: string, entryId: string): Promise<SessionEntry | null> {
+	if (isAgyTranscriptPath(sessionPath)) {
+		return getAgySessionEntry(sessionPath, entryId);
+	}
 	try {
 		for await (const line of readLines(Bun.file(sessionPath).stream())) {
 			const entry = parseJsonLine(line, 0, line.length);

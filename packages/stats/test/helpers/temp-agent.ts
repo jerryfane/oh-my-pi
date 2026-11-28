@@ -21,6 +21,7 @@ import { closeDb } from "@oh-my-pi/omp-stats/db";
 import { getAgentDir, setAgentDir, TempDir } from "@oh-my-pi/pi-utils";
 
 const XDG_KEYS = ["XDG_DATA_HOME", "XDG_STATE_HOME", "XDG_CACHE_HOME"] as const;
+const STATS_AGY_DATA_DIR_ENV = "OMP_STATS_AGY_DATA_DIR";
 
 export interface StatsTestIsolation {
 	/** Active per-test `TempDir`. Null between tests. */
@@ -30,18 +31,21 @@ export interface StatsTestIsolation {
 export function installStatsTestIsolation(prefix: string): StatsTestIsolation {
 	const originalAgentDir = getAgentDir();
 	let originalConfigDir: string | undefined;
+	let originalAgyDataDir: string | undefined;
 	const originalXdg: Record<string, string | undefined> = {};
 	let tempDir: TempDir | null = null;
 
 	beforeEach(() => {
 		tempDir = TempDir.createSync(prefix);
 		originalConfigDir = process.env.PI_CONFIG_DIR;
+		originalAgyDataDir = process.env[STATS_AGY_DATA_DIR_ENV];
 		for (const key of XDG_KEYS) {
 			originalXdg[key] = process.env[key];
 			delete process.env[key];
 		}
 		const configDir = path.relative(os.homedir(), tempDir.join("config"));
 		process.env.PI_CONFIG_DIR = configDir;
+		process.env[STATS_AGY_DATA_DIR_ENV] = tempDir.join("agy-data");
 		setAgentDir(path.join(os.homedir(), configDir, "agent"));
 	});
 
@@ -51,6 +55,11 @@ export function installStatsTestIsolation(prefix: string): StatsTestIsolation {
 			delete process.env.PI_CONFIG_DIR;
 		} else {
 			process.env.PI_CONFIG_DIR = originalConfigDir;
+		}
+		if (originalAgyDataDir === undefined) {
+			delete process.env[STATS_AGY_DATA_DIR_ENV];
+		} else {
+			process.env[STATS_AGY_DATA_DIR_ENV] = originalAgyDataDir;
 		}
 		for (const key of XDG_KEYS) {
 			const prior = originalXdg[key];
