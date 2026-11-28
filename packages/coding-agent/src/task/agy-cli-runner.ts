@@ -531,6 +531,11 @@ interface StepUsageTotals {
 	lastContextTokens?: number;
 }
 
+interface UnconfirmedFollowUp {
+	text: string;
+	alreadyPublishedInTranscript: boolean;
+}
+
 interface StepRunOutcome {
 	exitCode: number;
 	conversationId?: string;
@@ -547,11 +552,9 @@ interface StepRunOutcome {
 	abortReason?: string;
 	interruptedForSteer?: boolean;
 	/** Follow-up prompts accepted for this step whose turn was not confirmed by a `result` frame before exit. */
-	unconfirmedFollowUps?: string[];
+	unconfirmedFollowUps?: UnconfirmedFollowUp[];
 	/** True when the last completed `result` frame was already recorded in the transcript via an intermediate transition. */
 	lastResultAlreadyPublished?: boolean;
-	/** True when `unconfirmedFollowUps[0]` was already recorded as a user prompt via an intermediate transition. */
-	firstUnconfirmedAlreadyPublished?: boolean;
 }
 
 interface ActiveAgyProcessControl {
@@ -602,7 +605,7 @@ async function runSingleAgyStep(params: {
 	let stdinClosed = false;
 	let pendingTurns = 0;
 	let resultsReceived = 0;
-	const writtenFollowUps: string[] = [];
+	const writtenFollowUps: Array<{ text: string; publishedInTranscript: boolean }> = [];
 	const unwrittenFollowUps: string[] = [];
 
 	const currentUsage = (): StepUsageTotals => ({
@@ -670,7 +673,7 @@ async function runSingleAgyStep(params: {
 			}
 			pendingTurns += 1;
 			if (isFollowUp) {
-				writtenFollowUps.push(content);
+				writtenFollowUps.push({ text: content, publishedInTranscript: false });
 			}
 			return true;
 		} catch {
@@ -708,9 +711,15 @@ async function runSingleAgyStep(params: {
 		}
 	};
 
-	const collectUnconfirmedFollowUps = (): string[] => {
+	const collectUnconfirmedFollowUps = (): UnconfirmedFollowUp[] => {
 		const confirmedCount = Math.max(0, resultsReceived - 1);
-		return [...writtenFollowUps.slice(confirmedCount), ...unwrittenFollowUps];
+		return [
+			...writtenFollowUps.slice(confirmedCount).map(item => ({
+				text: item.text,
+				alreadyPublishedInTranscript: item.publishedInTranscript,
+			})),
+			...unwrittenFollowUps.map(text => ({ text, alreadyPublishedInTranscript: false })),
+		];
 	};
 
 	try {
@@ -775,16 +784,22 @@ async function runSingleAgyStep(params: {
 
 		const decoder = new TextDecoder();
 		let pending = "";
-		let publishedIntermediateTurns = 0;
+		let lastResultPublished = false;
 		let activeTurnHasResult = false;
-		let pendingIntermediateTransition: { prevResult: AgyStreamResult["result"]; nextPrompt: string } | undefined;
+		let pendingIntermediateTransition:
+			| { prevResult: AgyStreamResult["result"]; followUp: { text: string; publishedInTranscript: boolean } }
+			| undefined;
 		const flushPendingIntermediateTransition = () => {
 			if (!pendingIntermediateTransition) return;
 			const transition = pendingIntermediateTransition;
 			pendingIntermediateTransition = undefined;
-			publishedIntermediateTurns += 1;
+			transition.followUp.publishedInTranscript = true;
+			lastResultPublished = true;
 			activeTurnHasResult = false;
-			params.onIntermediateTurnComplete?.(transition);
+			params.onIntermediateTurnComplete?.({
+				prevResult: transition.prevResult,
+				nextPrompt: transition.followUp.text,
+			});
 		};
 		const handleLine = (rawLine: string) => {
 			const parsed = parseAgyStreamLine(rawLine);
@@ -817,6 +832,7 @@ async function runSingleAgyStep(params: {
 				resultEvent = parsed.result;
 				resultMalformedReason = parsed.malformedReason;
 				activeTurnHasResult = true;
+				lastResultPublished = false;
 				resultsReceived += 1;
 				noteConversationId(parsed.result?.conversation_id);
 				pendingTurns = Math.max(0, pendingTurns - 1);
@@ -827,13 +843,13 @@ async function runSingleAgyStep(params: {
 						flushDrainedFollowUps();
 					}
 					if (canContinue && pendingTurns > 0) {
-						const nextPrompt = writtenFollowUps[resultsReceived - 1];
+						const nextFollowUp = writtenFollowUps[resultsReceived - 1];
 						streamedText = "";
-						if (nextPrompt !== undefined) {
+						if (nextFollowUp !== undefined) {
 							// Defer recording the intermediate turn boundary until the child actually
 							// emits a frame for the successor turn; if stdin was closed and the child
 							// exits now, exit recovery records the transition exactly once on resume.
-							pendingIntermediateTransition = { prevResult: parsed.result, nextPrompt };
+							pendingIntermediateTransition = { prevResult: parsed.result, followUp: nextFollowUp };
 						}
 					} else {
 						closeStdinSafely();
@@ -927,8 +943,7 @@ async function runSingleAgyStep(params: {
 		}
 
 		const unconfirmedFollowUps = collectUnconfirmedFollowUps();
-		const lastResultAlreadyPublished = publishedIntermediateTurns > 0 && !activeTurnHasResult;
-		const firstUnconfirmedAlreadyPublished = lastResultAlreadyPublished && unconfirmedFollowUps.length > 0;
+		const lastResultAlreadyPublished = lastResultPublished && !activeTurnHasResult;
 		if (steerInterrupted && !aborted && !timedOut) {
 			return {
 				exitCode: 0,
@@ -944,7 +959,6 @@ async function runSingleAgyStep(params: {
 				interruptedForSteer: true,
 				...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
 				...(lastResultAlreadyPublished ? { lastResultAlreadyPublished: true } : {}),
-				...(firstUnconfirmedAlreadyPublished ? { firstUnconfirmedAlreadyPublished: true } : {}),
 			};
 		}
 
@@ -984,7 +998,6 @@ async function runSingleAgyStep(params: {
 			abortReason,
 			...(unconfirmedFollowUps.length > 0 ? { unconfirmedFollowUps } : {}),
 			...(lastResultAlreadyPublished ? { lastResultAlreadyPublished: true } : {}),
-			...(firstUnconfirmedAlreadyPublished ? { firstUnconfirmedAlreadyPublished: true } : {}),
 		};
 	} catch (err) {
 		const message = formatErrorMessage(err);
@@ -2192,9 +2205,15 @@ class AgySessionController {
 		return items.map(item => item.text);
 	}
 
-	drainAllPendingMessages(unconfirmedFollowUps: readonly string[] = []): string[] {
-		const steers = this.#pendingSteers.splice(0).map(item => item.text);
-		const followUps = this.#queuedFollowUps.splice(0).map(item => item.text);
+	drainAllPendingMessages(unconfirmedFollowUps: readonly UnconfirmedFollowUp[] = []): UnconfirmedFollowUp[] {
+		const steers = this.#pendingSteers.splice(0).map(item => ({
+			text: item.text,
+			alreadyPublishedInTranscript: false,
+		}));
+		const followUps = this.#queuedFollowUps.splice(0).map(item => ({
+			text: item.text,
+			alreadyPublishedInTranscript: false,
+		}));
 		return [...unconfirmedFollowUps, ...steers, ...followUps];
 	}
 
@@ -2381,12 +2400,34 @@ class AgySessionController {
 						const prevReply =
 							typeof prevResult?.response === "string" ? prevResult.response : pendingAssistantText;
 						const flushed = consumePendingTurnUsage();
-						if (prevReply || flushed.usage) {
+						let turnUsage = flushed.usage;
+						let turnDurationMs = flushed.durationMs;
+						if (prevResult?.usage) {
+							const resIn = prevResult.usage.input_tokens ?? 0;
+							const resOut = prevResult.usage.output_tokens ?? 0;
+							const resCache = prevResult.usage.cache_read_tokens ?? 0;
+							const deltaIn = Math.max(0, resIn - recordedStepInput);
+							const deltaOut = Math.max(0, resOut - recordedStepOutput);
+							const deltaCache = Math.max(0, resCache - recordedStepCacheRead);
+							if (deltaIn > 0 || deltaOut > 0 || deltaCache > 0) {
+								recordedStepInput += deltaIn;
+								recordedStepOutput += deltaOut;
+								recordedStepCacheRead += deltaCache;
+								const prevIn = turnUsage?.input ?? 0;
+								const prevOut = turnUsage?.output ?? 0;
+								const prevCache = turnUsage?.cacheRead ?? 0;
+								turnUsage = buildTranscriptUsage(prevIn + deltaIn, prevOut + deltaOut, prevCache + deltaCache);
+							}
+						}
+						if (turnDurationMs === undefined && prevResult?.duration_seconds !== undefined) {
+							turnDurationMs = Math.max(0, Math.round(prevResult.duration_seconds * 1000));
+						}
+						if (prevReply || turnUsage) {
 							input.transcript?.recordAssistantTurn({
 								text: prevReply,
 								stopReason: "stop",
-								usage: flushed.usage,
-								durationMs: flushed.durationMs,
+								usage: turnUsage,
+								durationMs: turnDurationMs,
 							});
 							if (prevReply) this.recordAssistantMessage(prevReply);
 						}
@@ -2702,9 +2743,10 @@ class AgySessionController {
 						}
 					}
 					if (pendingNext.length > 0) {
-						const alreadyPublishedCount = lastOutcome.firstUnconfirmedAlreadyPublished ? 1 : 0;
-						const unrecordedPrompts = pendingNext.slice(alreadyPublishedCount);
-						const combinedPrompt = pendingNext.join("\n\n");
+						const unrecordedPrompts = pendingNext
+							.filter(item => !item.alreadyPublishedInTranscript)
+							.map(item => item.text);
+						const combinedPrompt = pendingNext.map(item => item.text).join("\n\n");
 						currentTranscriptPrompt = unrecordedPrompts.join("\n\n");
 						recordNextUserPrompt = unrecordedPrompts.length > 0;
 						currentStepPrompt =
@@ -2957,11 +2999,16 @@ class AgySessionController {
 						summary.lastOutcome.aborted ||
 						Boolean(combinedAbort.signal.aborted) ||
 						refAtCommit?.status === "aborted";
-					const ownsLiveRef = Boolean(refAtCommit && refAtCommit.session === this.#sessionHandle);
+					const ownsLiveRef = Boolean(
+						refAtCommit && refAtCommit.session === this.#sessionHandle && refAtCommit.status !== "aborted",
+					);
 					this.#inActiveTurn = false;
+					// Always commit idle for an owned live ref — including when the caller aborted only this
+					// turn via AbortSignal or maxRuntimeMs — so the retained session returns to idle and
+					// rearms its idle TTL. Never overwrite an aborted tombstone or replacement ref.
 					const committedIdle = this.commitRunState("idle", {
 						expected: ownsLiveRef ? refAtCommit : this.#sessionHandle,
-						skipRegistry: wasAborted || !ownsLiveRef,
+						skipRegistry: !ownsLiveRef,
 					});
 					if (!wasAborted && ownsLiveRef && !committedIdle) {
 						wasAborted = true;
@@ -3123,7 +3170,14 @@ class AgySessionController {
 					if (!postLockEmit) {
 						this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
 						if (this.#running && (this.#wakeQueue.length === 0 || this.#disposed)) {
-							this.commitRunState("idle", { skipRegistry: this.#disposed });
+							const refNow = AgentRegistry.global().get(this.id);
+							const ownsNow = Boolean(
+								refNow && refNow.session === this.#sessionHandle && refNow.status !== "aborted",
+							);
+							this.commitRunState("idle", {
+								expected: ownsNow ? refNow : this.#sessionHandle,
+								skipRegistry: this.#disposed || !ownsNow,
+							});
 						}
 						releaseWakeHold();
 					}
@@ -3308,7 +3362,14 @@ class AgySessionController {
 					this.promoteLatePendingToWakeTurns();
 					this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
 					if (this.#wakeQueue.length === 0 || this.#disposed) {
-						this.commitRunState("idle", { skipRegistry: this.#disposed });
+						const refNow = AgentRegistry.global().get(this.id);
+						const ownsNow = Boolean(
+							refNow && refNow.session === this.#sessionHandle && refNow.status !== "aborted",
+						);
+						this.commitRunState("idle", {
+							expected: ownsNow ? refNow : this.#sessionHandle,
+							skipRegistry: this.#disposed || !ownsNow,
+						});
 					}
 				}
 			});

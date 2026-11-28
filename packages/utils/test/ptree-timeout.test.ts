@@ -1118,20 +1118,43 @@ console.log("settled");
 				expect(() => process.kill(helperPid, 0)).not.toThrow();
 
 				cp.kill(new AbortError("steer", ""), 120, "SIGINT");
-				await cp.exited.catch(() => {});
-				await cp.drainDone.catch(() => {});
-				await Bun.sleep(150);
+				await cp.wait({ allowAbort: true });
 
 				expect((await Bun.file(leaderSigFile).text()).trim()).toBe("SIGINT");
 
 				// The SIGINT/SIGTERM-ignoring descendant must be hard-killed by the group SIGKILL sweep.
-				let alive = true;
-				try {
-					process.kill(helperPid, 0);
-				} catch {
-					alive = false;
+				// Accept either gone (ESRCH) or zombie/dead state (Z/X) when an ancestor delays orphan reaping.
+				const isHelperStopped = async (pid: number): Promise<boolean> => {
+					try {
+						process.kill(pid, 0);
+					} catch {
+						return true;
+					}
+					if (process.platform === "linux") {
+						try {
+							const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
+							const closeParen = stat.lastIndexOf(")");
+							const procState =
+								closeParen >= 0
+									? stat
+											.slice(closeParen + 1)
+											.trim()
+											.split(" ")[0]
+									: "";
+							if (procState === "Z" || procState === "X") return true;
+						} catch {
+							return true;
+						}
+					}
+					return false;
+				};
+				const stopDeadline = Date.now() + 1000;
+				let stopped = await isHelperStopped(helperPid);
+				while (!stopped && Date.now() < stopDeadline) {
+					await Bun.sleep(20);
+					stopped = await isHelperStopped(helperPid);
 				}
-				expect(alive).toBe(false);
+				expect(stopped).toBe(true);
 			} finally {
 				const rawPid = await Bun.file(helperPidFile)
 					.text()

@@ -2534,11 +2534,20 @@ for await (const line of rl) {
 		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "SuccessorDropAgy.jsonl"), "utf8"))
 			.trim()
 			.split("\n")
-			.map(l => JSON.parse(l) as { type: string; message?: { role?: string; content?: Array<{ text?: string }> } });
+			.map(
+				l =>
+					JSON.parse(l) as {
+						type: string;
+						message?: {
+							role?: string;
+							content?: Array<{ text?: string }>;
+							usage?: { input?: number; output?: number };
+						};
+					},
+			);
 
-		const assistantTexts = transcriptLines
-			.filter(e => e.type === "message" && e.message?.role === "assistant")
-			.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
+		const assistantEntries = transcriptLines.filter(e => e.type === "message" && e.message?.role === "assistant");
+		const assistantTexts = assistantEntries.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
 		const userTexts = transcriptLines
 			.filter(e => e.type === "message" && e.message?.role === "user")
 			.map(e => (e.message?.content ?? []).map(c => c.text ?? "").join(""));
@@ -2546,6 +2555,14 @@ for await (const line of rl) {
 		expect(assistantTexts.filter(t => t.includes("UNIQUE_FIRST_ANSWER_841"))).toHaveLength(1);
 		expect(userTexts.filter(t => t.includes("UNIQUE_FOLLOWUP_PROMPT_841"))).toHaveLength(1);
 		expect(assistantTexts.filter(t => t.includes("UNIQUE_SECOND_ANSWER_842:"))).toHaveLength(1);
+
+		// Transcript accounting must preserve result-only usage from Turn 1 (40 in / 10 out) plus resumed Turn 2 (50 in / 15 out).
+		const totalTranscriptInput = assistantEntries.reduce((sum, e) => sum + (e.message?.usage?.input ?? 0), 0);
+		const totalTranscriptOutput = assistantEntries.reduce((sum, e) => sum + (e.message?.usage?.output ?? 0), 0);
+		expect(totalTranscriptInput).toBe(90);
+		expect(totalTranscriptOutput).toBe(25);
+		expect(res.usage?.input).toBe(90);
+		expect(res.usage?.output).toBe(25);
 	}, 30_000);
 
 	it("reserves the initial turn lock before exposing the session on registered and commits monitored idle once", async () => {
@@ -2655,27 +2672,125 @@ for await (const line of rl) {
 			unsubReg();
 		}
 
-		// Verify monitored settlement calls AgentRegistry.setStatus(id, "idle", ...) exactly once (single writer).
+		// Verify observable running->idle settlement and retained-session availability on both normal completion
+		// and caller-aborted monitored turns (caller abort must return the retained ref to idle, not leave it running).
 		const registry = AgentRegistry.global();
-		const origSetStatus = registry.setStatus.bind(registry);
-		let idleStatusWrites = 0;
-		registry.setStatus = ((idArg, statusArg, expectedArg) => {
-			if (idArg === "StartupLockWorker" && statusArg === "idle") {
-				idleStatusWrites += 1;
+		const observedStatuses: string[] = [];
+		const unsubStatus = registry.onChange(ev => {
+			if (ev.type === "status_changed" && ev.ref.id === "StartupLockWorker") {
+				observedStatuses.push(ev.ref.status);
 			}
-			return origSetStatus(idArg, statusArg, expectedArg);
-		}) as typeof registry.setStatus;
+		});
 		try {
 			const secondMon = await runSubagentFollowUpTurn({
 				id: "StartupLockWorker",
 				agent: makeAgent(),
-				message: "SINGLE_IDLE_WRITER_903",
+				message: "NORMAL_SETTLE_903",
 				artifactsDir,
 			});
 			expect(secondMon.exitCode).toBe(0);
-			expect(idleStatusWrites).toBe(1);
+			expect(observedStatuses).toEqual(["running", "idle"]);
+			const idleRefAfterNormal = registry.get("StartupLockWorker");
+			expect(idleRefAfterNormal?.status).toBe("idle");
+			expect(idleRefAfterNormal?.session?.runStartedAt).toBeUndefined();
+
+			// Caller-aborted monitored turn must still transition the owned live ref back to idle and leave
+			// the retained session usable for subsequent turns and lifecycle parking.
+			observedStatuses.length = 0;
+			const slowAbortBin = await createFakeAgyBinary(
+				dir,
+				`
+import * as readline from "node:readline";
+const argv = process.argv.slice(2);
+const convIdx = argv.indexOf("--conversation");
+const cid = convIdx >= 0 ? argv[convIdx + 1] : "conv-abort-idle";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	const msg = JSON.parse(line);
+	const content = msg?.message?.content ?? "";
+	if (content.includes("SLOW_CALLER_ABORT_904")) {
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "sleep 10" } } },
+		});
+		await new Promise(r => setTimeout(r, 10_000));
+	}
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "AFTER_ABORT_OK:" + content.slice(-30),
+			num_turns: 1,
+			usage: { input_tokens: 15, output_tokens: 5, cache_read_tokens: 0 },
+		},
+	});
+	break;
+}
+`,
+				"fake-agy-caller-abort",
+			);
+
+			const abortInit = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "ABORT_RETAINED_INIT",
+				index: 0,
+				id: "CallerAbortRetainedWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(slowAbortBin, { task: "gemini-4-neon-medium" }),
+			});
+			expect(abortInit.exitCode).toBe(0);
+
+			const abortStatuses: string[] = [];
+			const unsubAbortStatus = registry.onChange(ev => {
+				if (ev.type === "status_changed" && ev.ref.id === "CallerAbortRetainedWorker") {
+					abortStatuses.push(ev.ref.status);
+				}
+			});
+			try {
+				const callerAbort = new AbortController();
+				const abortedTurn = await runSubagentFollowUpTurn({
+					id: "CallerAbortRetainedWorker",
+					agent: makeAgent(),
+					message: "SLOW_CALLER_ABORT_904",
+					signal: callerAbort.signal,
+					onProgress: p => {
+						if (p.currentTool === "bash" && !callerAbort.signal.aborted) {
+							callerAbort.abort("Caller cancelled turn");
+						}
+					},
+				});
+				expect(abortedTurn.exitCode).toBe(1);
+				expect(abortedTurn.aborted).toBe(true);
+				expect(abortStatuses).toEqual(["running", "idle"]);
+
+				const refAfterCallerAbort = registry.get("CallerAbortRetainedWorker");
+				expect(refAfterCallerAbort?.status).toBe("idle");
+				expect(refAfterCallerAbort?.session).not.toBeNull();
+				expect(refAfterCallerAbort?.session?.runStartedAt).toBeUndefined();
+
+				// A follow-up turn after caller abort still succeeds on the retained session.
+				const recoveredTurn = await runSubagentFollowUpTurn({
+					id: "CallerAbortRetainedWorker",
+					agent: makeAgent(),
+					message: "POST_ABORT_FOLLOWUP_905",
+				});
+				expect(recoveredTurn.exitCode).toBe(0);
+				expect(recoveredTurn.output).toContain("AFTER_ABORT_OK:");
+				expect(recoveredTurn.output).toContain("POST_ABORT_FOLLOWUP_905");
+				expect(registry.get("CallerAbortRetainedWorker")?.status).toBe("idle");
+			} finally {
+				unsubAbortStatus();
+			}
 		} finally {
-			registry.setStatus = origSetStatus;
+			unsubStatus();
 		}
 	}, 30_000);
 });
