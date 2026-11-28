@@ -581,7 +581,11 @@ async function runSingleAgyStep(params: {
 	onProcessAttached?: (control: ActiveAgyProcessControl) => void;
 	onProcessDetached?: () => void;
 	onConversationId?: (conversationId: string) => void;
-	onIntermediateTurnComplete?: (info: { prevResult: AgyStreamResult["result"]; nextPrompt: string }) => void;
+	onIntermediateTurnComplete?: (info: {
+		prevResult: AgyStreamResult["result"];
+		prevUsage: StepUsageTotals;
+		nextPrompt: string;
+	}) => void;
 	drainQueuedFollowUps?: () => string[];
 	hasPendingSteer?: () => boolean;
 }): Promise<StepRunOutcome> {
@@ -787,8 +791,34 @@ async function runSingleAgyStep(params: {
 		let lastResultPublished = false;
 		let activeTurnHasResult = false;
 		let pendingIntermediateTransition:
-			| { prevResult: AgyStreamResult["result"]; followUp: { text: string; publishedInTranscript: boolean } }
+			| {
+					prevResult: AgyStreamResult["result"];
+					prevUsage: StepUsageTotals;
+					followUp: { text: string; publishedInTranscript: boolean };
+			  }
 			| undefined;
+		const reconcileResultUsage = (res: AgyStreamResult["result"] | undefined) => {
+			if (!res) return;
+			if (res.num_turns !== undefined) {
+				stepRequests = res.num_turns;
+			}
+			const resUsage = res.usage;
+			if (resUsage) {
+				if (resUsage.input_tokens !== undefined) {
+					stepInput = resUsage.input_tokens;
+				}
+				if (resUsage.output_tokens !== undefined) {
+					stepOutput = resUsage.output_tokens;
+				}
+				if (resUsage.cache_read_tokens !== undefined) {
+					stepCacheRead = resUsage.cache_read_tokens;
+				}
+				if (stepLastContext === undefined && stepRequests === 1) {
+					const ctx = (resUsage.input_tokens ?? 0) + (resUsage.cache_read_tokens ?? 0);
+					if (ctx > 0) stepLastContext = ctx;
+				}
+			}
+		};
 		const flushPendingIntermediateTransition = () => {
 			if (!pendingIntermediateTransition) return;
 			const transition = pendingIntermediateTransition;
@@ -798,6 +828,7 @@ async function runSingleAgyStep(params: {
 			activeTurnHasResult = false;
 			params.onIntermediateTurnComplete?.({
 				prevResult: transition.prevResult,
+				prevUsage: transition.prevUsage,
 				nextPrompt: transition.followUp.text,
 			});
 		};
@@ -831,6 +862,7 @@ async function runSingleAgyStep(params: {
 				flushPendingIntermediateTransition();
 				resultEvent = parsed.result;
 				resultMalformedReason = parsed.malformedReason;
+				reconcileResultUsage(parsed.result);
 				activeTurnHasResult = true;
 				lastResultPublished = false;
 				resultsReceived += 1;
@@ -849,7 +881,11 @@ async function runSingleAgyStep(params: {
 							// Defer recording the intermediate turn boundary until the child actually
 							// emits a frame for the successor turn; if stdin was closed and the child
 							// exits now, exit recovery records the transition exactly once on resume.
-							pendingIntermediateTransition = { prevResult: parsed.result, followUp: nextFollowUp };
+							pendingIntermediateTransition = {
+								prevResult: parsed.result,
+								prevUsage: currentUsage(),
+								followUp: nextFollowUp,
+							};
 						}
 					} else {
 						closeStdinSafely();
@@ -921,26 +957,6 @@ async function runSingleAgyStep(params: {
 		}
 
 		stderrText = cp.peekStderr().trim();
-
-		const resUsage = resultEvent?.usage;
-		if (resultEvent?.num_turns !== undefined) {
-			stepRequests = resultEvent.num_turns;
-		}
-		if (resUsage) {
-			if (resUsage.input_tokens !== undefined) {
-				stepInput = resUsage.input_tokens;
-			}
-			if (resUsage.output_tokens !== undefined) {
-				stepOutput = resUsage.output_tokens;
-			}
-			if (resUsage.cache_read_tokens !== undefined) {
-				stepCacheRead = resUsage.cache_read_tokens;
-			}
-			if (stepLastContext === undefined && stepRequests === 1) {
-				const ctx = (resUsage.input_tokens ?? 0) + (resUsage.cache_read_tokens ?? 0);
-				if (ctx > 0) stepLastContext = ctx;
-			}
-		}
 
 		const unconfirmedFollowUps = collectUnconfirmedFollowUps();
 		const lastResultAlreadyPublished = lastResultPublished && !activeTurnHasResult;
@@ -2396,28 +2412,23 @@ class AgySessionController {
 						this.setConversationId(cid);
 						input.transcript?.recordAgySession(cid);
 					},
-					onIntermediateTurnComplete: ({ prevResult, nextPrompt }) => {
+					onIntermediateTurnComplete: ({ prevResult, prevUsage, nextPrompt }) => {
 						const prevReply =
 							typeof prevResult?.response === "string" ? prevResult.response : pendingAssistantText;
 						const flushed = consumePendingTurnUsage();
 						let turnUsage = flushed.usage;
 						let turnDurationMs = flushed.durationMs;
-						if (prevResult?.usage) {
-							const resIn = prevResult.usage.input_tokens ?? 0;
-							const resOut = prevResult.usage.output_tokens ?? 0;
-							const resCache = prevResult.usage.cache_read_tokens ?? 0;
-							const deltaIn = Math.max(0, resIn - recordedStepInput);
-							const deltaOut = Math.max(0, resOut - recordedStepOutput);
-							const deltaCache = Math.max(0, resCache - recordedStepCacheRead);
-							if (deltaIn > 0 || deltaOut > 0 || deltaCache > 0) {
-								recordedStepInput += deltaIn;
-								recordedStepOutput += deltaOut;
-								recordedStepCacheRead += deltaCache;
-								const prevIn = turnUsage?.input ?? 0;
-								const prevOut = turnUsage?.output ?? 0;
-								const prevCache = turnUsage?.cacheRead ?? 0;
-								turnUsage = buildTranscriptUsage(prevIn + deltaIn, prevOut + deltaOut, prevCache + deltaCache);
-							}
+						const deltaIn = Math.max(0, prevUsage.inputTokens - recordedStepInput);
+						const deltaOut = Math.max(0, prevUsage.outputTokens - recordedStepOutput);
+						const deltaCache = Math.max(0, prevUsage.cacheReadTokens - recordedStepCacheRead);
+						if (deltaIn > 0 || deltaOut > 0 || deltaCache > 0) {
+							recordedStepInput += deltaIn;
+							recordedStepOutput += deltaOut;
+							recordedStepCacheRead += deltaCache;
+							const prevIn = turnUsage?.input ?? 0;
+							const prevOut = turnUsage?.output ?? 0;
+							const prevCache = turnUsage?.cacheRead ?? 0;
+							turnUsage = buildTranscriptUsage(prevIn + deltaIn, prevOut + deltaOut, prevCache + deltaCache);
 						}
 						if (turnDurationMs === undefined && prevResult?.duration_seconds !== undefined) {
 							turnDurationMs = Math.max(0, Math.round(prevResult.duration_seconds * 1000));

@@ -2793,4 +2793,134 @@ for await (const line of rl) {
 			unsubStatus();
 		}
 	}, 30_000);
+
+	it("preserves prior reconciled usage when a same-process successor's final result frame omits some usage counters", async () => {
+		const dir = await makeTempDir("omp-agy-partial-final-usage-");
+		const parentSession = path.join(dir, "parent.jsonl");
+		const artifactsDir = path.join(dir, "parent");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-pfu" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		const partialUsageBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const cid = "conv-partial-usage";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+let turn = 0;
+for await (const line of rl) {
+	if (!line.trim()) continue;
+	turn += 1;
+	if (turn === 1) {
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
+		});
+		await new Promise(r => setTimeout(r, 150));
+		emit({
+			event: "step_update",
+			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+		});
+		// Turn 1 reports usage only on its result frame (40 in / 10 out / 8 cache_read).
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "TURN1_USAGE_ANSWER",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+		});
+		continue;
+	}
+	// Successor reports its own DONE usage (50 in / 15 out / 12 cache_read), then its final SUCCESS frame
+	// reports only cumulative input_tokens: 90 and omits output_tokens and cache_read_tokens.
+	emit({
+		event: "step_update",
+		step_update: {
+			step_index: 2,
+			step_type: "agent_response",
+			state: "DONE",
+			text_delta: "TURN2_USAGE_ANSWER",
+			usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
+		},
+	});
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "TURN2_USAGE_ANSWER",
+			num_turns: 2,
+			usage: { input_tokens: 90 },
+		},
+	});
+	break;
+}
+`,
+			"fake-agy-partial-usage",
+		);
+
+		let injected = false;
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Turn 1 partial usage test",
+			index: 0,
+			id: "PartialUsageAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(partialUsageBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!injected && p.currentTool === "bash") {
+					injected = true;
+					void IrcBus.global().send({
+						from: "PeerUsage",
+						to: "PartialUsageAgy",
+						body: "Turn 2 partial usage follow-up",
+					});
+				}
+			},
+		});
+
+		expect(res.exitCode).toBe(0);
+		expect(res.output).toBe("TURN2_USAGE_ANSWER");
+		expect(res.usage?.input).toBe(90);
+		expect(res.usage?.output).toBe(25);
+		expect(res.usage?.cacheRead).toBe(20);
+
+		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "PartialUsageAgy.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(
+				l =>
+					JSON.parse(l) as {
+						type: string;
+						message?: {
+							role?: string;
+							content?: Array<{ text?: string }>;
+							usage?: { input?: number; output?: number; cacheRead?: number };
+						};
+					},
+			);
+		const assistantEntries = transcriptLines.filter(e => e.type === "message" && e.message?.role === "assistant");
+		const turn1Entry = assistantEntries.find(e =>
+			(e.message?.content ?? []).some(c => c.text?.includes("TURN1_USAGE_ANSWER")),
+		);
+		const turn2Entry = assistantEntries.find(e =>
+			(e.message?.content ?? []).some(c => c.text?.includes("TURN2_USAGE_ANSWER")),
+		);
+		expect(turn1Entry?.message?.usage?.input).toBe(40);
+		expect(turn1Entry?.message?.usage?.output).toBe(10);
+		expect(turn1Entry?.message?.usage?.cacheRead).toBe(8);
+		expect(turn2Entry?.message?.usage?.input).toBe(50);
+		expect(turn2Entry?.message?.usage?.output).toBe(15);
+		expect(turn2Entry?.message?.usage?.cacheRead).toBe(12);
+	}, 30_000);
 });

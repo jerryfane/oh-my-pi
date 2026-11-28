@@ -2,7 +2,7 @@ import { describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs/promises";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Process, ProcessStatus } from "@oh-my-pi/pi-natives";
+import { Process, ProcessStatus, processInfo } from "@oh-my-pi/pi-natives";
 import {
 	AbortError,
 	ChildProcess,
@@ -1115,7 +1115,7 @@ console.log("settled");
 				const helperPid = Number.parseInt((await Bun.file(helperPidFile).text()).trim(), 10);
 				expect(helperPid).toBeGreaterThan(1);
 				expect(helperPid).not.toBe(cp.pid);
-				expect(() => process.kill(helperPid, 0)).not.toThrow();
+				expect(processInfo([helperPid]).map(p => p.pid)).toEqual([helperPid]);
 
 				cp.kill(new AbortError("steer", ""), 120, "SIGINT");
 				await cp.wait({ allowAbort: true });
@@ -1123,38 +1123,12 @@ console.log("settled");
 				expect((await Bun.file(leaderSigFile).text()).trim()).toBe("SIGINT");
 
 				// The SIGINT/SIGTERM-ignoring descendant must be hard-killed by the group SIGKILL sweep.
-				// Accept either gone (ESRCH) or zombie/dead state (Z/X) when an ancestor delays orphan reaping.
-				const isHelperStopped = async (pid: number): Promise<boolean> => {
-					try {
-						process.kill(pid, 0);
-					} catch {
-						return true;
-					}
-					if (process.platform === "linux") {
-						try {
-							const stat = await fs.readFile(`/proc/${pid}/stat`, "utf8");
-							const closeParen = stat.lastIndexOf(")");
-							const procState =
-								closeParen >= 0
-									? stat
-											.slice(closeParen + 1)
-											.trim()
-											.split(" ")[0]
-									: "";
-							if (procState === "Z" || procState === "X") return true;
-						} catch {
-							return true;
-						}
-					}
-					return false;
-				};
+				// Native `processInfo` excludes exited and zombie processes without swallowing probe errors.
 				const stopDeadline = Date.now() + 1000;
-				let stopped = await isHelperStopped(helperPid);
-				while (!stopped && Date.now() < stopDeadline) {
+				while (processInfo([helperPid]).length > 0 && Date.now() < stopDeadline) {
 					await Bun.sleep(20);
-					stopped = await isHelperStopped(helperPid);
 				}
-				expect(stopped).toBe(true);
+				expect(processInfo([helperPid])).toEqual([]);
 			} finally {
 				const rawPid = await Bun.file(helperPidFile)
 					.text()
