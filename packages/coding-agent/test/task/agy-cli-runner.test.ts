@@ -2450,19 +2450,24 @@ const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-let turn = 0;
-for await (const line of rl) {
-	if (!line.trim()) continue;
-	const msg = JSON.parse(line);
-	const content = msg?.message?.content ?? "";
-	turn += 1;
-	if (!conv && turn === 1) {
-		// Wait briefly so the sibling follow-up arrives on stdin before emitting Turn 1 SUCCESS.
+const linesIter = rl[Symbol.asyncIterator]();
+const readPromptLine = async () => {
+	while (true) {
+		const next = await linesIter.next();
+		if (next.done) return null;
+		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
+	}
+};
+
+const firstContent = await readPromptLine();
+if (firstContent !== null) {
+	if (!conv) {
+		// Keep the tool ACTIVE until the follow-up arrives on live stdin (event-driven, no timer race).
 		emit({
 			event: "step_update",
 			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
 		});
-		await new Promise(r => setTimeout(r, 150));
+		const secondContent = await readPromptLine();
 		emit({
 			event: "step_update",
 			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
@@ -2477,27 +2482,26 @@ for await (const line of rl) {
 				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 0 },
 			},
 		});
-		continue;
-	}
-	if (!conv && turn === 2) {
-		// Emit one valid successor ACTIVE frame, then exit 0 WITHOUT emitting a second result frame.
+		if (secondContent !== null) {
+			// Emit one valid successor ACTIVE frame, then exit 0 WITHOUT emitting a second result frame.
+			emit({
+				event: "step_update",
+				step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+			});
+			process.exit(0);
+		}
+	} else {
 		emit({
-			event: "step_update",
-			step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "UNIQUE_SECOND_ANSWER_842:" + firstContent.slice(-30),
+				num_turns: 1,
+				usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 0 },
+			},
 		});
-		process.exit(0);
 	}
-	emit({
-		event: "result",
-		result: {
-			conversation_id: cid,
-			status: "SUCCESS",
-			response: "UNIQUE_SECOND_ANSWER_842:" + content.slice(-30),
-			num_turns: 1,
-			usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 0 },
-		},
-	});
-	break;
 }
 `,
 			"fake-agy-successor-drop",
@@ -2794,7 +2798,7 @@ for await (const line of rl) {
 		}
 	}, 30_000);
 
-	it("preserves prior reconciled usage when a same-process successor's final result frame omits some usage counters", async () => {
+	it("preserves prior reconciled usage on partial final frames and does not carry first-request context onto a result-only successor", async () => {
 		const dir = await makeTempDir("omp-agy-partial-final-usage-");
 		const parentSession = path.join(dir, "parent.jsonl");
 		const artifactsDir = path.join(dir, "parent");
@@ -2810,56 +2814,62 @@ const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
 emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-let turn = 0;
-for await (const line of rl) {
-	if (!line.trim()) continue;
-	turn += 1;
-	if (turn === 1) {
-		emit({
-			event: "step_update",
-			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
-		});
-		await new Promise(r => setTimeout(r, 150));
-		emit({
-			event: "step_update",
-			step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
-		});
-		// Turn 1 reports usage only on its result frame (40 in / 10 out / 8 cache_read).
-		emit({
-			event: "result",
-			result: {
-				conversation_id: cid,
-				status: "SUCCESS",
-				response: "TURN1_USAGE_ANSWER",
-				num_turns: 1,
-				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
-			},
-		});
-		continue;
+const linesIter = rl[Symbol.asyncIterator]();
+const readPromptLine = async () => {
+	while (true) {
+		const next = await linesIter.next();
+		if (next.done) return null;
+		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
 	}
-	// Successor reports its own DONE usage (50 in / 15 out / 12 cache_read), then its final SUCCESS frame
-	// reports only cumulative input_tokens: 90 and omits output_tokens and cache_read_tokens.
+};
+
+const first = await readPromptLine();
+if (first !== null) {
+	// Keep tool ACTIVE until the live follow-up arrives on stdin (no timer race with progress coalescer).
 	emit({
 		event: "step_update",
-		step_update: {
-			step_index: 2,
-			step_type: "agent_response",
-			state: "DONE",
-			text_delta: "TURN2_USAGE_ANSWER",
-			usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
-		},
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
 	});
+	const second = await readPromptLine();
+	emit({
+		event: "step_update",
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+	});
+	// Turn 1 reports usage only on its result frame (40 in / 10 out / 8 cache_read).
 	emit({
 		event: "result",
 		result: {
 			conversation_id: cid,
 			status: "SUCCESS",
-			response: "TURN2_USAGE_ANSWER",
-			num_turns: 2,
-			usage: { input_tokens: 90 },
+			response: "TURN1_USAGE_ANSWER",
+			num_turns: 1,
+			usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
 		},
 	});
-	break;
+	if (second !== null) {
+		// Successor reports its own DONE usage (50 in / 15 out / 12 cache_read), then its final SUCCESS frame
+		// reports only cumulative input_tokens: 90 and omits output_tokens and cache_read_tokens.
+		emit({
+			event: "step_update",
+			step_update: {
+				step_index: 2,
+				step_type: "agent_response",
+				state: "DONE",
+				text_delta: "TURN2_USAGE_ANSWER",
+				usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
+			},
+		});
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "TURN2_USAGE_ANSWER",
+				num_turns: 2,
+				usage: { input_tokens: 90 },
+			},
+		});
+	}
 }
 `,
 			"fake-agy-partial-usage",
@@ -2894,6 +2904,7 @@ for await (const line of rl) {
 		expect(res.usage?.input).toBe(90);
 		expect(res.usage?.output).toBe(25);
 		expect(res.usage?.cacheRead).toBe(20);
+		expect(res.contextTokens).toBe(62);
 
 		const transcriptLines = (await fs.readFile(path.join(artifactsDir, "PartialUsageAgy.jsonl"), "utf8"))
 			.trim()
@@ -2922,5 +2933,95 @@ for await (const line of rl) {
 		expect(turn2Entry?.message?.usage?.input).toBe(50);
 		expect(turn2Entry?.message?.usage?.output).toBe(15);
 		expect(turn2Entry?.message?.usage?.cacheRead).toBe(12);
+
+		// Two-turn same-process run with result-only usage (no agent_response DONE frames): cumulative usage
+		// and requests reconcile cleanly, while contextTokens must stay undefined instead of reporting Turn 1's 48.
+		const resultOnlyTwoTurnBin = await createFakeAgyBinary(
+			dir,
+			`
+import * as readline from "node:readline";
+const cid = "conv-result-only-two-turns";
+const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
+emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+
+const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
+const linesIter = rl[Symbol.asyncIterator]();
+const readPromptLine = async () => {
+	while (true) {
+		const next = await linesIter.next();
+		if (next.done) return null;
+		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
+	}
+};
+
+const first = await readPromptLine();
+if (first !== null) {
+	emit({
+		event: "step_update",
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
+	});
+	const second = await readPromptLine();
+	emit({
+		event: "step_update",
+		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
+	});
+	emit({
+		event: "result",
+		result: {
+			conversation_id: cid,
+			status: "SUCCESS",
+			response: "RESULT_ONLY_TURN1",
+			num_turns: 1,
+			usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+		},
+	});
+	if (second !== null) {
+		emit({
+			event: "result",
+			result: {
+				conversation_id: cid,
+				status: "SUCCESS",
+				response: "RESULT_ONLY_TURN2",
+				num_turns: 2,
+				usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+			},
+		});
+	}
+}
+`,
+			"fake-agy-result-only-two-turns",
+		);
+
+		let injectedTwoTurn = false;
+		const twoTurnRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Turn 1 result-only context check",
+			index: 0,
+			id: "ResultOnlyTwoTurnAgy",
+			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir,
+			sessionFile: parentSession,
+			keepAlive: false,
+			settings: makeSettings(resultOnlyTwoTurnBin, { task: "gemini-4-neon-medium" }),
+			onProgress: p => {
+				if (!injectedTwoTurn && p.currentTool === "bash") {
+					injectedTwoTurn = true;
+					void IrcBus.global().send({
+						from: "PeerTwoTurn",
+						to: "ResultOnlyTwoTurnAgy",
+						body: "Turn 2 result-only follow-up",
+					});
+				}
+			},
+		});
+
+		expect(twoTurnRes.exitCode).toBe(0);
+		expect(twoTurnRes.output).toBe("RESULT_ONLY_TURN2");
+		expect(twoTurnRes.requests).toBe(2);
+		expect(twoTurnRes.usage?.input).toBe(90);
+		expect(twoTurnRes.usage?.output).toBe(25);
+		expect(twoTurnRes.usage?.cacheRead).toBe(20);
+		expect(twoTurnRes.contextTokens).toBeUndefined();
 	}, 30_000);
 });

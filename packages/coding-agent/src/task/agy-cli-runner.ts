@@ -612,13 +612,20 @@ async function runSingleAgyStep(params: {
 	const writtenFollowUps: Array<{ text: string; publishedInTranscript: boolean }> = [];
 	const unwrittenFollowUps: string[] = [];
 
-	const currentUsage = (): StepUsageTotals => ({
-		requests: stepRequests,
-		inputTokens: stepInput,
-		outputTokens: stepOutput,
-		cacheReadTokens: stepCacheRead,
-		lastContextTokens: stepLastContext,
-	});
+	const currentUsage = (includeSingleRequestFallback = false): StepUsageTotals => {
+		let lastContextTokens = stepLastContext;
+		if (includeSingleRequestFallback && lastContextTokens === undefined && stepRequests === 1 && resultEvent?.usage) {
+			const ctx = (resultEvent.usage.input_tokens ?? 0) + (resultEvent.usage.cache_read_tokens ?? 0);
+			if (ctx > 0) lastContextTokens = ctx;
+		}
+		return {
+			requests: stepRequests,
+			inputTokens: stepInput,
+			outputTokens: stepOutput,
+			cacheReadTokens: stepCacheRead,
+			lastContextTokens,
+		};
+	};
 
 	if (params.abortSignal?.aborted) {
 		abortReason = abortReasonOf(params.abortSignal, "Cancelled");
@@ -813,10 +820,6 @@ async function runSingleAgyStep(params: {
 				if (resUsage.cache_read_tokens !== undefined) {
 					stepCacheRead = resUsage.cache_read_tokens;
 				}
-				if (stepLastContext === undefined && stepRequests === 1) {
-					const ctx = (resUsage.input_tokens ?? 0) + (resUsage.cache_read_tokens ?? 0);
-					if (ctx > 0) stepLastContext = ctx;
-				}
 			}
 		};
 		const flushPendingIntermediateTransition = () => {
@@ -826,6 +829,7 @@ async function runSingleAgyStep(params: {
 			transition.followUp.publishedInTranscript = true;
 			lastResultPublished = true;
 			activeTurnHasResult = false;
+			stepLastContext = undefined;
 			params.onIntermediateTurnComplete?.({
 				prevResult: transition.prevResult,
 				prevUsage: transition.prevUsage,
@@ -967,7 +971,7 @@ async function runSingleAgyStep(params: {
 				model,
 				response: streamedText,
 				responseIsAuthoritative: false,
-				usage: currentUsage(),
+				usage: currentUsage(true),
 				durationMs: Math.max(0, Date.now() - stepStartTime),
 				stderr: stderrText,
 				aborted: false,
@@ -1005,7 +1009,7 @@ async function runSingleAgyStep(params: {
 			response: finalResponse,
 			responseIsAuthoritative,
 			structuredOutput: activeTurnHasResult ? resultEvent?.structured_output : undefined,
-			usage: currentUsage(),
+			usage: currentUsage(true),
 			durationMs,
 			error: errorMessage,
 			stderr: stderrText || errorMessage || "",
@@ -2443,6 +2447,7 @@ class AgySessionController {
 							if (prevReply) this.recordAssistantMessage(prevReply);
 						}
 						pendingAssistantText = "";
+						if (input.progress) input.progress.contextTokens = undefined;
 						input.transcript?.recordUserPrompt(nextPrompt);
 						this.recordUserMessage(nextPrompt);
 					},
