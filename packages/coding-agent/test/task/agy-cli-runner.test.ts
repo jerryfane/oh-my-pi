@@ -1316,4 +1316,168 @@ exit 1
 			["completed", undefined],
 		]);
 	}, 30_000);
+
+	it("fixes tool correlation, exclusive transcript creation, streamed fallback dedup, and per-turn usage recording", async () => {
+		const dir = await makeTempDir("omp-agy-p2-usage-");
+		const parentSession = path.join(dir, "parent-session.jsonl");
+		const artifactsDir = path.join(dir, "parent-session");
+		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p1" })}\n`);
+		await fs.mkdir(artifactsDir, { recursive: true });
+
+		// 1. Out-of-order unindexed tool completions match by tool name, repeated indexed ACTIVE is idempotent,
+		// and per-turn + residual usage is recorded without double-counting.
+		const multiBin = await createFakeAgyShell(
+			dir,
+			`printf '%s\\n' '{"event":"init","conversation_id":"conv-p2","init":{"model":"gemini-4-neon-medium"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"Inspecting repo. "}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"DONE","usage":{"input_tokens":100,"output_tokens":20,"cache_read_tokens":50},"duration_seconds":0.25}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":7,"state":"ACTIVE","tool_name":"bash","tool_info":{"parameters":{"command":"ls"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":7,"state":"ACTIVE","tool_name":"bash","tool_info":{"parameters":{"command":"ls -la"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":7,"state":"DONE","tool_name":"bash","tool_info":{"parameters":{"command":"ls -la"},"output":"file.ts"}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"read","tool_info":{"parameters":{"path":"a.ts"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","state":"ACTIVE","tool_name":"grep","tool_info":{"parameters":{"pattern":"foo"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","state":"DONE","tool_name":"grep","tool_info":{"output":"grep-out"}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","state":"DONE","tool_name":"read","tool_info":{"output":"read-out"}}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-p2","status":"SUCCESS","response":"Final summary.","duration_seconds":1.2,"num_turns":2,"usage":{"input_tokens":350,"output_tokens":70,"cache_read_tokens":200}}}'
+exit 0
+`,
+			"fake-agy-p2-multi",
+		);
+
+		const res = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "Run tools and summarize",
+			index: 0,
+			id: "ToolOrderAndUsage",
+			artifactsDir,
+			sessionFile: parentSession,
+			settings: makeSettings(multiBin, { task: "default" }),
+		});
+		expect(res.exitCode).toBe(0);
+
+		const transcriptPath = path.join(artifactsDir, "ToolOrderAndUsage.jsonl");
+		const entries = (await fs.readFile(transcriptPath, "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+
+		// Delegated user prompt carries attribution="agent".
+		const userEntry = entries.find(
+			e => e.type === "message" && (e.message as Record<string, unknown>).role === "user",
+		);
+		expect((userEntry?.message as Record<string, unknown>)?.attribution).toBe("agent");
+
+		// agy_session custom entry captures conversationId once.
+		const agySessions = entries.filter(e => e.type === "custom" && e.customType === "agy_session");
+		expect(agySessions).toHaveLength(1);
+		expect((agySessions[0]?.data as Record<string, unknown>)?.conversationId).toBe("conv-p2");
+
+		// Duplicate indexed ACTIVE for bash (step_index 7) minted only ONE tool_execution_start.
+		const toolStarts = entries.filter(e => e.type === "custom" && e.customType === "tool_execution_start");
+		const startByName = new Map(
+			toolStarts.map(e => [
+				(e.data as Record<string, unknown>).toolName as string,
+				(e.data as Record<string, unknown>).toolCallId as string,
+			]),
+		);
+		expect(toolStarts).toHaveLength(3);
+
+		// Unindexed out-of-order DONE grep / DONE read attach each output to its matching tool call ID.
+		const toolResults = entries
+			.filter(e => e.type === "message" && (e.message as Record<string, unknown>).role === "toolResult")
+			.map(e => e.message as Record<string, unknown>);
+		const grepResult = toolResults.find(r => r.toolName === "grep");
+		const readResult = toolResults.find(r => r.toolName === "read");
+		expect(grepResult?.toolCallId).toBe(startByName.get("grep"));
+		expect(JSON.stringify(grepResult?.content)).toContain("grep-out");
+		expect(readResult?.toolCallId).toBe(startByName.get("read"));
+		expect(JSON.stringify(readResult?.content)).toContain("read-out");
+
+		// Assistant messages carry api="agy-cli", provider="agy-cli", bare model, and exact non-overlapping usage totals.
+		const assistantUsageMsgs = entries
+			.filter(
+				e =>
+					e.type === "message" &&
+					(e.message as Record<string, unknown>).role === "assistant" &&
+					(e.message as Record<string, unknown>).usage !== undefined,
+			)
+			.map(e => e.message as Record<string, unknown>);
+		expect(assistantUsageMsgs).toHaveLength(2);
+		for (const msg of assistantUsageMsgs) {
+			expect(msg.api).toBe("agy-cli");
+			expect(msg.provider).toBe("agy-cli");
+			expect(msg.model).toBe("gemini-4-neon-medium");
+		}
+		const sumInput = assistantUsageMsgs.reduce((acc, m) => acc + ((m.usage as Record<string, number>).input ?? 0), 0);
+		const sumOutput = assistantUsageMsgs.reduce(
+			(acc, m) => acc + ((m.usage as Record<string, number>).output ?? 0),
+			0,
+		);
+		const sumCacheRead = assistantUsageMsgs.reduce(
+			(acc, m) => acc + ((m.usage as Record<string, number>).cacheRead ?? 0),
+			0,
+		);
+		expect({ sumInput, sumOutput, sumCacheRead }).toEqual({ sumInput: 350, sumOutput: 70, sumCacheRead: 200 });
+
+		// 2. Exclusive open (`wx`) refuses to overwrite an existing transcript and omits sessionFile from lifecycle.
+		const existingPath = path.join(artifactsDir, "ExistingTranscript.jsonl");
+		const sentinelContent = '{"type":"session","id":"do-not-overwrite"}\n';
+		await fs.writeFile(existingPath, sentinelContent);
+		const existingBus = new EventBus();
+		const existingLifecycles: SubagentLifecyclePayload[] = [];
+		existingBus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, p => existingLifecycles.push(p as SubagentLifecyclePayload));
+		const existingRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "must not clobber",
+			index: 0,
+			id: "ExistingTranscript",
+			artifactsDir,
+			sessionFile: parentSession,
+			eventBus: existingBus,
+			settings: makeSettings(multiBin, { task: "default" }),
+		});
+		expect(existingRes.exitCode).toBe(0);
+		expect(await fs.readFile(existingPath, "utf8")).toBe(sentinelContent);
+		expect(existingLifecycles.map(l => [l.status, l.sessionFile])).toEqual([
+			["started", undefined],
+			["completed", undefined],
+		]);
+
+		// 3. Streamed fallback when `result.response` is omitted does NOT replay pre-tool text in the final transcript turn.
+		const fallbackBin = await createFakeAgyShell(
+			dir,
+			`printf '%s\\n' '{"event":"init","conversation_id":"conv-fb","init":{"model":"gemini-4-neon-medium"}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"I will inspect."}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":1,"state":"ACTIVE","tool_name":"read","tool_info":{"parameters":{"path":"x.ts"}}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"tool","step_index":1,"state":"DONE","tool_name":"read","tool_info":{"output":"ok"}}}'
+printf '%s\\n' '{"event":"step_update","step_update":{"step_type":"agent_response","state":"ACTIVE","text_delta":"Tail answer only."}}'
+printf '%s\\n' '{"event":"result","result":{"conversation_id":"conv-fb","status":"SUCCESS","num_turns":2}}'
+exit 0
+`,
+			"fake-agy-fallback-dedup",
+		);
+		const fbRes = await runSubprocess({
+			cwd: dir,
+			agent: makeAgent(),
+			task: "fallback dedup check",
+			index: 0,
+			id: "FallbackDedup",
+			artifactsDir,
+			sessionFile: parentSession,
+			settings: makeSettings(fallbackBin, { task: "default" }),
+		});
+		expect(fbRes.exitCode).toBe(0);
+		// SingleResult still receives the full streamed aggregate, while the transcript records pre-tool text only once.
+		expect(fbRes.output).toContain("I will inspect.");
+		expect(fbRes.output).toContain("Tail answer only.");
+		const fbEntries = (await fs.readFile(path.join(artifactsDir, "FallbackDedup.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		const finalAssistant = fbEntries.at(-2)?.message as Record<string, unknown>;
+		expect(JSON.stringify(finalAssistant.content)).toContain("Tail answer only.");
+		expect(JSON.stringify(finalAssistant.content)).not.toContain("I will inspect.");
+	}, 30_000);
 });

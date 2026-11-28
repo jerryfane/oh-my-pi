@@ -11,6 +11,7 @@ import {
 } from "@oh-my-pi/pi-catalog/models";
 import type { ModelCost } from "@oh-my-pi/pi-catalog/types";
 import { $envpos, getConfigRootDir, getStatsDbPath, VERSION } from "@oh-my-pi/pi-utils";
+import { AGY_CLI_PROVIDER } from "./agy-parser";
 import { ChunkedInsert } from "./chunked-insert";
 import { classifyAgentType, type ParseSessionResult, type SessionParserState } from "./parser";
 import { ensureRollupSchema, getDailyActivityFromRollup } from "./rollup";
@@ -734,6 +735,13 @@ function resolveStoredCost(stats: MessageStatsInput): ResolvedCost {
 	const recurring = catalogCost?.timeBased !== undefined && hasRecurringTariff(catalogCost.timeBased);
 	if (storedCost && Number.isFinite(storedCost.total) && (storedCost.total !== 0 || recurring)) {
 		return { cost: storedCost, unpriced: false };
+	}
+
+	// Official `agy` CLI usage is covered by the user's Antigravity subscription
+	// with no public per-token rate card; mark it unpriced rather than free so
+	// cost totals and per-request averages stay accurate.
+	if (stats.provider === AGY_CLI_PROVIDER) {
+		return { cost: ZERO_USAGE_COST, unpriced: true };
 	}
 
 	// Without a request timestamp a scheduled card has no tariff to select, and

@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { getSessionsDir, hasFsCode, isEacces, logger } from "@oh-my-pi/pi-utils";
 import { syncAllSessions } from "./aggregator";
+import { getAgyBrainDir, isAgyTranscriptPath } from "./agy-parser";
 import { getDataVersion, initDb } from "./db";
 import { isCompressScratchPath } from "./parser";
 import { getRollupStatus, refreshRollups } from "./rollup";
@@ -53,6 +54,7 @@ export class StatsLive {
 
 	#started = false;
 	#watcher: fs.FSWatcher | null = null;
+	#agyWatcher: fs.FSWatcher | null = null;
 	#fullSyncTimer: NodeJS.Timeout | null = null;
 	#debounceTimer: NodeJS.Timeout | null = null;
 	#maxWaitTimer: NodeJS.Timeout | null = null;
@@ -90,6 +92,8 @@ export class StatsLive {
 		this.#started = false;
 		this.#watcher?.close();
 		this.#watcher = null;
+		this.#agyWatcher?.close();
+		this.#agyWatcher = null;
 		for (const timer of [
 			this.#fullSyncTimer,
 			this.#debounceTimer,
@@ -277,13 +281,16 @@ export class StatsLive {
 			pending.clear();
 			this.requestSync(files);
 		};
+		const enqueueFile = (fullPath: string) => {
+			pending.add(fullPath);
+			clearTimeout(this.#debounceTimer ?? undefined);
+			this.#debounceTimer = setTimeout(flush, WATCH_DEBOUNCE_MS);
+			this.#maxWaitTimer ??= setTimeout(flush, WATCH_MAX_WAIT_MS);
+		};
 		try {
 			this.#watcher = fs.watch(root, { recursive: true }, (_event, filename) => {
 				if (!filename?.endsWith(".jsonl") || isCompressScratchPath(filename)) return;
-				pending.add(path.join(root, filename));
-				clearTimeout(this.#debounceTimer ?? undefined);
-				this.#debounceTimer = setTimeout(flush, WATCH_DEBOUNCE_MS);
-				this.#maxWaitTimer ??= setTimeout(flush, WATCH_MAX_WAIT_MS);
+				enqueueFile(path.join(root, filename));
 			});
 			this.#watcher.on("error", error => {
 				// An unreadable subtree (e.g. a root-only directory) fails only its own watch; the rest keeps reporting.
@@ -298,6 +305,29 @@ export class StatsLive {
 		} catch (error) {
 			// No sessions dir yet, or recursive watch unsupported: periodic full syncs cover it.
 			logger.debug("Stats session watcher unavailable", { root, error: String(error) });
+		}
+
+		const agyBrainRoot = getAgyBrainDir();
+		if (agyBrainRoot && fs.existsSync(agyBrainRoot)) {
+			try {
+				this.#agyWatcher = fs.watch(agyBrainRoot, { recursive: true }, (_event, filename) => {
+					if (!filename?.endsWith("transcript.jsonl")) return;
+					const fullPath = path.join(agyBrainRoot, filename);
+					if (!isAgyTranscriptPath(fullPath)) return;
+					enqueueFile(fullPath);
+				});
+				this.#agyWatcher.on("error", error => {
+					if (isEacces(error) || hasFsCode(error, "EPERM")) {
+						logger.debug("Stats agy watcher skipped an unreadable directory", { error: String(error) });
+						return;
+					}
+					logger.warn("Stats agy watcher failed; relying on periodic sync", { error: String(error) });
+					this.#agyWatcher?.close();
+					this.#agyWatcher = null;
+				});
+			} catch (error) {
+				logger.debug("Stats agy watcher unavailable", { root: agyBrainRoot, error: String(error) });
+			}
 		}
 	}
 
