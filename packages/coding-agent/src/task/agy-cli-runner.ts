@@ -609,12 +609,23 @@ async function runSingleAgyStep(params: {
 	let stdinClosed = false;
 	let pendingTurns = 0;
 	let resultsReceived = 0;
+	let lastResultPublished = false;
+	let activeTurnHasResult = false;
+	let successorTransitionObserved = false;
 	const writtenFollowUps: Array<{ text: string; publishedInTranscript: boolean }> = [];
 	const unwrittenFollowUps: string[] = [];
 
 	const currentUsage = (includeSingleRequestFallback = false): StepUsageTotals => {
 		let lastContextTokens = stepLastContext;
-		if (includeSingleRequestFallback && lastContextTokens === undefined && stepRequests === 1 && resultEvent?.usage) {
+		if (
+			includeSingleRequestFallback &&
+			lastContextTokens === undefined &&
+			activeTurnHasResult &&
+			!successorTransitionObserved &&
+			resultsReceived === 1 &&
+			stepRequests === 1 &&
+			resultEvent?.usage
+		) {
 			const ctx = (resultEvent.usage.input_tokens ?? 0) + (resultEvent.usage.cache_read_tokens ?? 0);
 			if (ctx > 0) lastContextTokens = ctx;
 		}
@@ -795,8 +806,6 @@ async function runSingleAgyStep(params: {
 
 		const decoder = new TextDecoder();
 		let pending = "";
-		let lastResultPublished = false;
-		let activeTurnHasResult = false;
 		let pendingIntermediateTransition:
 			| {
 					prevResult: AgyStreamResult["result"];
@@ -829,6 +838,7 @@ async function runSingleAgyStep(params: {
 			transition.followUp.publishedInTranscript = true;
 			lastResultPublished = true;
 			activeTurnHasResult = false;
+			successorTransitionObserved = true;
 			stepLastContext = undefined;
 			params.onIntermediateTurnComplete?.({
 				prevResult: transition.prevResult,

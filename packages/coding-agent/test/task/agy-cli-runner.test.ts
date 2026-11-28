@@ -2805,13 +2805,23 @@ for await (const line of rl) {
 		await fs.writeFile(parentSession, `${JSON.stringify({ type: "session", version: 3, id: "p-pfu" })}\n`);
 		await fs.mkdir(artifactsDir, { recursive: true });
 
-		const partialUsageBin = await createFakeAgyBinary(
-			dir,
-			`
+		// Single shared stdin-gated two-turn fixture driven by scenario-specific Turn 2 actions.
+		const createTwoTurnFixture = (
+			name: string,
+			scenario: {
+				cid: string;
+				turn1Result: Record<string, unknown>;
+				turn2Events?: Array<Record<string, unknown>>;
+				turn2ExitCode?: number;
+			},
+		) =>
+			createFakeAgyBinary(
+				dir,
+				`
 import * as readline from "node:readline";
-const cid = "conv-partial-usage";
+const scenario = ${JSON.stringify(scenario)};
 const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
+emit({ event: "init", conversation_id: scenario.cid, init: { model: "gemini-4-neon-medium" } });
 
 const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
 const linesIter = rl[Symbol.asyncIterator]();
@@ -2835,70 +2845,83 @@ if (first !== null) {
 		event: "step_update",
 		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
 	});
-	// Turn 1 reports usage only on its result frame (40 in / 10 out / 8 cache_read).
-	emit({
-		event: "result",
-		result: {
-			conversation_id: cid,
-			status: "SUCCESS",
-			response: "TURN1_USAGE_ANSWER",
-			num_turns: 1,
-			usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
-		},
-	});
+	emit({ event: "result", result: { conversation_id: scenario.cid, ...scenario.turn1Result } });
 	if (second !== null) {
-		// Successor reports its own DONE usage (50 in / 15 out / 12 cache_read), then its final SUCCESS frame
-		// reports only cumulative input_tokens: 90 and omits output_tokens and cache_read_tokens.
-		emit({
-			event: "step_update",
-			step_update: {
-				step_index: 2,
-				step_type: "agent_response",
-				state: "DONE",
-				text_delta: "TURN2_USAGE_ANSWER",
-				usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
-			},
-		});
-		emit({
-			event: "result",
-			result: {
-				conversation_id: cid,
-				status: "SUCCESS",
-				response: "TURN2_USAGE_ANSWER",
-				num_turns: 2,
-				usage: { input_tokens: 90 },
-			},
-		});
+		for (const ev of scenario.turn2Events ?? []) {
+			if (ev.event === "result" && ev.result && typeof ev.result === "object") {
+				emit({ ...ev, result: { conversation_id: scenario.cid, ...ev.result } });
+			} else {
+				emit(ev);
+			}
+		}
+		if (typeof scenario.turn2ExitCode === "number") {
+			process.exit(scenario.turn2ExitCode);
+		}
 	}
 }
 `,
-			"fake-agy-partial-usage",
-		);
+				name,
+			);
 
-		let injected = false;
-		const res = await runSubprocess({
-			cwd: dir,
-			agent: makeAgent(),
-			task: "Turn 1 partial usage test",
-			index: 0,
-			id: "PartialUsageAgy",
-			parentAgentId: MAIN_AGENT_ID,
-			artifactsDir,
-			sessionFile: parentSession,
-			keepAlive: false,
-			settings: makeSettings(partialUsageBin, { task: "gemini-4-neon-medium" }),
-			onProgress: p => {
-				if (!injected && p.currentTool === "bash") {
-					injected = true;
-					void IrcBus.global().send({
-						from: "PeerUsage",
-						to: "PartialUsageAgy",
-						body: "Turn 2 partial usage follow-up",
-					});
-				}
+		const runTwoTurnCase = async (id: string, bin: string) => {
+			let injected = false;
+			return runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: `Turn 1 for ${id}`,
+				index: 0,
+				id,
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: false,
+				settings: makeSettings(bin, { task: "gemini-4-neon-medium" }),
+				onProgress: p => {
+					if (!injected && p.currentTool === "bash") {
+						injected = true;
+						void IrcBus.global().send({
+							from: `Peer-${id}`,
+							to: id,
+							body: `Turn 2 follow-up for ${id}`,
+						});
+					}
+				},
+			});
+		};
+
+		// 1. Successor reports DONE usage (50/15/12) then partial final SUCCESS with only input_tokens: 90.
+		const partialUsageBin = await createTwoTurnFixture("fake-agy-partial-usage", {
+			cid: "conv-partial-usage",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "TURN1_USAGE_ANSWER",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
 			},
+			turn2Events: [
+				{
+					event: "step_update",
+					step_update: {
+						step_index: 2,
+						step_type: "agent_response",
+						state: "DONE",
+						text_delta: "TURN2_USAGE_ANSWER",
+						usage: { input_tokens: 50, output_tokens: 15, cache_read_tokens: 12 },
+					},
+				},
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "TURN2_USAGE_ANSWER",
+						num_turns: 2,
+						usage: { input_tokens: 90 },
+					},
+				},
+			],
 		});
 
+		const res = await runTwoTurnCase("PartialUsageAgy", partialUsageBin);
 		expect(res.exitCode).toBe(0);
 		expect(res.output).toBe("TURN2_USAGE_ANSWER");
 		expect(res.usage?.input).toBe(90);
@@ -2934,94 +2957,83 @@ if (first !== null) {
 		expect(turn2Entry?.message?.usage?.output).toBe(15);
 		expect(turn2Entry?.message?.usage?.cacheRead).toBe(12);
 
-		// Two-turn same-process run with result-only usage (no agent_response DONE frames): cumulative usage
-		// and requests reconcile cleanly, while contextTokens must stay undefined instead of reporting Turn 1's 48.
-		const resultOnlyTwoTurnBin = await createFakeAgyBinary(
-			dir,
-			`
-import * as readline from "node:readline";
-const cid = "conv-result-only-two-turns";
-const emit = obj => process.stdout.write(JSON.stringify(obj) + "\\n");
-emit({ event: "init", conversation_id: cid, init: { model: "gemini-4-neon-medium" } });
-
-const rl = readline.createInterface({ input: process.stdin, crlfDelay: Infinity });
-const linesIter = rl[Symbol.asyncIterator]();
-const readPromptLine = async () => {
-	while (true) {
-		const next = await linesIter.next();
-		if (next.done) return null;
-		if (next.value.trim()) return JSON.parse(next.value)?.message?.content ?? "";
-	}
-};
-
-const first = await readPromptLine();
-if (first !== null) {
-	emit({
-		event: "step_update",
-		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "ACTIVE", tool_info: { name: "bash", parameters: { command: "wait" } } },
-	});
-	const second = await readPromptLine();
-	emit({
-		event: "step_update",
-		step_update: { step_index: 1, step_type: "tool", tool_name: "bash", state: "DONE", tool_info: { name: "bash", output: "ok" } },
-	});
-	emit({
-		event: "result",
-		result: {
-			conversation_id: cid,
-			status: "SUCCESS",
-			response: "RESULT_ONLY_TURN1",
-			num_turns: 1,
-			usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
-		},
-	});
-	if (second !== null) {
-		emit({
-			event: "result",
-			result: {
-				conversation_id: cid,
+		// 2. Counted two-turn result-only run: contextTokens must stay undefined instead of Turn 1's 48.
+		const countedTwoTurnBin = await createTwoTurnFixture("fake-agy-result-only-counted", {
+			cid: "conv-result-only-counted",
+			turn1Result: {
 				status: "SUCCESS",
-				response: "RESULT_ONLY_TURN2",
-				num_turns: 2,
-				usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+				response: "RESULT_ONLY_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
 			},
+			turn2Events: [
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "RESULT_ONLY_TURN2",
+						num_turns: 2,
+						usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+					},
+				},
+			],
 		});
-	}
-}
-`,
-			"fake-agy-result-only-two-turns",
-		);
+		const countedRes = await runTwoTurnCase("ResultOnlyCountedAgy", countedTwoTurnBin);
+		expect(countedRes.exitCode).toBe(0);
+		expect(countedRes.output).toBe("RESULT_ONLY_TURN2");
+		expect(countedRes.requests).toBe(2);
+		expect(countedRes.usage?.input).toBe(90);
+		expect(countedRes.usage?.output).toBe(25);
+		expect(countedRes.usage?.cacheRead).toBe(20);
+		expect(countedRes.contextTokens).toBeUndefined();
 
-		let injectedTwoTurn = false;
-		const twoTurnRes = await runSubprocess({
-			cwd: dir,
-			agent: makeAgent(),
-			task: "Turn 1 result-only context check",
-			index: 0,
-			id: "ResultOnlyTwoTurnAgy",
-			parentAgentId: MAIN_AGENT_ID,
-			artifactsDir,
-			sessionFile: parentSession,
-			keepAlive: false,
-			settings: makeSettings(resultOnlyTwoTurnBin, { task: "gemini-4-neon-medium" }),
-			onProgress: p => {
-				if (!injectedTwoTurn && p.currentTool === "bash") {
-					injectedTwoTurn = true;
-					void IrcBus.global().send({
-						from: "PeerTwoTurn",
-						to: "ResultOnlyTwoTurnAgy",
-						body: "Turn 2 result-only follow-up",
-					});
-				}
+		// 3. Uncounted two-turn result-only run (Turn 2 omits num_turns): must NOT infer cumulative 110 as single-request context.
+		const uncountedTwoTurnBin = await createTwoTurnFixture("fake-agy-result-only-uncounted", {
+			cid: "conv-result-only-uncounted",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "UNCOUNTED_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
 			},
+			turn2Events: [
+				{
+					event: "result",
+					result: {
+						status: "SUCCESS",
+						response: "UNCOUNTED_TURN2",
+						usage: { input_tokens: 90, output_tokens: 25, cache_read_tokens: 20 },
+					},
+				},
+			],
 		});
+		const uncountedRes = await runTwoTurnCase("ResultOnlyUncountedAgy", uncountedTwoTurnBin);
+		expect(uncountedRes.exitCode).toBe(0);
+		expect(uncountedRes.output).toBe("UNCOUNTED_TURN2");
+		expect(uncountedRes.usage?.input).toBe(90);
+		expect(uncountedRes.usage?.output).toBe(25);
+		expect(uncountedRes.usage?.cacheRead).toBe(20);
+		expect(uncountedRes.contextTokens).toBeUndefined();
 
-		expect(twoTurnRes.exitCode).toBe(0);
-		expect(twoTurnRes.output).toBe("RESULT_ONLY_TURN2");
-		expect(twoTurnRes.requests).toBe(2);
-		expect(twoTurnRes.usage?.input).toBe(90);
-		expect(twoTurnRes.usage?.output).toBe(25);
-		expect(twoTurnRes.usage?.cacheRead).toBe(20);
-		expect(twoTurnRes.contextTokens).toBeUndefined();
+		// 4. Successor emits ACTIVE then exits nonzero (7) without a second result: must NOT resurrect Turn 1's 48 context.
+		const activeCrashBin = await createTwoTurnFixture("fake-agy-successor-crash", {
+			cid: "conv-successor-crash",
+			turn1Result: {
+				status: "SUCCESS",
+				response: "CRASH_TURN1",
+				num_turns: 1,
+				usage: { input_tokens: 40, output_tokens: 10, cache_read_tokens: 8 },
+			},
+			turn2Events: [
+				{
+					event: "step_update",
+					step_update: { step_index: 2, step_type: "agent_response", state: "ACTIVE" },
+				},
+			],
+			turn2ExitCode: 7,
+		});
+		const crashRes = await runTwoTurnCase("SuccessorCrashContextAgy", activeCrashBin);
+		expect(crashRes.exitCode).toBe(7);
+		expect(crashRes.contextTokens).toBeUndefined();
 	}, 30_000);
 });
