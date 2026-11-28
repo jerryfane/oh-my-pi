@@ -134,6 +134,9 @@ const NO_CACHE_INPUT_BACKFILL_KEY = "cost_no_cache_input_v1";
 // value stored is the version that ran it), since only a catalog update can
 // price a model it could not price before.
 const CATALOG_COST_BACKFILL_KEY = "catalog_cost_backfill";
+// Reprice previously-ingested `agy-cli` rows (which stored `cost_total = 0` and
+// `cost_unpriced = 1` before peer-catalog pricing shipped) once in place.
+const AGY_CLI_COST_BACKFILL_KEY = "agy_cli_catalog_cost_v1";
 // The Spotlight tables are filled by the parser; transcripts ingested before
 // they existed are re-parsed once. Only files modified since the experiment
 // shipped can hold its entries, so older cursors stay put.
@@ -626,7 +629,27 @@ export async function initDb(): Promise<Database> {
 	reparseModifiedSince(db, MODEL_USAGE_PURPOSE_BACKFILL_KEY, MODEL_USAGE_SINCE_MS);
 	reparseModifiedSince(db, TOOL_APPROVALS_BACKFILL_KEY, TOOL_APPROVALS_SINCE_MS);
 	ensureRollupSchema(db);
+	backfillAgyCliCatalogCosts(db);
 	return db;
+}
+
+const AGY_EFFORT_SUFFIX_RE = /-(?:low|medium|high|xhigh)$/;
+
+function agyPricingFallbacks(modelId: string): readonly (readonly [string, string])[] {
+	const stripped = modelId.replace(AGY_EFFORT_SUFFIX_RE, "");
+	const candidates = stripped !== modelId ? [modelId, stripped] : [modelId];
+	const fallbacks: Array<readonly [string, string]> = [];
+	for (const id of candidates) {
+		fallbacks.push(
+			["google", id],
+			["anthropic", id],
+			["openrouter", `google/${id}`],
+			["openrouter", `anthropic/${id}`],
+			["openrouter", `openai/${id}`],
+			["openrouter", id],
+		);
+	}
+	return fallbacks;
 }
 
 function hasBillableCost(cost: ModelCost): boolean {
@@ -645,13 +668,16 @@ function getCatalogCost(provider: string, modelId: string): ModelCost | null {
 	}
 
 	// openai-codex has no catalog pricing-peer row (its bundled rows carry
-	// their own prices); keep its first-party fallback here.
+	// their own prices); agy-cli mirrors Google/Anthropic/OpenRouter models
+	// with optional `-low`/`-medium`/`-high`/`-xhigh` effort suffixes.
 	const peer = pricingPeerFor(provider, modelId);
 	const fallbacks = peer
 		? peer.peers.map(peerProvider => [peerProvider, peer.peerId] as const)
 		: provider === "openai-codex"
 			? [["openai", modelId] as const]
-			: [];
+			: provider === AGY_CLI_PROVIDER
+				? agyPricingFallbacks(modelId)
+				: [];
 	for (const [fallbackProvider, fallbackId] of fallbacks) {
 		const fallbackCost = getBundledModelCost(fallbackProvider, fallbackId);
 		if (fallbackCost && hasBillableCost(fallbackCost)) {
@@ -737,13 +763,6 @@ function resolveStoredCost(stats: MessageStatsInput): ResolvedCost {
 		return { cost: storedCost, unpriced: false };
 	}
 
-	// Official `agy` CLI usage is covered by the user's Antigravity subscription
-	// with no public per-token rate card; mark it unpriced rather than free so
-	// cost totals and per-request averages stay accurate.
-	if (stats.provider === AGY_CLI_PROVIDER) {
-		return { cost: ZERO_USAGE_COST, unpriced: true };
-	}
-
 	// Without a request timestamp a scheduled card has no tariff to select, and
 	// the epoch would silently become one. Leave the request unpriced; a re-parse
 	// of the session file repairs it once the timestamp is recoverable.
@@ -751,11 +770,19 @@ function resolveStoredCost(stats: MessageStatsInput): ResolvedCost {
 		return { cost: storedCost ?? ZERO_USAGE_COST, unpriced: true };
 	}
 
+	const calculated = calculateCatalogCost(stats.provider, stats.model, stats.usage, stats.timestamp);
+	if (calculated) {
+		return { cost: calculated, unpriced: false };
+	}
+
+	// An unknown `agy-cli` model with no matching public peer rate card stays
+	// unpriced subscription usage rather than reporting as free ($0).
+	if (stats.provider === AGY_CLI_PROVIDER) {
+		return { cost: storedCost ?? ZERO_USAGE_COST, unpriced: true };
+	}
+
 	return {
-		cost:
-			calculateCatalogCost(stats.provider, stats.model, stats.usage, stats.timestamp) ??
-			storedCost ??
-			ZERO_USAGE_COST,
+		cost: storedCost ?? ZERO_USAGE_COST,
 		unpriced: false,
 	};
 }
@@ -831,6 +858,47 @@ function backfillMissingCatalogCosts(database: Database): void {
 	});
 
 	applyBackfill();
+}
+
+function backfillAgyCliCatalogCosts(database: Database): void {
+	const row = database.query("SELECT value FROM meta WHERE key = ?").get(AGY_CLI_COST_BACKFILL_KEY) as
+		| { value: string }
+		| undefined;
+	if (row?.value === BACKFILL_COMPLETE) return;
+
+	const rows = database
+		.query(`
+			SELECT id, provider, model, timestamp, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens
+			FROM messages
+			WHERE provider = ? AND total_tokens > 0 AND (cost_total = 0 OR cost_unpriced = 1)
+		`)
+		.all(AGY_CLI_PROVIDER) as CostBackfillRow[];
+
+	const update = database.query(`
+		UPDATE messages
+		SET cost_input = ?, cost_output = ?, cost_cache_read = ?, cost_cache_write = ?,
+			cost_total = ?, cost_no_cache_input = ?, cost_unpriced = 0
+		WHERE id = ?
+	`);
+	const markComplete = database.query("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)");
+
+	database.transaction(() => {
+		for (const item of rows) {
+			const schedule = getCatalogCost(item.provider, item.model)?.timeBased;
+			if (schedule && !hasRequestTimestamp(item.timestamp)) continue;
+			const tokens: CostTokens = {
+				input: item.input_tokens,
+				output: item.output_tokens,
+				cacheRead: item.cache_read_tokens,
+				cacheWrite: item.cache_write_tokens,
+			};
+			const cost = calculateCatalogCost(item.provider, item.model, tokens, item.timestamp);
+			if (!cost || cost.total === 0) continue;
+			const noCacheInputCost = calculateNoCacheInputCost(item.provider, item.model, tokens, item.timestamp) ?? 0;
+			update.run(cost.input, cost.output, cost.cacheRead, cost.cacheWrite, cost.total, noCacheInputCost, item.id);
+		}
+		markComplete.run(AGY_CLI_COST_BACKFILL_KEY, BACKFILL_COMPLETE);
+	})();
 }
 
 function backfillNoCacheInputCosts(database: Database): void {

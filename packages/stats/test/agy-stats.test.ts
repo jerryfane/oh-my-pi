@@ -220,8 +220,9 @@ describe("agy transcript ingestion", () => {
 		expect(dashboard.overall.totalInputTokens).toBe(2500);
 		expect(dashboard.overall.totalOutputTokens).toBe(460);
 		expect(dashboard.overall.totalCacheReadTokens).toBe(7100);
-		expect(dashboard.overall.totalCost).toBe(0);
-		expect(dashboard.overall.unpricedRequests).toBe(4);
+		// Priced from bundled Google/OpenRouter Gemini 4 Neon peer card ($3/M in, $15/M out, $0.15/M cacheRead).
+		expect(dashboard.overall.totalCost).toBeCloseTo(2500 * 3e-6 + 460 * 15e-6 + 7100 * 0.15e-6, 9);
+		expect(dashboard.overall.unpricedRequests).toBe(0);
 
 		const byAgentType = new Map(dashboard.byAgentType.map(a => [a.agentType, a]));
 		expect(byAgentType.get("main")?.totalRequests).toBe(1);
@@ -244,7 +245,8 @@ describe("agy transcript ingestion", () => {
 		const recent = getRecentRequests(10);
 		const standaloneReq = recent.find(r => r.model === "gemini-4-neon-high");
 		expect(standaloneReq?.api).toBe(AGY_CLI_API);
-		expect(standaloneReq?.costUnpriced).toBe(true);
+		expect(standaloneReq?.costUnpriced).toBe(false);
+		expect(standaloneReq?.usage.cost.total).toBeCloseTo(1000 * 3e-6 + 200 * 15e-6 + 5000 * 0.15e-6, 9);
 		const details = await getRequestDetails(standaloneReq!.id!);
 		expect(details).not.toBeNull();
 		expect(JSON.stringify(details?.output)).toContain("Checking server status now.");
@@ -478,5 +480,80 @@ describe("agy transcript ingestion", () => {
 			if (prevAgyApp === undefined) delete process.env.AGY_APP_DATA_DIR;
 			else process.env.AGY_APP_DATA_DIR = prevAgyApp;
 		}
+	});
+
+	it("prices known agy-cli peer models via bundled catalog, keeps unknown models unpriced, and backfills existing zero-cost rows", async () => {
+		const ts = new Date(Date.now() - 5_000).toISOString();
+		await writeAgyTranscript("conv-pricing", [
+			{
+				step_index: 1,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: ts,
+				model: "gemini-4-neon-high",
+				input_tokens: 1_000_000,
+				cache_read_tokens: 1_000_000,
+				output_tokens: 100_000,
+			},
+			{
+				step_index: 2,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: ts,
+				model: "claude-opus-5-5-medium",
+				input_tokens: 500_000,
+				cache_read_tokens: 0,
+				output_tokens: 50_000,
+			},
+			{
+				step_index: 3,
+				source: "MODEL",
+				type: "PLANNER_RESPONSE",
+				status: "DONE",
+				created_at: ts,
+				model: "unknown-future-model-high",
+				input_tokens: 10_000,
+				cache_read_tokens: 0,
+				output_tokens: 1_000,
+			},
+		]);
+
+		await syncAllSessions({ workers: 1 });
+		const dash = await getDashboardStats("24h");
+		const byModel = new Map(dash.byModel.map(m => [m.model, m]));
+
+		// Gemini 4 Neon: $3/M in + $0.15/M cacheRead + $15/M out => $3 + $0.15 + $1.50 = $4.65
+		// Prompt savings ratio: ($6.00 uncached - $3.15 cached) / $6.00 = 0.475 (47.5%)
+		expect(byModel.get("gemini-4-neon-high")?.totalCost).toBeCloseTo(4.65, 6);
+		expect(byModel.get("gemini-4-neon-high")?.unpricedRequests).toBe(0);
+		expect(byModel.get("gemini-4-neon-high")?.cacheSavings).toBeCloseTo(0.475, 6);
+
+		// Claude Opus 5.5: $4/M in * 0.5 + $20/M out * 0.05 => $2 + $1 = $3.00
+		expect(byModel.get("claude-opus-5-5-medium")?.totalCost).toBeCloseTo(3.0, 6);
+		expect(byModel.get("claude-opus-5-5-medium")?.unpricedRequests).toBe(0);
+
+		// Unknown model stays unpriced subscription usage rather than $0 free.
+		expect(byModel.get("unknown-future-model-high")?.totalCost).toBe(0);
+		expect(byModel.get("unknown-future-model-high")?.unpricedRequests).toBe(1);
+
+		// Simulate pre-PR32 DB rows (zero cost, cost_unpriced=1, backfill key absent) and verify initDb backfills them.
+		const { closeDb } = await import("@oh-my-pi/omp-stats/db");
+		const { getStatsDbPath } = await import("@oh-my-pi/pi-utils");
+		closeDb();
+		const raw = new Database(getStatsDbPath());
+		raw.run(
+			"UPDATE messages SET cost_input = 0, cost_output = 0, cost_cache_read = 0, cost_cache_write = 0, cost_total = 0, cost_no_cache_input = 0, cost_unpriced = 1 WHERE provider = 'agy-cli'",
+		);
+		raw.run("DELETE FROM meta WHERE key = 'agy_cli_catalog_cost_v1'");
+		raw.close();
+
+		await initDb();
+		const afterBackfill = await getDashboardStats("24h");
+		const backfilledNeon = afterBackfill.byModel.find(m => m.model === "gemini-4-neon-high");
+		expect(backfilledNeon?.totalCost).toBeCloseTo(4.65, 6);
+		expect(backfilledNeon?.unpricedRequests).toBe(0);
+		expect(backfilledNeon?.cacheSavings).toBeCloseTo(0.475, 6);
 	});
 });
