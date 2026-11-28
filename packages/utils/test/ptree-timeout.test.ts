@@ -1086,4 +1086,59 @@ console.log("settled");
 			}
 		},
 	);
+
+	it.skipIf(process.platform === "win32")(
+		"kills SIGINT-ignoring descendants in a non-subreaper detached group after the leader exits on SIGINT",
+		async () => {
+			const dir = await fs.mkdtemp(path.join(os.tmpdir(), "ptree-sigint-group-"));
+			const helperPidFile = path.join(dir, "helper.pid");
+			const leaderSigFile = path.join(dir, "leader.sig");
+			const readyFile = path.join(dir, "ready");
+			try {
+				const cp = spawn(
+					[
+						"/bin/sh",
+						"-c",
+						`trap 'echo SIGINT > ${JSON.stringify(leaderSigFile)}; exit 130' INT; trap 'echo SIGTERM > ${JSON.stringify(leaderSigFile)}; exit 143' TERM; (trap '' INT TERM; echo $$ > ${JSON.stringify(helperPidFile)}; sleep 15) </dev/null >/dev/null 2>&1 & while [ ! -s ${JSON.stringify(helperPidFile)} ]; do sleep 0.01; done; echo ready > ${JSON.stringify(readyFile)}; sleep 15`,
+					],
+					{ detached: true, subreaper: false, descendantDrainMs: 100 },
+				);
+				const deadline = Date.now() + 3000;
+				while (!(await Bun.file(readyFile).exists()) && Date.now() < deadline) {
+					await Bun.sleep(10);
+				}
+				expect(await Bun.file(readyFile).exists()).toBe(true);
+				const helperPid = Number.parseInt((await Bun.file(helperPidFile).text()).trim(), 10);
+				expect(helperPid).toBeGreaterThan(1);
+				expect(() => process.kill(helperPid, 0)).not.toThrow();
+
+				cp.kill(new AbortError("steer", ""), 120, "SIGINT");
+				await cp.exited.catch(() => {});
+				await cp.drainDone.catch(() => {});
+				await Bun.sleep(150);
+
+				expect((await Bun.file(leaderSigFile).text()).trim()).toBe("SIGINT");
+
+				// The SIGINT/SIGTERM-ignoring descendant must be hard-killed by the group SIGKILL sweep.
+				let alive = true;
+				try {
+					process.kill(helperPid, 0);
+				} catch {
+					alive = false;
+				}
+				expect(alive).toBe(false);
+			} finally {
+				const rawPid = await Bun.file(helperPidFile)
+					.text()
+					.catch(() => "");
+				const pid = Number.parseInt(rawPid.trim(), 10);
+				if (pid > 1) {
+					try {
+						process.kill(pid, "SIGKILL");
+					} catch {}
+				}
+				await fs.rm(dir, { recursive: true, force: true });
+			}
+		},
+	);
 });

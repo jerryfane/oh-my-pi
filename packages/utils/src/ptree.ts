@@ -584,19 +584,38 @@ export class ChildProcess<In extends InMask = InMask> {
 		return this.#signalChild(gracefulMs);
 	}
 
-	/** Send `gracefulSignal` to the child (its group when it leads one), then SIGKILL if it outlives `gracefulMs`. */
+	/** Send `gracefulSignal` to the child (its group when it leads one), then SIGKILL if it or its group outlives `gracefulMs`. */
 	async #signalChild(gracefulMs: number, gracefulSignal: "SIGTERM" | "SIGINT" = "SIGTERM"): Promise<void> {
+		const isGroup = this.#terminateGroup && process.platform !== "win32";
 		const signal = (name: NodeJS.Signals) => {
 			try {
-				if (this.#terminateGroup && process.platform !== "win32") process.kill(-this.proc.pid, name);
+				if (isGroup) process.kill(-this.proc.pid, name);
 				else this.proc.kill(name);
 			} catch {}
 		};
+		const isGroupAlive = (): boolean => {
+			if (!isGroup) return !this.#isRootExited();
+			try {
+				process.kill(-this.proc.pid, 0);
+				return true;
+			} catch (err) {
+				return (err as NodeJS.ErrnoException)?.code === "EPERM";
+			}
+		};
 		if (gracefulMs >= 0) {
+			const deadline = Date.now() + gracefulMs;
 			signal(gracefulSignal);
 			await Promise.race([this.proc.exited, Bun.sleep(gracefulMs)]);
+			if (isGroup) {
+				while (isGroupAlive() && Date.now() < deadline) {
+					await Bun.sleep(Math.min(20, Math.max(1, deadline - Date.now())));
+				}
+			}
 		}
-		if (!this.#isRootExited()) signal("SIGKILL");
+		if (!this.#isRootExited() || isGroupAlive()) {
+			signal("SIGKILL");
+			if (isGroup) this.#descendantsCleaned = true;
+		}
 	}
 
 	/**

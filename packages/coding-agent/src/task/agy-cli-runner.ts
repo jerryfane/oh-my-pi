@@ -771,6 +771,13 @@ async function runSingleAgyStep(params: {
 
 		const decoder = new TextDecoder();
 		let pending = "";
+		let pendingIntermediateTransition: { prevResult: AgyStreamResult["result"]; nextPrompt: string } | undefined;
+		const flushPendingIntermediateTransition = () => {
+			if (!pendingIntermediateTransition) return;
+			const transition = pendingIntermediateTransition;
+			pendingIntermediateTransition = undefined;
+			params.onIntermediateTurnComplete?.(transition);
+		};
 		const handleLine = (rawLine: string) => {
 			const parsed = parseAgyStreamLine(rawLine);
 			if (!parsed) return;
@@ -778,6 +785,7 @@ async function runSingleAgyStep(params: {
 				noteConversationId(parsed.conversation_id);
 				if (parsed.init?.model) model = parsed.init.model;
 			} else if (parsed.event === "step_update") {
+				flushPendingIntermediateTransition();
 				const su = parsed.step_update;
 				noteConversationId(su?.conversation_id);
 				if (su?.step_type === "agent_response") {
@@ -797,6 +805,7 @@ async function runSingleAgyStep(params: {
 					}
 				}
 			} else if (parsed.event === "result") {
+				flushPendingIntermediateTransition();
 				resultEvent = parsed.result;
 				resultMalformedReason = parsed.malformedReason;
 				resultsReceived += 1;
@@ -812,7 +821,10 @@ async function runSingleAgyStep(params: {
 						const nextPrompt = writtenFollowUps[resultsReceived - 1];
 						streamedText = "";
 						if (nextPrompt !== undefined) {
-							params.onIntermediateTurnComplete?.({ prevResult: parsed.result, nextPrompt });
+							// Defer recording the intermediate turn boundary until the child actually
+							// emits a frame for the successor turn; if stdin was closed and the child
+							// exits now, exit recovery records the transition exactly once on resume.
+							pendingIntermediateTransition = { prevResult: parsed.result, nextPrompt };
 						}
 					} else {
 						closeStdinSafely();
@@ -1681,6 +1693,88 @@ function prepareOutputSchema(outputSchema: unknown): {
 	// Valid unconstrained JSON Schema (`true` or `{}`): `agy --json-schema` rejects schemas
 	// without root `"type": "object"`, so explicitly request raw JSON in the final step prompt.
 	return { jsonPromptInstruction: buildJsonSchemaPromptInstruction() };
+}
+
+interface AgyProgressReporter {
+	appendText(delta: string): void;
+	getTailText(): string;
+	schedule(flush?: boolean): void;
+	clearTimer(): void;
+}
+
+/** Shared rolling-tail & timer-coalescing progress reporter used by both initial and monitored follow-up turns. */
+function createAgyProgressReporter(params: {
+	id: string;
+	progress: AgentProgress;
+	startTime: number;
+	onProgress?: (progress: AgentProgress) => void;
+	emitFrame: (snapshot: AgentProgress) => void;
+}): AgyProgressReporter {
+	let recentOutputTail = "";
+	let recentOutputDirty = false;
+	let lastEmitMs = 0;
+	let timer: ReturnType<typeof setTimeout> | null = null;
+
+	const emitNow = () => {
+		if (recentOutputDirty) {
+			recentOutputDirty = false;
+			const tail =
+				recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES
+					? recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES)
+					: recentOutputTail;
+			params.progress.recentOutput = tail
+				.split("\n")
+				.filter(line => line.trim())
+				.slice(-RECENT_OUTPUT_LINES)
+				.reverse();
+		}
+		params.progress.durationMs = Date.now() - params.startTime;
+		const snapshot = { ...params.progress };
+		if (params.onProgress) {
+			invokeObserverSafely("agy onProgress callback failed", { id: params.id, status: snapshot.status }, () =>
+				params.onProgress?.(snapshot),
+			);
+		}
+		params.emitFrame(snapshot);
+		lastEmitMs = Date.now();
+	};
+
+	const clearTimer = () => {
+		if (timer) {
+			clearTimeout(timer);
+			timer = null;
+		}
+	};
+
+	return {
+		appendText(delta: string) {
+			recentOutputTail += delta;
+			if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES * 2) {
+				recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
+			}
+			recentOutputDirty = true;
+		},
+		getTailText: () => recentOutputTail,
+		schedule(flush = false) {
+			if (flush) {
+				clearTimer();
+				emitNow();
+				return;
+			}
+			const elapsed = Date.now() - lastEmitMs;
+			if (lastEmitMs === 0 || elapsed >= PROGRESS_COALESCE_MS) {
+				clearTimer();
+				emitNow();
+				return;
+			}
+			if (timer) return;
+			timer = setTimeout(() => {
+				timer = null;
+				emitNow();
+			}, PROGRESS_COALESCE_MS - elapsed);
+		},
+		clearTimer,
+	};
 }
 
 interface TurnSequenceInput {
@@ -2623,6 +2717,10 @@ class AgySessionController {
 		};
 	}
 
+	runWithTurnLock<T>(fn: () => Promise<T>): Promise<T> {
+		return this.#withTurnLock(undefined, fn);
+	}
+
 	async runMonitoredFollowUpTurn(options: FollowUpTurnOptions, startTime: number): Promise<SingleResult> {
 		if (options.restore || options.steps !== undefined) {
 			throw new Error("External agy CLI subagents do not support restore/stepped-resume follow-up turns.");
@@ -2632,6 +2730,12 @@ class AgySessionController {
 		}
 		if (options.workPoolYieldItems && options.workPoolYieldItems.length > 0) {
 			throw new Error("External agy CLI subagents do not support workPoolYieldItems follow-up turns.");
+		}
+		if (options.completionProbe === true) {
+			throw new Error("External agy CLI subagents do not support completionProbe follow-up turns.");
+		}
+		if (options.softRequestBudget !== undefined && options.softRequestBudget > 0) {
+			throw new Error("External agy CLI subagents do not support softRequestBudget follow-up turns.");
 		}
 		const index = options.index ?? 0;
 		if (this.#disposed || this.#admissionClosed) {
@@ -2655,8 +2759,9 @@ class AgySessionController {
 			};
 		}
 
+		let postLockEmit: (() => void) | undefined;
 		try {
-			return await this.#withTurnLock(options.signal, async () => {
+			const result = await this.#withTurnLock(options.signal, async () => {
 				if (this.#disposed || this.#admissionClosed) {
 					return {
 						index,
@@ -2704,80 +2809,30 @@ class AgySessionController {
 					resolvedModel: this.#resolvedModel,
 					resolvedModelIdentity: this.#resolvedModel,
 				};
-				let recentOutputTail = "";
-				let recentOutputDirty = false;
-				let lastProgressEmitMs = 0;
-				let progressTimer: ReturnType<typeof setTimeout> | null = null;
-				const appendRecentText = (delta: string) => {
-					recentOutputTail += delta;
-					if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES * 2) {
-						recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
-					}
-					recentOutputDirty = true;
-				};
-				const emitProgressNow = () => {
-					if (recentOutputDirty) {
-						recentOutputDirty = false;
-						const tail =
-							recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES
-								? recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES)
-								: recentOutputTail;
-						progress.recentOutput = tail
-							.split("\n")
-							.filter(line => line.trim())
-							.slice(-RECENT_OUTPUT_LINES)
-							.reverse();
-					}
-					progress.durationMs = Date.now() - startTime;
-					if (options.onProgress) {
-						invokeObserverSafely(
-							"agy follow-up onProgress failed",
-							{ id: this.id, status: progress.status },
-							() => options.onProgress?.({ ...progress }),
+				const progressReporter = createAgyProgressReporter({
+					id: this.id,
+					progress,
+					startTime,
+					onProgress: options.onProgress,
+					emitFrame: snapshot => {
+						emitSubagentFrameSafely(
+							options.eventBus,
+							options.subagentEventBus,
+							TASK_SUBAGENT_PROGRESS_CHANNEL,
+							{
+								index,
+								agent: options.agent.name,
+								agentSource: options.agent.source,
+								task: options.message,
+								parentToolCallId: options.parentToolCallId,
+								detached: true,
+								...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
+								progress: snapshot,
+							},
+							{ id: this.id, status: snapshot.status },
 						);
-					}
-					emitSubagentFrameSafely(
-						options.eventBus,
-						options.subagentEventBus,
-						TASK_SUBAGENT_PROGRESS_CHANNEL,
-						{
-							index,
-							agent: options.agent.name,
-							agentSource: options.agent.source,
-							task: options.message,
-							parentToolCallId: options.parentToolCallId,
-							detached: true,
-							...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
-							progress: { ...progress },
-						},
-						{ id: this.id, status: progress.status },
-					);
-					lastProgressEmitMs = Date.now();
-				};
-				const scheduleProgress = (flush = false) => {
-					if (flush) {
-						if (progressTimer) {
-							clearTimeout(progressTimer);
-							progressTimer = null;
-						}
-						emitProgressNow();
-						return;
-					}
-					const elapsed = Date.now() - lastProgressEmitMs;
-					if (lastProgressEmitMs === 0 || elapsed >= PROGRESS_COALESCE_MS) {
-						if (progressTimer) {
-							clearTimeout(progressTimer);
-							progressTimer = null;
-						}
-						emitProgressNow();
-						return;
-					}
-					if (progressTimer) return;
-					progressTimer = setTimeout(() => {
-						progressTimer = null;
-						emitProgressNow();
-					}, PROGRESS_COALESCE_MS - elapsed);
-				};
+					},
+				});
 
 				let transcript: AgyTranscriptWriter | undefined;
 				this.#inActiveTurn = true;
@@ -2800,7 +2855,7 @@ class AgySessionController {
 					},
 					{ id: this.id, status: "started" },
 				);
-				scheduleProgress(true);
+				progressReporter.schedule(true);
 
 				const releaseWakeHold = this.holdWakes();
 				try {
@@ -2829,8 +2884,8 @@ class AgySessionController {
 						maxRuntimeMs,
 						transcript,
 						progress,
-						onScheduleProgress: scheduleProgress,
-						onTextDelta: appendRecentText,
+						onScheduleProgress: flush => progressReporter.schedule(flush),
+						onTextDelta: delta => progressReporter.appendText(delta),
 						onResolvedModel: rawModel => {
 							if (!rawModel) return;
 							const display = formatResolvedAgyModel(rawModel);
@@ -2843,8 +2898,25 @@ class AgySessionController {
 						callIdNamespace: `agy-fu-${++this.#turnStepSeq}`,
 					});
 
-					const wasAborted =
-						summary.runtimeExceeded || summary.lastOutcome.aborted || Boolean(combinedAbort.signal.aborted);
+					// Atomically commit monitored turn acceptance vs cancellation against the registry
+					// BEFORE async artifact/transcript I/O and terminal progress callbacks so RPC
+					// `cancel_subagent` can never return true while this turn reports completion.
+					const registry = AgentRegistry.global();
+					const refAtCommit = registry.get(this.id);
+					let wasAborted =
+						summary.runtimeExceeded ||
+						summary.lastOutcome.aborted ||
+						Boolean(combinedAbort.signal.aborted) ||
+						refAtCommit?.status === "aborted";
+					this.#inActiveTurn = false;
+					this.setRunState("idle");
+					if (!wasAborted && refAtCommit && refAtCommit.session) {
+						if (!registry.setStatus(this.id, "idle", refAtCommit)) {
+							wasAborted = true;
+						}
+					}
+					this.promoteLatePendingToWakeTurns();
+
 					const abortReason = wasAborted
 						? summary.runtimeExceeded
 							? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
@@ -2929,34 +3001,35 @@ class AgySessionController {
 						durationMs: summary.finalStepDurationMs,
 					});
 
-					// Stop accepting in-turn input BEFORE terminal observers and `agent_end` so late
-					// messages route cleanly to the wake queue instead of being stranded.
-					this.#inActiveTurn = false;
-					this.promoteLatePendingToWakeTurns();
-
-					scheduleProgress(true);
-					emitSubagentFrameSafely(
-						options.eventBus,
-						options.subagentEventBus,
-						TASK_SUBAGENT_LIFECYCLE_CHANNEL,
-						{
-							id: options.id,
-							agent: options.agent.name,
-							parentToolCallId: options.parentToolCallId,
-							detached: true,
-							agentSource: options.agent.source,
-							description: options.description,
-							...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
-							status: progress.status,
-							index,
-						},
-						{ id: this.id, status: progress.status },
-					);
 					if (outputPath) {
 						invokeObserverSafely("agy follow-up setHistory failed", { id: this.id }, () => {
-							AgentRegistry.global().setHistory(this.id, { outputPath });
+							registry.setHistory(this.id, { outputPath });
 						});
 					}
+
+					const finalStatus = progress.status;
+					postLockEmit = () => {
+						progressReporter.schedule(true);
+						emitSubagentFrameSafely(
+							options.eventBus,
+							options.subagentEventBus,
+							TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+							{
+								id: options.id,
+								agent: options.agent.name,
+								parentToolCallId: options.parentToolCallId,
+								detached: true,
+								agentSource: options.agent.source,
+								description: options.description,
+								...(this.#transcriptPath ? { sessionFile: this.#transcriptPath } : {}),
+								status: finalStatus,
+								index,
+							},
+							{ id: this.id, status: finalStatus },
+						);
+						this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
+						releaseWakeHold();
+					};
 
 					return {
 						index,
@@ -2992,20 +3065,21 @@ class AgySessionController {
 						outputMeta,
 					};
 				} finally {
-					if (progressTimer) {
-						clearTimeout(progressTimer);
-						progressTimer = null;
-					}
+					progressReporter.clearTimer();
 					this.#inActiveTurn = false;
 					combinedAbort.dispose();
 					await transcript?.close().catch(() => {});
-					this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
-					if (this.#wakeQueue.length === 0 || this.#disposed) {
-						this.setRunState("idle");
+					if (!postLockEmit) {
+						this.emitSessionEvent({ type: "agent_end", messages: [...this.#messages] });
+						if (this.#wakeQueue.length === 0 || this.#disposed) {
+							this.setRunState("idle");
+						}
+						releaseWakeHold();
 					}
-					releaseWakeHold();
 				}
 			});
+			postLockEmit?.();
+			return result;
 		} catch (err) {
 			if (options.signal?.aborted) {
 				const reason = abortReasonOf(options.signal, "Cancelled");
@@ -3544,86 +3618,32 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		transcript?.recordModelChange(display);
 	};
 
-	let lastProgressEmitMs = 0;
-	let progressTimer: ReturnType<typeof setTimeout> | null = null;
-	// Bounded rolling tail (matches native executor's newest-first 8-line preview without unbounded memory growth).
-	let recentOutputTail = "";
-	let recentOutputDirty = false;
-
-	const appendRecentText = (delta: string) => {
-		recentOutputTail += delta;
-		if (recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES * 2) {
-			recentOutputTail = recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES);
-		}
-		recentOutputDirty = true;
-	};
-
-	const refreshRecentOutput = () => {
-		if (!recentOutputDirty) return;
-		recentOutputDirty = false;
-		const tail =
-			recentOutputTail.length > RECENT_OUTPUT_TAIL_BYTES
-				? recentOutputTail.slice(-RECENT_OUTPUT_TAIL_BYTES)
-				: recentOutputTail;
-		const filtered = tail.split("\n").filter(line => line.trim());
-		progress.recentOutput = filtered.slice(-RECENT_OUTPUT_LINES).reverse();
-	};
-
-	const emitProgressNow = () => {
-		refreshRecentOutput();
-		progress.durationMs = Date.now() - startTime;
-		const activeSessionFile = transcript?.activePath;
-		if (onProgress) {
-			invokeObserverSafely("agy onProgress callback failed", { id, status: progress.status }, () =>
-				onProgress({ ...progress }),
+	const progressReporter = createAgyProgressReporter({
+		id,
+		progress,
+		startTime,
+		onProgress,
+		emitFrame: snapshot => {
+			const activeSessionFile = transcript?.activePath;
+			emitSubagentFrameSafely(
+				options.eventBus,
+				options.subagentEventBus,
+				TASK_SUBAGENT_PROGRESS_CHANNEL,
+				{
+					index,
+					agent: agent.name,
+					agentSource: agent.source,
+					task,
+					parentToolCallId: options.parentToolCallId,
+					detached: options.detached,
+					assignment,
+					...(activeSessionFile ? { sessionFile: activeSessionFile } : {}),
+					progress: snapshot,
+				},
+				{ id, status: snapshot.status },
 			);
-		}
-		const progressPayload = {
-			index,
-			agent: agent.name,
-			agentSource: agent.source,
-			task,
-			parentToolCallId: options.parentToolCallId,
-			detached: options.detached,
-			assignment,
-			...(activeSessionFile ? { sessionFile: activeSessionFile } : {}),
-			progress: { ...progress },
-		};
-		emitSubagentFrameSafely(
-			options.eventBus,
-			options.subagentEventBus,
-			TASK_SUBAGENT_PROGRESS_CHANNEL,
-			progressPayload,
-			{ id, status: progress.status },
-		);
-		lastProgressEmitMs = Date.now();
-	};
-
-	const scheduleProgress = (flush = false) => {
-		if (flush) {
-			if (progressTimer) {
-				clearTimeout(progressTimer);
-				progressTimer = null;
-			}
-			emitProgressNow();
-			return;
-		}
-		const now = Date.now();
-		const elapsed = now - lastProgressEmitMs;
-		if (lastProgressEmitMs === 0 || elapsed >= PROGRESS_COALESCE_MS) {
-			if (progressTimer) {
-				clearTimeout(progressTimer);
-				progressTimer = null;
-			}
-			emitProgressNow();
-			return;
-		}
-		if (progressTimer) return;
-		progressTimer = setTimeout(() => {
-			progressTimer = null;
-			emitProgressNow();
-		}, PROGRESS_COALESCE_MS - elapsed);
-	};
+		},
+	});
 
 	// Emit lifecycle start event so OMP's Subagents (Alt+A) HUD registers the worker immediately.
 	const initialSessionFile = transcript?.activePath;
@@ -3644,7 +3664,7 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		},
 		{ id, status: "started" },
 	);
-	scheduleProgress(true);
+	progressReporter.schedule(true);
 
 	const deadlineMs = maxRuntimeMs > 0 ? startTime + maxRuntimeMs : undefined;
 	let summary: TurnSequenceSummary = {
@@ -3665,212 +3685,216 @@ export async function runAgySubagent(options: ExecutorOptions, config: AgySubage
 		completedCacheReadTokens: 0,
 		finalStepUnrecordedText: "",
 	};
-
-	try {
-		const { jsonSchemaStr, jsonPromptInstruction } = prepareOutputSchema(outputSchema);
-		const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
-		const preparedSteps = stepPrompts.map((stepPrompt, i) => {
-			const isFinalStep = i === stepPrompts.length - 1;
-			const basePrompt = buildAgyPrompt(options, stepPrompt, i === 0);
-			return {
-				transcriptPrompt: stepPrompt,
-				promptText: isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt,
-				isFinalStep,
-				jsonSchema: isFinalStep ? jsonSchemaStr : undefined,
-				jsonPromptInstruction: isFinalStep ? jsonPromptInstruction : undefined,
-			};
-		});
-		summary = await controller.executeTurnSequence({
-			steps: preparedSteps,
-			abortSignal: combinedAbort.signal,
-			deadlineMs,
-			maxRuntimeMs,
-			transcript,
-			progress,
-			onScheduleProgress: scheduleProgress,
-			onToolResult: options.onToolResult,
-			onTextDelta: appendRecentText,
-			onResolvedModel: updateResolvedModel,
-			activityRef: registeredRef,
-			callIdNamespace: "agy-call",
-		});
-	} catch (err) {
-		const message = formatErrorMessage(err);
-		summary = {
-			...summary,
-			lastOutcome: {
-				...summary.lastOutcome,
-				exitCode: 1,
-				error: summary.lastOutcome.error ?? message,
-				stderr: summary.lastOutcome.stderr || message,
-			},
-		};
-	} finally {
-		if (progressTimer) {
-			clearTimeout(progressTimer);
-			progressTimer = null;
-		}
-		combinedAbort.dispose();
-	}
-
-	const {
-		lastOutcome,
-		runtimeExceeded,
-		completedInputTokens,
-		completedOutputTokens,
-		completedCacheReadTokens,
-		finalStepUnrecordedText,
-		finalStepResidualUsage,
-		finalStepDurationMs,
-	} = summary;
-
-	// Atomically commit the terminal registry transition BEFORE any async artifact/transcript I/O or
-	// terminal progress callbacks so RPC `cancel_subagent` can never succeed while the same run reports
-	// completion, and one-shot teardown can never falsely acknowledge new mid-job messages.
-	const refAtCommit = registry.get(id);
-	let wasAborted =
-		runtimeExceeded ||
-		lastOutcome.aborted ||
-		Boolean(combinedAbort.signal.aborted) ||
-		registeredRef.status === "aborted";
-	let releaseWakeHold: (() => void) | undefined;
-	const adoptConversationId =
-		!wasAborted &&
-		options.keepAlive !== false &&
-		worktree === undefined &&
-		controller.conversationId !== undefined &&
-		refAtCommit === registeredRef
-			? controller.conversationId
-			: undefined;
-
-	if (adoptConversationId !== undefined) {
-		releaseWakeHold = controller.holdWakes();
-		controller.endActiveTurn();
-		if (registry.setStatus(id, "idle", registeredRef)) {
-			AgentLifecycleManager.global().adopt(
-				id,
-				{
-					idleTtlMs: cfgTaskAgentIdleTtlMs.get(settings),
-					revive: createAgyReviver({
-						id,
-						binary: config.binary,
-						model: config.model,
-						resolvedModel: progress.resolvedModel ?? initialResolvedModel,
-						cwd: runCwd,
-						additionalDirectories: additionalDirs,
-						artifactsDir: options.artifactsDir,
-						transcriptPath: transcript?.activePath,
-						parentId: options.parentAgentId,
-						maxRuntimeMs,
-						conversationId: adoptConversationId,
-					}),
-					onRelease: options.onRelease,
-				},
-				registeredRef,
-			);
-			onReleaseTransferred = true;
-			controller.promoteLatePendingToWakeTurns();
-		} else {
-			// An explicit cancel won the transition to `aborted`.
-			wasAborted = true;
-			releaseWakeHold();
-			releaseWakeHold = undefined;
-			controller.closeAdmission();
-		}
-	} else {
-		controller.closeAdmission();
-		if (!wasAborted && refAtCommit === registeredRef && registeredRef.status !== "aborted") {
-			registry.unregister(id, registeredRef);
-		} else if (registeredRef.status === "aborted") {
-			wasAborted = true;
-		}
-	}
-
-	const abortReason = wasAborted
-		? runtimeExceeded
-			? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
-			: (lastOutcome.abortReason ?? abortReasonOf(combinedAbort.signal, "Cancelled"))
-		: undefined;
-	let exitCode = wasAborted ? 1 : lastOutcome.exitCode;
-	let error = wasAborted ? (abortReason ?? lastOutcome.error) : lastOutcome.error;
-
-	let rawOutput = typeof lastOutcome.response === "string" ? lastOutcome.response : "";
-	if (wasAborted && !rawOutput.trim() && recentOutputTail.trim().length > 0) {
-		const snippet = previewLine(recentOutputTail.trim(), 200);
-		rawOutput = `[cancelled after ${progress.requests} req, ${progress.tokens} tok — last activity: "${snippet}"]`;
-	}
-
+	let wasAborted = false;
+	let abortReason: string | undefined;
+	let exitCode = 1;
+	let error: string | undefined;
 	let structuredOutput: StructuredSubagentOutput | undefined;
-	let truncatedOutput = rawOutput;
+	let truncatedOutput = "";
 	let truncated = false;
 	let outputPath: string | undefined;
 	let outputMeta: { lineCount: number; charCount: number } | undefined;
-	try {
-		const structured = finalizeStructuredOutput({
-			outputSchema,
-			outputSchemaMode: options.outputSchemaMode,
-			outputSchemaSource: options.outputSchemaSource,
-			exitCode,
-			rawOutput,
-			parsedFromAgy: lastOutcome.structuredOutput,
-			error,
-		});
-		rawOutput = typeof structured.rawOutput === "string" ? structured.rawOutput : "";
-		exitCode = structured.exitCode;
-		error = structured.error;
-		structuredOutput = structured.structuredOutput;
+	let releaseWakeHold: (() => void) | undefined;
 
-		const truncatedResult = truncateTail(rawOutput, {
-			maxBytes: MAX_OUTPUT_BYTES,
-			maxLines: MAX_OUTPUT_LINES,
-		});
-		truncatedOutput = truncatedResult.content;
-		truncated = Boolean(truncatedResult.truncated);
-
-		if (options.artifactsDir) {
-			const persisted = await persistSubagentOutputArtifacts({
-				artifactsDir: options.artifactsDir,
-				id,
-				rawOutput,
-				structuredOutput,
+	// Hold the controller's exclusive per-session turn lock across initial execution, atomic
+	// registry commit, artifact persistence, and `transcript.finish()` so a concurrent monitored
+	// follow-up can never race into the still-open `<id>.jsonl` or overwrite the initial artifact.
+	await controller.runWithTurnLock(async () => {
+		try {
+			const { jsonSchemaStr, jsonPromptInstruction } = prepareOutputSchema(outputSchema);
+			const stepPrompts = options.steps && options.steps.length > 0 ? options.steps : [task];
+			const preparedSteps = stepPrompts.map((stepPrompt, i) => {
+				const isFinalStep = i === stepPrompts.length - 1;
+				const basePrompt = buildAgyPrompt(options, stepPrompt, i === 0);
+				return {
+					transcriptPrompt: stepPrompt,
+					promptText:
+						isFinalStep && jsonPromptInstruction ? `${basePrompt}\n\n${jsonPromptInstruction}` : basePrompt,
+					isFinalStep,
+					jsonSchema: isFinalStep ? jsonSchemaStr : undefined,
+					jsonPromptInstruction: isFinalStep ? jsonPromptInstruction : undefined,
+				};
 			});
-			outputPath = persisted.outputPath;
-			outputMeta = persisted.outputMeta;
+			summary = await controller.executeTurnSequence({
+				steps: preparedSteps,
+				abortSignal: combinedAbort.signal,
+				deadlineMs,
+				maxRuntimeMs,
+				transcript,
+				progress,
+				onScheduleProgress: flush => progressReporter.schedule(flush),
+				onToolResult: options.onToolResult,
+				onTextDelta: delta => progressReporter.appendText(delta),
+				onResolvedModel: updateResolvedModel,
+				activityRef: registeredRef,
+				callIdNamespace: "agy-call",
+			});
+		} catch (err) {
+			const message = formatErrorMessage(err);
+			summary = {
+				...summary,
+				lastOutcome: {
+					...summary.lastOutcome,
+					exitCode: 1,
+					error: summary.lastOutcome.error ?? message,
+					stderr: summary.lastOutcome.stderr || message,
+				},
+			};
+		} finally {
+			progressReporter.clearTimer();
+			combinedAbort.dispose();
 		}
-	} catch (err) {
-		const message = formatErrorMessage(err);
-		exitCode = 1;
-		error = error ?? message;
-	}
 
-	progress.currentTool = undefined;
-	progress.currentToolArgs = undefined;
-	progress.currentToolArgsKey = undefined;
-	progress.currentToolStartMs = undefined;
-	progress.streaming = undefined;
-	progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+		const { lastOutcome, runtimeExceeded, finalStepUnrecordedText, finalStepResidualUsage, finalStepDurationMs } =
+			summary;
 
-	// Flush final assistant turn and `session_exit` to `<id>.jsonl` before releasing any queued
-	// wake turns or announcing terminal lifecycle so observers immediately settle the subagent's status.
-	const finalTranscriptText =
-		lastOutcome.responseIsAuthoritative || structuredOutput?.status === "valid"
-			? truncatedOutput
-			: truncateTail(finalStepUnrecordedText, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES }).content;
-	await transcript?.finish({
-		status: progress.status,
-		text: finalTranscriptText,
-		errorMessage: error,
-		modelDisplay: progress.resolvedModel,
-		usage: finalStepResidualUsage,
-		durationMs: finalStepDurationMs,
+		// Atomically commit the terminal registry transition BEFORE any async artifact/transcript I/O or
+		// terminal progress callbacks so RPC `cancel_subagent` can never succeed while the same run reports
+		// completion, and one-shot teardown can never falsely acknowledge new mid-job messages.
+		const refAtCommit = registry.get(id);
+		wasAborted =
+			runtimeExceeded ||
+			lastOutcome.aborted ||
+			Boolean(combinedAbort.signal.aborted) ||
+			registeredRef.status === "aborted";
+		const adoptConversationId =
+			!wasAborted &&
+			options.keepAlive !== false &&
+			worktree === undefined &&
+			controller.conversationId !== undefined &&
+			refAtCommit === registeredRef
+				? controller.conversationId
+				: undefined;
+
+		if (adoptConversationId !== undefined) {
+			releaseWakeHold = controller.holdWakes();
+			controller.endActiveTurn();
+			if (registry.setStatus(id, "idle", registeredRef)) {
+				AgentLifecycleManager.global().adopt(
+					id,
+					{
+						idleTtlMs: cfgTaskAgentIdleTtlMs.get(settings),
+						revive: createAgyReviver({
+							id,
+							binary: config.binary,
+							model: config.model,
+							resolvedModel: progress.resolvedModel ?? initialResolvedModel,
+							cwd: runCwd,
+							additionalDirectories: additionalDirs,
+							artifactsDir: options.artifactsDir,
+							transcriptPath: transcript?.activePath,
+							parentId: options.parentAgentId,
+							maxRuntimeMs,
+							conversationId: adoptConversationId,
+						}),
+						onRelease: options.onRelease,
+					},
+					registeredRef,
+				);
+				onReleaseTransferred = true;
+				controller.promoteLatePendingToWakeTurns();
+			} else {
+				// An explicit cancel won the transition to `aborted`.
+				wasAborted = true;
+				releaseWakeHold();
+				releaseWakeHold = undefined;
+				controller.closeAdmission();
+			}
+		} else {
+			controller.closeAdmission();
+			if (!wasAborted && refAtCommit === registeredRef && registeredRef.status !== "aborted") {
+				registry.unregister(id, registeredRef);
+			} else if (registeredRef.status === "aborted") {
+				wasAborted = true;
+			}
+		}
+
+		abortReason = wasAborted
+			? runtimeExceeded
+				? `Subagent exceeded task.maxRuntimeMs (${maxRuntimeMs}ms)`
+				: (lastOutcome.abortReason ?? abortReasonOf(combinedAbort.signal, "Cancelled"))
+			: undefined;
+		exitCode = wasAborted ? 1 : lastOutcome.exitCode;
+		error = wasAborted ? (abortReason ?? lastOutcome.error) : lastOutcome.error;
+
+		let rawOutput = typeof lastOutcome.response === "string" ? lastOutcome.response : "";
+		const tailText = progressReporter.getTailText().trim();
+		if (wasAborted && !rawOutput.trim() && tailText.length > 0) {
+			const snippet = previewLine(tailText, 200);
+			rawOutput = `[cancelled after ${progress.requests} req, ${progress.tokens} tok — last activity: "${snippet}"]`;
+		}
+
+		truncatedOutput = rawOutput;
+		try {
+			const structured = finalizeStructuredOutput({
+				outputSchema,
+				outputSchemaMode: options.outputSchemaMode,
+				outputSchemaSource: options.outputSchemaSource,
+				exitCode,
+				rawOutput,
+				parsedFromAgy: lastOutcome.structuredOutput,
+				error,
+			});
+			rawOutput = typeof structured.rawOutput === "string" ? structured.rawOutput : "";
+			exitCode = structured.exitCode;
+			error = structured.error;
+			structuredOutput = structured.structuredOutput;
+
+			const truncatedResult = truncateTail(rawOutput, {
+				maxBytes: MAX_OUTPUT_BYTES,
+				maxLines: MAX_OUTPUT_LINES,
+			});
+			truncatedOutput = truncatedResult.content;
+			truncated = Boolean(truncatedResult.truncated);
+
+			if (options.artifactsDir) {
+				const persisted = await persistSubagentOutputArtifacts({
+					artifactsDir: options.artifactsDir,
+					id,
+					rawOutput,
+					structuredOutput,
+				});
+				outputPath = persisted.outputPath;
+				outputMeta = persisted.outputMeta;
+			}
+		} catch (err) {
+			const message = formatErrorMessage(err);
+			exitCode = 1;
+			error = error ?? message;
+		}
+
+		progress.currentTool = undefined;
+		progress.currentToolArgs = undefined;
+		progress.currentToolArgsKey = undefined;
+		progress.currentToolStartMs = undefined;
+		progress.streaming = undefined;
+		progress.status = wasAborted ? "aborted" : exitCode === 0 ? "completed" : "failed";
+
+		// Flush final assistant turn and `session_exit` to `<id>.jsonl` before releasing the turn lock
+		// or queued wake turns so observers and subsequent follow-ups see a completely settled transcript.
+		const finalTranscriptText =
+			lastOutcome.responseIsAuthoritative || structuredOutput?.status === "valid"
+				? truncatedOutput
+				: truncateTail(finalStepUnrecordedText, { maxBytes: MAX_OUTPUT_BYTES, maxLines: MAX_OUTPUT_LINES }).content;
+		await transcript?.finish({
+			status: progress.status,
+			text: finalTranscriptText,
+			errorMessage: error,
+			modelDisplay: progress.resolvedModel,
+			usage: finalStepResidualUsage,
+			durationMs: finalStepDurationMs,
+		});
+
+		const finalSessionFile = transcript?.activePath;
+		controller.setTranscriptPath(finalSessionFile);
+		if (truncatedOutput) {
+			controller.recordAssistantMessage(truncatedOutput);
+		}
 	});
 
+	const { lastOutcome, completedInputTokens, completedOutputTokens, completedCacheReadTokens } = summary;
 	const finalSessionFile = transcript?.activePath;
-	controller.setTranscriptPath(finalSessionFile);
-	if (truncatedOutput) {
-		controller.recordAssistantMessage(truncatedOutput);
-	}
-	scheduleProgress(true);
+	progressReporter.schedule(true);
 	emitSubagentFrameSafely(
 		options.eventBus,
 		options.subagentEventBus,

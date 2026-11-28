@@ -1975,6 +1975,8 @@ if (!conv) {
 
 		let sentAfterClose = false;
 		let receipt: Awaited<ReturnType<typeof IrcBus.prototype.send>> | undefined;
+		const closedArtifactsDir = path.join(dir, "closed-artifacts");
+		await fs.mkdir(closedArtifactsDir, { recursive: true });
 		const recoveredRes = await runSubprocess({
 			cwd: dir,
 			agent: makeAgent(),
@@ -1982,6 +1984,7 @@ if (!conv) {
 			index: 0,
 			id: "ClosedFd0Worker",
 			parentAgentId: MAIN_AGENT_ID,
+			artifactsDir: closedArtifactsDir,
 			keepAlive: false,
 			settings: makeSettings(closeStdinBin, { task: "gemini-4-neon-medium" }),
 			onProgress: p => {
@@ -1999,6 +2002,25 @@ if (!conv) {
 		expect(recoveredRes.exitCode).toBe(0);
 		expect(recoveredRes.output).toContain("RECOVERED_FOLLOWUP:");
 		expect(recoveredRes.output).toContain("Must not be lost");
+		// Closed-stdin recovery must record the Turn 1 reply and the recovered prompt exactly ONCE each in JSONL.
+		const closedTranscriptLines = (await fs.readFile(path.join(closedArtifactsDir, "ClosedFd0Worker.jsonl"), "utf8"))
+			.trim()
+			.split("\n")
+			.map(l => JSON.parse(l) as Record<string, unknown>);
+		const turn1ReplyEntries = closedTranscriptLines.filter(
+			e =>
+				e.type === "message" &&
+				(e.message as Record<string, unknown>).role === "assistant" &&
+				JSON.stringify(e.message).includes("turn1-only"),
+		);
+		const recoveredPromptEntries = closedTranscriptLines.filter(
+			e =>
+				e.type === "message" &&
+				(e.message as Record<string, unknown>).role === "user" &&
+				JSON.stringify(e.message).includes("Must not be lost"),
+		);
+		expect(turn1ReplyEntries).toHaveLength(1);
+		expect(recoveredPromptEntries).toHaveLength(1);
 
 		// 2. Steer queued BEFORE conversation_id is emitted on step_update (not init) must interrupt promptly
 		// AND deliver SIGINT (not SIGTERM) so the child's SIGINT checkpoint handler runs before resume.
@@ -2295,6 +2317,93 @@ if (promptText.includes("PROSE_BAD")) {
 		await expect(
 			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", topicBoard: "board" }),
 		).rejects.toThrow(/topicBoard/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", completionProbe: true }),
+		).rejects.toThrow(/completionProbe/i);
+		await expect(
+			runSubagentFollowUpTurn({ id: "ContractAgyWorker", agent: makeAgent(), message: "x", softRequestBudget: 1 }),
+		).rejects.toThrow(/softRequestBudget/i);
+
+		// 3b. RPC cancel from a monitored follow-up's terminal onProgress must return false (committed idle first).
+		const fuRpcBus = new EventBus();
+		const fuRpcSubagents = new RpcSubagentRegistry(fuRpcBus, () => {});
+		let fuTerminalCancel: boolean | undefined;
+		let fuCancelChecked = false;
+		const fuCancelRes = await runSubagentFollowUpTurn({
+			id: "ContractAgyWorker",
+			agent: makeAgent(),
+			message: "check-monitored-cancel-atomicity",
+			eventBus: fuRpcBus,
+			onProgress: p => {
+				if (p.status === "completed" && !fuCancelChecked) {
+					fuCancelChecked = true;
+					void handleRpcCancelSubagent(fuRpcSubagents, "ContractAgyWorker").then(ok => {
+						fuTerminalCancel = ok;
+					});
+				}
+			},
+		});
+		await Bun.sleep(20);
+		fuRpcSubagents.dispose();
+		expect(fuCancelRes.exitCode).toBe(0);
+		expect(fuTerminalCancel).toBe(false);
+		expect(AgentRegistry.global().get("ContractAgyWorker")?.status).toBe("idle");
+
+		// 3c. A monitored follow-up triggered the instant the initial run flips idle must wait on the shared turn lock
+		// so it never corrupts the still-flushing initial transcript or gets overwritten by the initial artifact.
+		let earlyFollowUpPromise: Promise<import("../../src/task/task-details").SingleResult> | undefined;
+		const unsubRace = AgentRegistry.global().onChange(ev => {
+			if (
+				ev.type === "status_changed" &&
+				ev.ref.id === "InitialLockRaceWorker" &&
+				ev.ref.status === "idle" &&
+				!earlyFollowUpPromise
+			) {
+				earlyFollowUpPromise = runSubagentFollowUpTurn({
+					id: "InitialLockRaceWorker",
+					agent: makeAgent(),
+					message: "FOLLOWUP_AFTER_IDLE_EVENT",
+					artifactsDir,
+				});
+			}
+		});
+		try {
+			const raceInitRes = await runSubprocess({
+				cwd: dir,
+				agent: makeAgent(),
+				task: "INITIAL_LOCK_RACE",
+				index: 0,
+				id: "InitialLockRaceWorker",
+				parentAgentId: MAIN_AGENT_ID,
+				artifactsDir,
+				sessionFile: parentSession,
+				keepAlive: true,
+				settings: makeSettings(followUpBin, { task: "gemini-4-neon-medium" }),
+			});
+			expect(raceInitRes.exitCode).toBe(0);
+			expect(earlyFollowUpPromise).toBeDefined();
+			const raceFuRes = await earlyFollowUpPromise!;
+			expect(raceFuRes.exitCode).toBe(0);
+			// Final artifact must hold FOLLOWUP_AFTER_IDLE_EVENT (never overwritten by INITIAL_LOCK_RACE).
+			const latestArtifact = await fs.readFile(path.join(artifactsDir, "InitialLockRaceWorker.md"), "utf8");
+			expect(latestArtifact).toContain("FOLLOWUP_AFTER_IDLE_EVENT");
+			// Transcript must be valid JSONL with unique sequential IDs and an intact parentId chain.
+			const raceLines = (await fs.readFile(path.join(artifactsDir, "InitialLockRaceWorker.jsonl"), "utf8"))
+				.trim()
+				.split("\n")
+				.map(l => JSON.parse(l) as Record<string, unknown>);
+			const raceIds = new Set<string>();
+			let racePrev: string | null = null;
+			for (const entry of raceLines.slice(1)) {
+				const eid = entry.id as string;
+				expect(raceIds.has(eid)).toBe(false);
+				raceIds.add(eid);
+				expect(entry.parentId).toBe(racePrev);
+				racePrev = eid;
+			}
+		} finally {
+			unsubRace();
+		}
 
 		// 4. Real worker calling AgentRegistry.global().get() for a main-homed agy agent crosses the bridge cleanly.
 		const probeReady = Promise.withResolvers<AgentsProbe>();
